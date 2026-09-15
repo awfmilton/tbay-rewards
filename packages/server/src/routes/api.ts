@@ -478,6 +478,9 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
       delivery: result.delivery,
       tx_hash: result.txHash,
       amount_tokens: result.amountTokens,
+      // So the browser can refuse to submit from a different account rather
+      // than letting the transaction revert and cost the customer gas.
+      wallet_address: result.claim.wallet_address,
       transaction: result.transaction,
     };
   });

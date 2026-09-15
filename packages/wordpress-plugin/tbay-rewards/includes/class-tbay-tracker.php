@@ -64,12 +64,17 @@ class TBAY_Rewards_Tracker {
 			TBAY_REWARDS_VERSION
 		);
 
+		// Deliberately NOT dependent on the tracker. WordPress drops a delayed
+		// loading strategy when any dependent is blocking, so declaring the
+		// dependency turned the tracker into a synchronous <script> in <head> —
+		// a slow platform would then stall every page render. Every use of
+		// window.tbay in this file is already guarded.
 		wp_enqueue_script(
 			'tbay-rewards',
 			TBAY_REWARDS_URL . 'assets/tbay-rewards.js',
-			array( 'tbay-tracker' ),
+			array(),
 			TBAY_REWARDS_VERSION,
-			true
+			array( 'strategy' => 'defer', 'in_footer' => true )
 		);
 
 		$chain = $this->api->chain_config();
@@ -126,6 +131,26 @@ class TBAY_Rewards_Tracker {
 					'transferSending' => __( 'Sending points…', 'tbay-rewards' ),
 					/* translators: %d: number of points sent. */
 					'transferSent'   => __( '%d points sent.', 'tbay-rewards' ),
+					'signPrompt'     => __( 'Sign the message in your wallet to prove it is yours. This is free and moves nothing.', 'tbay-rewards' ),
+					'walletLinked'   => __( 'Wallet verified.', 'tbay-rewards' ),
+					'shareCreating'  => __( 'Creating your link…', 'tbay-rewards' ),
+					'shareOpened'    => __( 'Shared. You earn points when someone opens your link.', 'tbay-rewards' ),
+					'txSent'         => __( 'Sent — waiting for the network to confirm.', 'tbay-rewards' ),
+					/* translators: %s: amount of TBAY. */
+					'claimPending'   => __( 'You have an unfinished claim for %s TBAY.', 'tbay-rewards' ),
+					'claimResume'    => __( 'Finish claiming', 'tbay-rewards' ),
+					'claimWrongWallet' => __( 'Your wallet switched accounts. Select the account you verified and try again.', 'tbay-rewards' ),
+					'bridgeAsked'    => __( 'You asked to bridge', 'tbay-rewards' ),
+					'bridgeStays'    => __( 'Stays in your wallet', 'tbay-rewards' ),
+					'bridgeRounding' => __( 'Amounts are rounded down to 9 decimal places, because that is the precision Ethereum TBAY uses. Anything smaller stays in your wallet.', 'tbay-rewards' ),
+					'bridgeUnrecorded' => __( 'Your tokens were burned but we could not record it.', 'tbay-rewards' ),
+					'bridgeRetry'    => __( 'Retry', 'tbay-rewards' ),
+					'bridgeViewTx'   => __( 'View transaction', 'tbay-rewards' ),
+					'errCancelled'   => __( 'You cancelled in your wallet — nothing was sent.', 'tbay-rewards' ),
+					'errNoGas'       => __( 'Your wallet needs a little ETH on zkSync to pay the network fee.', 'tbay-rewards' ),
+					'errWrongChain'  => __( 'Your wallet is on the wrong network. Approve the switch to zkSync and try again.', 'tbay-rewards' ),
+					'errSessionExpired' => __( 'Your session expired. Reload the page and try again — nothing was lost.', 'tbay-rewards' ),
+					'errUnreachable' => __( 'We could not reach the rewards service. Please try again shortly.', 'tbay-rewards' ),
 				),
 			)
 		);

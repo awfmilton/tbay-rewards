@@ -34,7 +34,10 @@
     --success:     #00e5a0;
     --text:        #e4eaf5;
     --text-2:      #8896b4;
+    /* 2.56:1 on --surface, so decorative use only. */
     --text-3:      #4f5c78;
+    /* Informational text uses this instead: 5.77:1 on surface. */
+    --text-muted:  #8896b4;
     --font-display:'Syne', system-ui, sans-serif;
     --font-body:   'DM Sans', system-ui, sans-serif;
     --font-mono:   'JetBrains Mono', ui-monospace, monospace;
@@ -77,7 +80,7 @@
     padding: .5rem .75rem; min-height: 40px;
   }
   input:focus, select:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(0,212,212,.15); }
-  input[type=password] { flex: 1 1 15rem; min-width: 0; font-family: var(--font-mono); font-size: 14px; }
+  input[type=password] { flex: 1 1 15rem; min-width: 0; font-family: var(--font-mono); font-size: 16px; }
 
   button {
     cursor: pointer; font-weight: 600; font-size: .875rem;
@@ -112,15 +115,15 @@
   }
   .card:hover { border-color: var(--border-glow); box-shadow: var(--shadow-glow); }
   .card .label {
-    display: block; font-family: var(--font-mono); font-size: .66rem;
-    letter-spacing: .14em; text-transform: uppercase; color: var(--text-3);
+    display: block; font-family: var(--font-mono); font-size: .72rem;
+    letter-spacing: .14em; text-transform: uppercase; color: var(--text-muted);
   }
   .card .value {
     display: block; font-family: var(--font-display);
     font-size: clamp(1.5rem, 5vw, 1.9rem); font-weight: 700; line-height: 1.1;
     letter-spacing: -.02em; color: #fff; margin-top: .35rem; overflow-wrap: anywhere;
   }
-  .card .sub { display: block; color: var(--text-2); font-size: .78rem; margin-top: .25rem; }
+  .card .sub { display: block; color: var(--text-2); font-size: .8rem; margin-top: .25rem; }
 
   .panel {
     background: var(--surface); border: 1px solid var(--border);
@@ -137,7 +140,7 @@
   table { width: 100%; min-width: 30rem; border-collapse: collapse; font-size: .875rem; }
   th, td { text-align: left; padding: .7rem 1.15rem; border-bottom: 1px solid var(--border); }
   th {
-    color: var(--text-3); font-weight: 500; font-size: .66rem;
+    color: var(--text-muted); font-weight: 500; font-size: .72rem;
     font-family: var(--font-mono); letter-spacing: .12em; text-transform: uppercase;
   }
   td { color: var(--text-2); }
@@ -145,17 +148,18 @@
   td.num, th.num { text-align: right; font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
   td code { font-family: var(--font-mono); color: var(--primary); font-size: .8rem; }
 
-  .empty { padding: 1.5rem 1.15rem; color: var(--text-3); font-size: .9rem; }
+  .empty { padding: 1.5rem 1.15rem; color: var(--text-muted); font-size: .9rem; }
 
   .toolbar {
     display: flex; gap: .6rem; align-items: center; flex-wrap: wrap;
     padding: .85rem 1.15rem; border-bottom: 1px solid var(--border);
   }
-  .toolbar label { color: var(--text-3); font-size: .8rem; }
+  .toolbar label { color: var(--text-muted); font-size: .8rem; }
   .toolbar select { flex: 1 1 10rem; min-width: 0; }
 
-  #heatCanvas { width: 100%; height: auto; display: block; background: #0b0b0f; }
-  .legend { display: flex; gap: .65rem; align-items: center; padding: .7rem 1.15rem; color: var(--text-3); font-size: .72rem; flex-wrap: wrap; }
+  /* Cap the height: a 1:2 canvas at desktop width is otherwise 2400px tall. */
+  #heatCanvas { width: 100%; height: auto; max-height: 70vh; object-fit: contain; display: block; background: #0b0b0f; }
+  .legend { display: flex; gap: .65rem; align-items: center; padding: .7rem 1.15rem; color: var(--text-muted); font-size: .75rem; flex-wrap: wrap; }
   .swatch { width: 120px; height: 10px; border-radius: 5px; background: linear-gradient(90deg,#001b44,#0a84ff,#00e5a0,#f5a623,#ff4d6d); }
 
   .err {
@@ -167,10 +171,14 @@
   .chart div { flex: 1; background: linear-gradient(180deg, var(--primary), var(--accent)); border-radius: 2px 2px 0 0; min-height: 2px; opacity: .9; }
 
   @media (max-width: 40rem) {
-    header { padding: .7rem 1rem; }
+    /* The header wraps to three rows on a phone; sticky would then eat a third
+       of the viewport permanently, so it scrolls away instead. */
+    header { position: static; padding: .7rem 1rem; }
     header h1 { flex: 1 1 100%; }
     input[type=password] { flex: 1 1 100%; }
     header select, header button { flex: 1 1 auto; }
+    /* 16px keeps iOS Safari from zooming the page on focus. */
+    input, select, button { font-size: 16px; min-height: 44px; }
   }
 
   @media (prefers-reduced-motion: reduce) {
@@ -194,7 +202,15 @@
 </header>
 
 <main>
-  <div id="error" class="err" hidden></div>
+  <div id="error" class="err" role="alert" hidden></div>
+  <div id="firstRun" class="panel" hidden>
+    <h2>Getting started</h2>
+    <p class="empty">
+      Paste your API secret above and press Load. It is the <code>tbs_…</code> value printed once by
+      <code>tenant:create</code>. If you have lost it, issue a new one with
+      <code>key:issue --slug &lt;your-slug&gt;</code>.
+    </p>
+  </div>
   <nav>
     <button data-tab="overview" aria-current="true">Overview</button>
     <button data-tab="sources">Sources</button>
@@ -250,7 +266,7 @@
           <option value="tablet">Tablet</option>
         </select>
         <button class="ghost" id="heatLoad">Render</button>
-        <span id="heatMeta" style="color:var(--muted);font-size:13px"></span>
+          <span id="heatMeta" style="color:var(--text-muted);font-size:13px"></span>
       </div>
       <canvas id="heatCanvas" width="1000" height="2000"></canvas>
       <div class="legend"><span>cold</span><span class="swatch"></span><span>hot</span></div>
@@ -284,8 +300,10 @@
 
   var secretInput = document.getElementById('secret');
   var errorBox = document.getElementById('error');
+  // sessionStorage, not localStorage: this is a credential that can read every
+  // customer record, and it should not outlive the browser session.
   var stored = null;
-  try { stored = localStorage.getItem('tbay_dash_secret'); } catch (e) {}
+  try { stored = sessionStorage.getItem('tbay_dash_secret'); } catch (e) {}
   if (stored) secretInput.value = stored;
 
   function secret() { return secretInput.value.trim(); }
@@ -304,6 +322,19 @@
         return body;
       });
     });
+  }
+
+  /** Network and HTML-error-page failures are not useful messages on their own. */
+  function friendly(error) {
+    var message = String((error && error.message) || error || '');
+    if (/failed to fetch|networkerror/i.test(message)) {
+      return 'Cannot reach the rewards server. Check the URL and that it is running.';
+    }
+    if (/unexpected token/i.test(message)) {
+      return 'The server returned an unexpected response. Check that this URL is your rewards API.';
+    }
+    if (/401|unauthor/i.test(message)) return 'That API secret was not accepted.';
+    return message || 'Could not load reports';
   }
 
   function showError(message) {
@@ -341,9 +372,16 @@
            '</tr></thead><tbody>' + body + '</tbody></table></div>';
   }
 
+  /**
+   * Escapes for both text and attribute contexts.
+   *
+   * Quotes matter: page keys come from public-key ingest and are rendered into
+   * attribute values below, where an unescaped quote would break out.
+   */
   function escape(value) {
     return String(value === null || value === undefined ? '' : value)
-      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
   // ── Tabs ──────────────────────────────────────────────────────────────────
@@ -487,7 +525,15 @@
         { label: 'From', render: function (r) { return '<code>' + escape(r.from_address.slice(0, 10)) + '…</code>'; } },
         { label: 'L1 recipient', render: function (r) { return '<code>' + escape(r.l1_recipient.slice(0, 10)) + '…</code>'; } },
         { label: 'Amount (L1)', num: true, render: function (r) { return l1(r.l1_amount); } },
-        { label: 'Status', render: function (r) { return escape(r.status); } },
+        { label: 'Status', render: function (r) {
+            var labels = {
+              pending: 'Awaiting burn',
+              burn_verified: 'Awaiting L1 release',
+              released: 'Released',
+              rejected: 'Rejected'
+            };
+            return escape(labels[r.status] || r.status);
+          } },
         { label: 'Burn tx', render: function (r) { return '<code>' + escape(r.burn_tx_hash.slice(0, 12)) + '…</code>'; } }
       ], rows, 'No bridge withdrawals yet.');
     });
@@ -561,7 +607,7 @@
       ctx.fillRect(0, 0, canvas.width, canvas.height);
 
       document.getElementById('heatMeta').textContent =
-        map.cells.length + ' cells · ' + num(map.totalWeight) + ' samples · ' +
+        map.pageKey + ' · ' + map.cells.length + ' cells · ' + num(map.totalWeight) + ' samples · ' +
         num(map.sampleSessions) + ' sessions' +
         (map.avgDocHeight ? ' · avg page ' + map.avgDocHeight + 'px' : '');
 
@@ -587,16 +633,28 @@
 
   function loadAll() {
     if (!secret()) { showError('Enter your API secret to load reports.'); return; }
-    try { localStorage.setItem('tbay_dash_secret', secret()); } catch (e) {}
+    try { sessionStorage.setItem('tbay_dash_secret', secret()); } catch (e) {}
     showError('');
+    document.getElementById('firstRun').hidden = true;
 
-    Promise.all([
+    var button = document.getElementById('load');
+    button.disabled = true;
+    button.textContent = 'Loading…';
+
+    // allSettled, not all: one failing report should not blank the other eight.
+    Promise.allSettled([
       loadOverview(), loadSources(), loadProducts(), loadCarts(),
       loadBlog(), loadRewards(), loadHeatPages(), loadBridge(), loadSupply()
-    ]).then(function () {
-      return renderHeatmap();
-    })['catch'](function (err) {
-      showError(err.message || 'Could not load reports');
+    ]).then(function (results) {
+      var failed = results.filter(function (r) { return r.status === 'rejected'; });
+      if (failed.length) {
+        showError(friendly(failed[0].reason) +
+          (failed.length > 1 ? ' (' + failed.length + ' reports unavailable)' : ''));
+      }
+      return renderHeatmap()['catch'](function () {});
+    })['finally'](function () {
+      button.disabled = false;
+      button.textContent = 'Load';
     });
   }
 
@@ -609,7 +667,7 @@
   });
   document.getElementById('range').addEventListener('change', loadAll);
   document.getElementById('forget').addEventListener('click', function () {
-    try { localStorage.removeItem('tbay_dash_secret'); } catch (e) {}
+    try { sessionStorage.removeItem('tbay_dash_secret'); } catch (e) {}
     secretInput.value = '';
   });
   document.getElementById('heatPage').addEventListener('change', function () {
@@ -617,6 +675,7 @@
     if (option && option.dataset.device) document.getElementById('heatDevice').value = option.dataset.device;
   });
 
+  document.getElementById('firstRun').hidden = Boolean(stored);
   if (stored) loadAll();
 }());
 </script>

@@ -42,7 +42,13 @@
 	/* Type */
 	--tbay-text:        #e4eaf5;
 	--tbay-text-2:      #8896b4;
+	/*
+	 * The theme's --c-text3 measures 2.56:1 on our surface — below even the 3:1
+	 * large-text floor — so it is kept only for decorative and disabled states.
+	 * Anything a reader needs uses --tbay-text-muted, which is text-2 at 5.77:1.
+	 */
 	--tbay-text-3:      #4f5c78;
+	--tbay-text-muted:  #8896b4;
 	--tbay-font-display: 'Syne', var(--font-display, sans-serif);
 	--tbay-font-body:    'DM Sans', var(--font-body, sans-serif);
 	--tbay-font-mono:    'JetBrains Mono', var(--font-mono, monospace);
@@ -127,6 +133,7 @@
 
 /* ── Buttons ─────────────────────────────────────────────────────────────── */
 
+.tbay-root .tbay-button,
 .tbay-button {
 	display: inline-flex;
 	align-items: center;
@@ -204,8 +211,18 @@
 
 /* ── Fields ──────────────────────────────────────────────────────────────── */
 
-.tbay-field { display: block; }
+.tbay-root .tbay-field,
+.tbay-field { display: block; margin-bottom: 0; }
 
+/*
+ * Scoped under .tbay-root as well as the component class.
+ *
+ * The tbay.tk theme styles bare `input`/`button[type=submit]` elements, and a
+ * single class ties with an element selector on specificity — so the theme won,
+ * taking the 16px font with it and letting iOS zoom the page on every focus.
+ */
+.tbay-root .tbay-field input,
+.tbay-root .tbay-field select,
 .tbay-field input,
 .tbay-field select {
 	width: 100%;
@@ -220,7 +237,7 @@
 	min-height: 44px;
 }
 
-.tbay-field input::placeholder { color: var(--tbay-text-3); }
+.tbay-field input::placeholder { color: var(--tbay-text-muted); }
 
 .tbay-field input:focus,
 .tbay-field select:focus {
@@ -229,7 +246,18 @@
 	box-shadow: 0 0 0 3px rgba(0, 212, 212, .15);
 }
 
-.tbay-field--inline { flex: 0 0 auto; max-width: 9rem; }
+/* Visible field labels: a bare number box between two buttons is a guess. */
+.tbay-field__label {
+	display: block;
+	margin-bottom: .3rem;
+	font-family: var(--tbay-font-mono);
+	font-size: .68rem;
+	letter-spacing: .1em;
+	text-transform: uppercase;
+	color: var(--tbay-text-muted);
+}
+
+.tbay-field--inline { flex: 0 0 auto; max-width: 11rem; }
 .tbay-field--inline input { font-family: var(--tbay-font-mono); text-align: right; }
 
 /* Off-screen rather than display:none — plenty of bots skip hidden inputs. */
@@ -297,6 +325,9 @@
 
 .tbay-newsletter__fields .tbay-field { flex: 1 1 13rem; min-width: 0; }
 
+/* Grow horizontally in a row; reset in the column media query below. */
+.tbay-field--grow { flex: 1 1 12rem; min-width: 0; }
+
 .tbay-newsletter__status { margin: .85rem 0 0; font-size: .875rem; }
 .tbay-newsletter__status:empty { display: none; }
 
@@ -334,7 +365,8 @@
 	font-size: .8rem;
 	font-weight: 500;
 	cursor: pointer;
-	min-height: 36px;
+	/* Sharing is the main way to earn, so it gets a full-size tap target. */
+	min-height: 44px;
 	transition: color var(--tbay-t-fast), border-color var(--tbay-t-fast), background var(--tbay-t-fast);
 }
 
@@ -374,10 +406,10 @@
 .tbay-stat__label {
 	display: block;
 	font-family: var(--tbay-font-mono);
-	font-size: .68rem;
+	font-size: .72rem;
 	letter-spacing: .14em;
 	text-transform: uppercase;
-	color: var(--tbay-text-3);
+	color: var(--tbay-text-muted);
 }
 
 .tbay-stat__value {
@@ -434,7 +466,7 @@
 	transition: width var(--tbay-t-mid) var(--tbay-ease);
 }
 
-.tbay-progress__label { font-size: .78rem; color: var(--tbay-text-3); margin-top: .35rem; display: block; }
+.tbay-progress__label { font-size: .78rem; color: var(--tbay-text-muted); margin-top: .35rem; display: block; }
 
 /* ── Badges ──────────────────────────────────────────────────────────────── */
 
@@ -454,9 +486,14 @@
 
 .tbay-badge--earned { border-color: var(--tbay-border-glow); box-shadow: var(--tbay-shadow-glow); }
 
-/* Unearned badges are dimmed, not hidden: seeing what is next is the point. */
-.tbay-badge--locked { opacity: .55; }
-.tbay-badge--locked .tbay-badge__icon { filter: grayscale(1); }
+/*
+ * Unearned badges are dimmed, not hidden: seeing what is next is the point.
+ * The dimming is applied to the icon only — fading the whole tile took its
+ * text to 1.6:1, so the one thing a locked badge needs to communicate became
+ * the least readable thing on the card.
+ */
+.tbay-badge--locked .tbay-badge__icon { filter: grayscale(1); opacity: .5; }
+.tbay-badge--locked .tbay-badge__name { color: var(--tbay-text-2); }
 
 .tbay-badge__icon {
 	width: 48px;
@@ -494,7 +531,15 @@
 	color: var(--tbay-primary);
 }
 
-.tbay-badge__next { display: block; margin-top: .35rem; font-size: .7rem; color: var(--tbay-text-3); }
+.tbay-badge__desc {
+	display: block;
+	margin-top: .3rem;
+	font-size: .72rem;
+	line-height: 1.45;
+	color: var(--tbay-text-muted);
+}
+
+.tbay-badge__next { display: block; margin-top: .35rem; font-size: .72rem; color: var(--tbay-text-muted); }
 
 /* ── Wallet and bridge ───────────────────────────────────────────────────── */
 
@@ -528,8 +573,8 @@
 
 .tbay-wallet__note {
 	margin: 1rem 0 0;
-	font-size: .8rem;
-	color: var(--tbay-text-3);
+	font-size: .82rem;
+	color: var(--tbay-text-muted);
 	max-width: 62ch;
 	line-height: 1.7;
 }
@@ -572,7 +617,7 @@
 }
 
 .tbay-bridge__quote dl { display: grid; grid-template-columns: auto 1fr; gap: .3rem .9rem; margin: 0; }
-.tbay-bridge__quote dt { color: var(--tbay-text-3); }
+.tbay-bridge__quote dt { color: var(--tbay-text-muted); }
 .tbay-bridge__quote dd { margin: 0; font-family: var(--tbay-font-mono); color: var(--tbay-text); overflow-wrap: anywhere; }
 
 .tbay-bridge__warning {
@@ -604,10 +649,10 @@
 
 .tbay-ledger th {
 	font-family: var(--tbay-font-mono);
-	font-size: .66rem;
+	font-size: .72rem;
 	letter-spacing: .12em;
 	text-transform: uppercase;
-	color: var(--tbay-text-3);
+	color: var(--tbay-text-muted);
 	font-weight: 500;
 }
 
@@ -647,14 +692,27 @@
 	margin: 1rem 0;
 }
 
-.tbay-empty { padding: 1.5rem 0; color: var(--tbay-text-3); font-size: .9rem; text-align: center; }
+.tbay-empty { padding: 1.5rem 0; color: var(--tbay-text-muted); font-size: .9rem; text-align: center; }
 
 /* ── Responsive refinements ──────────────────────────────────────────────── */
 
 /* Below 30rem the wallet controls stack: a redeem input beside a button is
    unusable at 320px. */
 @media (max-width: 30rem) {
+	/*
+	 * Once these containers become columns, `flex-basis` stops meaning width and
+	 * starts meaning HEIGHT — a 13rem basis turned every field into a 208px-tall
+	 * box with a 44px input floating at the top. Reset the basis wherever the
+	 * direction flips.
+	 */
+	.tbay-newsletter__fields .tbay-field,
+	.tbay-wallet__actions .tbay-field,
+	.tbay-bridge__row .tbay-field,
+	.tbay-field--grow,
+	.tbay-rank__body { flex: 1 1 auto; }
+
 	.tbay-newsletter__fields { flex-direction: column; }
+	.tbay-root .tbay-newsletter__fields .tbay-button,
 	.tbay-newsletter__fields .tbay-button,
 	.tbay-wallet__actions .tbay-button,
 	.tbay-bridge__row .tbay-button { width: 100%; }
