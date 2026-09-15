@@ -1,0 +1,84 @@
+# TBAY Rewards — single-VPS deployment.
+#
+#   cp .env.docker.example .env && edit it
+#   docker compose up -d
+#
+# Put a TLS terminator (Caddy, nginx, Cloudflare Tunnel) in front of `app`.
+# See docs/DEPLOYMENT.md for a ready-made Caddyfile.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-tbay}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-tbay_rewards}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # Not published to the host: only the app and worker need to reach it.
+    expose:
+      - '5432'
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-tbay} -d ${POSTGRES_DB:-tbay_rewards}']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://${POSTGRES_USER:-tbay}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-tbay_rewards}
+      PUBLIC_URL: ${PUBLIC_URL:?set PUBLIC_URL in .env}
+      IDENTITY_SALT: ${IDENTITY_SALT:?set IDENTITY_SALT in .env}
+      TOKEN_SECRET: ${TOKEN_SECRET:?set TOKEN_SECRET in .env}
+      TBAY_CHAIN_ID: ${TBAY_CHAIN_ID:-300}
+      TBAY_L2_CONTRACT: ${TBAY_L2_CONTRACT:-0x74eb73ACa939Fc911f79D9589e808f0207684D09}
+      TBAY_L1_CONTRACT: ${TBAY_L1_CONTRACT:-0xC17e078E914aB6023dd48831358067d428409116}
+      TBAY_RPC_URL: ${TBAY_RPC_URL:-https://sepolia.era.zksync.dev}
+      TBAY_CLAIM_SIGNER_KEY: ${TBAY_CLAIM_SIGNER_KEY:-}
+      TBAY_REWARD_SUPPLY_CAP_WEI: ${TBAY_REWARD_SUPPLY_CAP_WEI:-0}
+      TBAY_SUPPLY_MODE: ${TBAY_SUPPLY_MODE:-mint}
+      BRIDGE_OPERATOR_TOKEN: ${BRIDGE_OPERATOR_TOKEN:-}
+      THIRDWEB_CLIENT_ID: ${THIRDWEB_CLIENT_ID:-}
+      EMAIL_TRANSPORT: ${EMAIL_TRANSPORT:-log}
+      EMAIL_FROM_NAME: ${EMAIL_FROM_NAME:-TBAY Rewards}
+      EMAIL_FROM_ADDRESS: ${EMAIL_FROM_ADDRESS:-no-reply@tbay.tk}
+      SMTP_URL: ${SMTP_URL:-}
+      # The worker container owns the background jobs; the API just serves.
+      RUN_WORKERS: 'false'
+    ports:
+      - '127.0.0.1:${APP_PORT:-4000}:4000'
+
+  worker:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      app:
+        condition: service_started
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://${POSTGRES_USER:-tbay}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-tbay_rewards}
+      PUBLIC_URL: ${PUBLIC_URL}
+      IDENTITY_SALT: ${IDENTITY_SALT}
+      TOKEN_SECRET: ${TOKEN_SECRET}
+      TBAY_CHAIN_ID: ${TBAY_CHAIN_ID:-300}
+      TBAY_L2_CONTRACT: ${TBAY_L2_CONTRACT:-0x74eb73ACa939Fc911f79D9589e808f0207684D09}
+      TBAY_RPC_URL: ${TBAY_RPC_URL:-https://sepolia.era.zksync.dev}
+      TBAY_CLAIM_SIGNER_KEY: ${TBAY_CLAIM_SIGNER_KEY:-}
+      EMAIL_TRANSPORT: ${EMAIL_TRANSPORT:-log}
+      EMAIL_FROM_ADDRESS: ${EMAIL_FROM_ADDRESS:-no-reply@tbay.tk}
+      SMTP_URL: ${SMTP_URL:-}
+      # The API container already applied the migrations on boot.
+      MIGRATE_ON_BOOT: 'false'
+    command: ['node', 'packages/server/dist/workers/standalone.js']
+
+volumes:
+  pgdata:

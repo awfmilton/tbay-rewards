@@ -1,0 +1,338 @@
+import type { FastifyInstance } from 'fastify';
+import { z } from 'zod';
+import { db } from '../db/pool.js';
+import { requireSecretKey, tenantOf } from '../lib/auth.js';
+import { ApiError } from '../lib/errors.js';
+import { parse } from './collect.js';
+import { contactHandleSchema } from './schemas.js';
+import { requireContact } from '../services/contacts.js';
+import {
+  awardBadgeManually,
+  badgesForContact,
+  createCoupon,
+  evaluateBadges,
+  evaluateRank,
+  listNotifications,
+  listRanks,
+  markNotificationsRead,
+  profile,
+  recordStreak,
+  redeemCoupon,
+  transferPoints,
+  unlockContent,
+  hasUnlocked,
+} from '../services/gamification.js';
+import {
+  getWithdrawal,
+  listWithdrawals,
+  markReleased,
+  recordWithdrawal,
+  rejectWithdrawal,
+  withdrawalInstructions,
+} from '../services/bridge.js';
+import { tokensToWei } from '../lib/chain.js';
+
+/** Gamification and bridge endpoints. Secret-key authenticated throughout. */
+export async function gamificationRoutes(app: FastifyInstance): Promise<void> {
+  app.addHook('preHandler', async (request) => {
+    await requireSecretKey(request);
+  });
+
+  // ── Profile, badges, ranks ────────────────────────────────────────────────
+
+  app.get<{ Querystring: { contactId?: string; email?: string; externalRef?: string } }>(
+    '/v1/gamification/profile',
+    async (request) => {
+      const tenant = tenantOf(request);
+      const contact = await requireContact(tenant.id, request.query);
+      return { contact_id: contact.id, ...(await profile(tenant.id, contact.id)) };
+    },
+  );
+
+  app.get<{ Querystring: { contactId?: string; email?: string } }>(
+    '/v1/gamification/badges',
+    async (request) => {
+      const tenant = tenantOf(request);
+      const contact = await requireContact(tenant.id, request.query);
+      return { badges: await badgesForContact(tenant.id, contact.id) };
+    },
+  );
+
+  app.get('/v1/gamification/ranks', async (request) => {
+    const tenant = tenantOf(request);
+    return { ranks: await listRanks(tenant.id) };
+  });
+
+  /** Re-run badge and rank evaluation, e.g. after a bulk import. */
+  app.post('/v1/gamification/evaluate', async (request) => {
+    const tenant = tenantOf(request);
+    const input = parse(contactHandleSchema, request.body);
+    const contact = await requireContact(tenant.id, input);
+
+    const badges = await evaluateBadges(tenant.id, contact.id);
+    const rank = await evaluateRank(tenant.id, contact.id);
+
+    return {
+      badges_earned: badges.map((entry) => ({
+        key: entry.badge.key,
+        name: entry.badge.name,
+        level: entry.level,
+        points_awarded: entry.pointsAwarded,
+      })),
+      rank: rank.rank ? { key: rank.rank.key, name: rank.rank.name } : null,
+      promoted: rank.promoted,
+    };
+  });
+
+  app.post('/v1/gamification/badges/award', async (request) => {
+    const tenant = tenantOf(request);
+    const input = parse(
+      contactHandleSchema.extend({
+        badgeKey: z.string().max(64),
+        level: z.number().int().min(1).max(20).optional(),
+      }),
+      request.body,
+    );
+    const contact = await requireContact(tenant.id, input);
+    const awarded = await awardBadgeManually(tenant.id, contact.id, input.badgeKey, input.level ?? 1);
+    return { award: awarded };
+  });
+
+  // ── Streaks ───────────────────────────────────────────────────────────────
+
+  app.post('/v1/gamification/streak', async (request) => {
+    const tenant = tenantOf(request);
+    const input = parse(
+      contactHandleSchema.extend({ key: z.string().max(64).optional() }),
+      request.body,
+    );
+    const contact = await requireContact(tenant.id, input);
+    return recordStreak(tenant.id, contact.id, input.key ?? 'daily_login');
+  });
+
+  // ── Transfers ─────────────────────────────────────────────────────────────
+
+  app.post('/v1/gamification/transfer', async (request) => {
+    const tenant = tenantOf(request);
+    const input = parse(
+      z.object({
+        fromContactId: z.string().uuid().optional(),
+        fromEmail: z.string().email().max(254).optional(),
+        toContactId: z.string().uuid().optional(),
+        toEmail: z.string().email().max(254).optional(),
+        points: z.number().int().positive().max(1_000_000),
+        message: z.string().max(500).optional(),
+      }),
+      request.body,
+    );
+
+    const sender = await requireContact(tenant.id, {
+      contactId: input.fromContactId,
+      email: input.fromEmail,
+    });
+    const recipient = await requireContact(tenant.id, {
+      contactId: input.toContactId,
+      email: input.toEmail,
+    });
+
+    return transferPoints(tenant.id, {
+      fromContactId: sender.id,
+      toContactId: recipient.id,
+      points: input.points,
+      message: input.message,
+    });
+  });
+
+  // ── Coupons ───────────────────────────────────────────────────────────────
+
+  app.post('/v1/gamification/coupons', async (request) => {
+    const tenant = tenantOf(request);
+    const input = parse(
+      z.object({
+        code: z.string().min(3).max(64).regex(/^[A-Za-z0-9_-]+$/),
+        points: z.number().int().positive().max(1_000_000),
+        maxUses: z.number().int().positive().nullish(),
+        perContactLimit: z.number().int().positive().max(100).optional(),
+        expiresAt: z.string().max(40).nullish(),
+      }),
+      request.body,
+    );
+    return createCoupon(tenant.id, input);
+  });
+
+  app.post('/v1/gamification/coupons/redeem', async (request) => {
+    const tenant = tenantOf(request);
+    const input = parse(
+      contactHandleSchema.extend({ code: z.string().min(1).max(64) }),
+      request.body,
+    );
+    const contact = await requireContact(tenant.id, input);
+    return redeemCoupon(tenant.id, contact.id, input.code);
+  });
+
+  // ── Gated content ─────────────────────────────────────────────────────────
+
+  app.post('/v1/gamification/content/unlock', async (request) => {
+    const tenant = tenantOf(request);
+    const input = parse(
+      contactHandleSchema.extend({
+        contentRef: z.string().min(1).max(191),
+        points: z.number().int().positive().max(1_000_000),
+      }),
+      request.body,
+    );
+    const contact = await requireContact(tenant.id, input);
+    return unlockContent(tenant.id, contact.id, input.contentRef, input.points);
+  });
+
+  app.get<{ Querystring: { contactId?: string; email?: string; contentRef?: string } }>(
+    '/v1/gamification/content/access',
+    async (request) => {
+      const tenant = tenantOf(request);
+      const contentRef = String(request.query.contentRef ?? '');
+      if ('' === contentRef) throw ApiError.badRequest('contentRef is required');
+      const contact = await requireContact(tenant.id, request.query);
+      return { unlocked: await hasUnlocked(tenant.id, contact.id, contentRef) };
+    },
+  );
+
+  // ── Notifications ─────────────────────────────────────────────────────────
+
+  app.get<{ Querystring: { contactId?: string; email?: string; unread?: string } }>(
+    '/v1/gamification/notifications',
+    async (request) => {
+      const tenant = tenantOf(request);
+      const contact = await requireContact(tenant.id, request.query);
+      return {
+        notifications: await listNotifications(tenant.id, contact.id, {
+          unreadOnly: request.query.unread === '1',
+        }),
+      };
+    },
+  );
+
+  app.post('/v1/gamification/notifications/read', async (request) => {
+    const tenant = tenantOf(request);
+    const input = parse(
+      contactHandleSchema.extend({ ids: z.array(z.string().uuid()).max(200).optional() }),
+      request.body,
+    );
+    const contact = await requireContact(tenant.id, input);
+    return { marked: await markNotificationsRead(tenant.id, contact.id, input.ids ?? null) };
+  });
+
+  // ── L2 → L1 bridge ────────────────────────────────────────────────────────
+
+  /** What to call on the L2 contract, and what the dust rules mean for you. */
+  app.post('/v1/bridge/quote', async (request) => {
+    const input = parse(
+      z.object({
+        amountTokens: z.number().positive().optional(),
+        amountWei: z.string().regex(/^\d+$/).optional(),
+      }),
+      request.body,
+    );
+    if (!input.amountTokens && !input.amountWei) {
+      throw ApiError.badRequest('Provide amountTokens or amountWei');
+    }
+    const wei = input.amountWei ? BigInt(input.amountWei) : tokensToWei(input.amountTokens!);
+    return withdrawalInstructions(wei);
+  });
+
+  /** Submit a completed burn so the L1 release can be queued. */
+  app.post('/v1/bridge/withdrawals', async (request) => {
+    const tenant = tenantOf(request);
+    const input = parse(
+      contactHandleSchema.extend({
+        burnTxHash: z.string().length(66),
+        fromAddress: z.string().length(42),
+        l1Recipient: z.string().length(42).nullish(),
+      }),
+      request.body,
+    );
+
+    let contactId: string | null = null;
+    let memberId: string | null = null;
+    try {
+      const contact = await requireContact(tenant.id, input);
+      contactId = contact.id;
+      memberId = contact.member_id;
+    } catch {
+      // A withdrawal is a wallet action, not an account action: someone who
+      // never signed up can still bridge tokens they hold.
+    }
+
+    return recordWithdrawal({
+      burnTxHash: input.burnTxHash,
+      fromAddress: input.fromAddress,
+      l1Recipient: input.l1Recipient ?? null,
+      tenantId: tenant.id,
+      contactId,
+      memberId,
+    });
+  });
+
+  app.get<{ Querystring: { fromAddress?: string; status?: string } }>(
+    '/v1/bridge/withdrawals',
+    async (request) => {
+      const tenant = tenantOf(request);
+      return {
+        withdrawals: await listWithdrawals({
+          tenantId: tenant.id,
+          fromAddress: request.query.fromAddress,
+          status: request.query.status,
+        }),
+      };
+    },
+  );
+
+  app.get<{ Params: { id: string } }>('/v1/bridge/withdrawals/:id', async (request) => {
+    const tenant = tenantOf(request);
+    const withdrawal = await getWithdrawal(request.params.id);
+    // Scope the lookup: a withdrawal id must not leak another retailer's data.
+    if (!withdrawal || (withdrawal.tenant_id && withdrawal.tenant_id !== tenant.id)) {
+      throw ApiError.notFound('Withdrawal not found');
+    }
+    return { withdrawal };
+  });
+
+  /**
+   * Operator-only settlement.
+   *
+   * Releasing on L1 is an assertion the platform cannot verify from L2, so it
+   * requires the separate bridge-operator credential rather than any retailer's
+   * API secret.
+   */
+  app.post<{ Params: { id: string } }>('/v1/bridge/withdrawals/:id/release', async (request) => {
+    requireBridgeOperator(request.headers['x-tbay-operator'] as string | undefined);
+    const input = parse(z.object({ l1TxHash: z.string().length(66) }), request.body);
+    const released = await markReleased(request.params.id, input.l1TxHash);
+    if (!released) throw ApiError.conflict('That withdrawal is not awaiting release');
+    return { withdrawal: released };
+  });
+
+  app.post<{ Params: { id: string } }>('/v1/bridge/withdrawals/:id/reject', async (request) => {
+    requireBridgeOperator(request.headers['x-tbay-operator'] as string | undefined);
+    const input = parse(z.object({ reason: z.string().max(500) }), request.body);
+    const rejected = await rejectWithdrawal(request.params.id, input.reason);
+    if (!rejected) throw ApiError.conflict('That withdrawal cannot be rejected');
+    return { withdrawal: rejected };
+  });
+}
+
+function requireBridgeOperator(presented: string | undefined): void {
+  const expected = process.env.BRIDGE_OPERATOR_TOKEN ?? '';
+  if ('' === expected) {
+    throw new ApiError(503, 'operator_unavailable', 'No bridge operator token is configured');
+  }
+  if (!presented || presented.length !== expected.length) {
+    throw ApiError.forbidden('Bridge operator credential required');
+  }
+  // Constant-time compare so the token cannot be recovered a byte at a time.
+  let mismatch = 0;
+  for (let i = 0; i < expected.length; i += 1) {
+    mismatch |= expected.charCodeAt(i) ^ presented.charCodeAt(i);
+  }
+  if (mismatch !== 0) throw ApiError.forbidden('Bridge operator credential required');
+}
+
