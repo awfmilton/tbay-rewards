@@ -188,7 +188,10 @@ class TBAY_Rewards_UI {
 					<p class="tbay-rank__name"><?php echo esc_html( (string) ( $rank['name'] ?? '' ) ); ?></p>
 					<p class="tbay-rank__desc"><?php echo esc_html( (string) ( $rank['description'] ?? '' ) ); ?></p>
 
-					<div class="tbay-progress">
+					<div class="tbay-progress" role="progressbar"
+						aria-valuenow="<?php echo esc_attr( (string) $percent ); ?>"
+						aria-valuemin="0" aria-valuemax="100"
+						aria-label="<?php esc_attr_e( 'Progress toward the next rank', 'tbay-rewards' ); ?>">
 						<div class="tbay-progress__bar" style="width:<?php echo esc_attr( (string) $percent ); ?>%"></div>
 					</div>
 
@@ -257,8 +260,12 @@ class TBAY_Rewards_UI {
 						}
 					}
 					?>
-					<div class="tbay-badge <?php echo $earned ? 'tbay-badge--earned' : 'tbay-badge--locked'; ?>"
-						title="<?php echo esc_attr( (string) ( $badge['description'] ?? '' ) ); ?>">
+					<div class="tbay-badge <?php echo $earned ? 'tbay-badge--earned' : 'tbay-badge--locked'; ?>">
+						<span class="screen-reader-text">
+							<?php echo $earned
+								? esc_html__( 'Earned:', 'tbay-rewards' )
+								: esc_html__( 'Locked:', 'tbay-rewards' ); ?>
+						</span>
 
 						<div class="tbay-badge__icon" aria-hidden="true">
 							<?php if ( ! empty( $badge['image_url'] ) ) : ?>
@@ -269,6 +276,9 @@ class TBAY_Rewards_UI {
 						</div>
 
 						<p class="tbay-badge__name"><?php echo esc_html( (string) ( $badge['name'] ?? '' ) ); ?></p>
+						<?php if ( ! empty( $badge['description'] ) ) : ?>
+							<span class="tbay-badge__desc"><?php echo esc_html( (string) $badge['description'] ); ?></span>
+						<?php endif; ?>
 
 						<?php if ( $earned && '' !== $label ) : ?>
 							<span class="tbay-badge__tier"><?php echo esc_html( $label ); ?></span>
@@ -325,7 +335,7 @@ class TBAY_Rewards_UI {
 				</button>
 
 				<label class="tbay-field tbay-field--inline">
-					<span class="screen-reader-text"><?php esc_html_e( 'Points to redeem', 'tbay-rewards' ); ?></span>
+					<span class="tbay-field__label"><?php esc_html_e( 'Points to redeem', 'tbay-rewards' ); ?></span>
 					<input type="number" inputmode="numeric" min="0" step="1"
 						value="<?php echo esc_attr( (string) $points ); ?>"
 						max="<?php echo esc_attr( (string) $points ); ?>" data-tbay-redeem-amount>
@@ -335,6 +345,9 @@ class TBAY_Rewards_UI {
 					<?php esc_html_e( 'Redeem for TBAY', 'tbay-rewards' ); ?>
 				</button>
 			</div>
+
+			<?php // An unfinished claim from an earlier attempt, with a way to finish it. ?>
+			<div data-tbay-pending hidden></div>
 
 			<p class="tbay-wallet__status" role="status" aria-live="polite" data-tbay-wallet-status></p>
 
@@ -366,7 +379,7 @@ class TBAY_Rewards_UI {
 
 			<div class="tbay-bridge__row">
 				<label class="tbay-field tbay-field--inline">
-					<span class="screen-reader-text"><?php esc_html_e( 'TBAY to bridge', 'tbay-rewards' ); ?></span>
+					<span class="tbay-field__label"><?php esc_html_e( 'TBAY to move', 'tbay-rewards' ); ?></span>
 					<input type="number" inputmode="decimal" min="0" step="0.000000001"
 						placeholder="0.0" data-tbay-bridge-amount>
 				</label>
@@ -381,6 +394,10 @@ class TBAY_Rewards_UI {
 			</div>
 
 			<div class="tbay-bridge__quote" data-tbay-bridge-quote-output hidden></div>
+
+			<?php // A burn we have not managed to record yet, with a retry. ?>
+			<div data-tbay-bridge-pending hidden></div>
+
 			<p class="tbay-bridge__status" role="status" aria-live="polite" data-tbay-bridge-status></p>
 
 			<p class="tbay-wallet__note">
@@ -403,7 +420,7 @@ class TBAY_Rewards_UI {
 			<h3 class="tbay-title"><?php esc_html_e( 'Redeem a reward code', 'tbay-rewards' ); ?></h3>
 
 			<div class="tbay-wallet__actions">
-				<label class="tbay-field" style="flex:1 1 12rem">
+				<label class="tbay-field tbay-field--grow">
 					<span class="screen-reader-text"><?php esc_html_e( 'Reward code', 'tbay-rewards' ); ?></span>
 					<input type="text" autocomplete="off" spellcheck="false"
 						placeholder="<?php esc_attr_e( 'WELCOME50', 'tbay-rewards' ); ?>"
@@ -431,7 +448,7 @@ class TBAY_Rewards_UI {
 			</p>
 
 			<div class="tbay-wallet__actions">
-				<label class="tbay-field" style="flex:1 1 12rem">
+				<label class="tbay-field tbay-field--grow">
 					<span class="screen-reader-text"><?php esc_html_e( 'Recipient email', 'tbay-rewards' ); ?></span>
 					<input type="email" autocomplete="off"
 						placeholder="<?php esc_attr_e( 'them@example.com', 'tbay-rewards' ); ?>"
@@ -439,7 +456,7 @@ class TBAY_Rewards_UI {
 				</label>
 
 				<label class="tbay-field tbay-field--inline">
-					<span class="screen-reader-text"><?php esc_html_e( 'Points to send', 'tbay-rewards' ); ?></span>
+					<span class="tbay-field__label"><?php esc_html_e( 'Points to send', 'tbay-rewards' ); ?></span>
 					<input type="number" inputmode="numeric" min="1" step="1"
 						max="<?php echo esc_attr( (string) $points ); ?>"
 						placeholder="100" data-tbay-transfer-amount>
@@ -530,7 +547,24 @@ class TBAY_Rewards_UI {
 		$wallet  = is_wp_error( $balance ) ? '' : (string) ( $balance['wallet_address'] ?? '' );
 
 		ob_start();
-		echo '<div class="tbay-root tbay-rewards" data-tbay-rewards>';
+		// No data-tbay-rewards wrapper: that attribute makes the script treat
+		// this as a full dashboard and look for wallet controls that a
+		// standalone bridge panel does not render, leaving every click stuck on
+		// "connect your wallet".
+		echo '<div class="tbay-root tbay-rewards">';
+
+		if ( '' !== $wallet ) {
+			printf(
+				'<p class="tbay-wallet__address" data-tbay-wallet-address><code>%s</code></p>',
+				esc_html( $wallet )
+			);
+		} else {
+			printf(
+				'<p class="tbay-notice">%s</p>',
+				esc_html__( 'Connect and verify a wallet on your rewards page before bridging.', 'tbay-rewards' )
+			);
+		}
+
 		$this->render_bridge_panel( $this->api->chain_config(), $wallet );
 		echo '</div>';
 		return (string) ob_get_clean();
@@ -697,8 +731,9 @@ class TBAY_Rewards_UI {
 		$logged_in = static fn(): bool => is_user_logged_in();
 
 		$routes = array(
-			'share'          => array( 'POST', 'handle_share' ),
-			'wallet'         => array( 'POST', 'handle_wallet' ),
+			'share'            => array( 'POST', 'handle_share' ),
+			'wallet/challenge' => array( 'POST', 'handle_wallet_challenge' ),
+			'wallet'           => array( 'POST', 'handle_wallet' ),
 			'redeem'         => array( 'POST', 'handle_redeem' ),
 			'claim-tx'       => array( 'POST', 'handle_claim_tx' ),
 			'balance'        => array( 'GET', 'handle_balance' ),
@@ -750,7 +785,14 @@ class TBAY_Rewards_UI {
 			: new WP_REST_Response( $result, 200 );
 	}
 
-	public function handle_wallet( WP_REST_Request $request ): WP_REST_Response {
+	/**
+	 * Step one of linking a wallet: ask the platform for a challenge to sign.
+	 *
+	 * Wallets are never bound on a claim alone — anything that later trusts the
+	 * stored address (bridging above all) would otherwise be pointable at an
+	 * address the member does not control.
+	 */
+	public function handle_wallet_challenge( WP_REST_Request $request ): WP_REST_Response {
 		$contact_id = $this->require_contact();
 		if ( null === $contact_id ) {
 			return $this->error( __( 'Your rewards account is not ready yet.', 'tbay-rewards' ) );
@@ -762,14 +804,51 @@ class TBAY_Rewards_UI {
 		}
 
 		$result = $this->api->post(
-			'/v1/contacts/wallet',
+			'/v1/wallet/challenge',
 			array( 'contactId' => $contact_id, 'walletAddress' => $address )
 		);
-		if ( is_wp_error( $result ) ) {
-			return $this->error( $result->get_error_message() );
+
+		return is_wp_error( $result )
+			? $this->error( $result->get_error_message() )
+			: new WP_REST_Response( $result, 200 );
+	}
+
+	/** Step two: hand the signature back so the platform can verify it. */
+	public function handle_wallet( WP_REST_Request $request ): WP_REST_Response {
+		$contact_id = $this->require_contact();
+		if ( null === $contact_id ) {
+			return $this->error( __( 'Your rewards account is not ready yet.', 'tbay-rewards' ) );
 		}
 
-		update_user_meta( get_current_user_id(), '_tbay_wallet', $address );
+		$nonce     = sanitize_text_field( (string) $request->get_param( 'nonce' ) );
+		$signature = sanitize_text_field( (string) $request->get_param( 'signature' ) );
+		$message   = sanitize_textarea_field( (string) $request->get_param( 'message' ) );
+
+		if ( '' === $nonce || ! preg_match( '/^0x[0-9a-fA-F]{100,}$/', $signature ) || '' === $message ) {
+			return $this->error( __( 'That wallet signature could not be read.', 'tbay-rewards' ) );
+		}
+
+		$result = $this->api->post(
+			'/v1/contacts/wallet',
+			array(
+				'contactId' => $contact_id,
+				'nonce'     => $nonce,
+				'signature' => $signature,
+				'message'   => $message,
+			)
+		);
+		if ( is_wp_error( $result ) ) {
+			return $this->error( $result->get_error_message(), 403 );
+		}
+
+		// Only recorded locally once the platform has actually verified it.
+		if ( ! empty( $result['wallet_address'] ) ) {
+			update_user_meta(
+				get_current_user_id(),
+				'_tbay_wallet',
+				sanitize_text_field( (string) $result['wallet_address'] )
+			);
+		}
 		$this->api->flush_cache();
 
 		return new WP_REST_Response( $result, 200 );

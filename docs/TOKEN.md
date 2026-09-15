@@ -118,7 +118,25 @@ reverted transactions:
 | Minimum claim | `1e15` wei (0.001 TBAY) |
 | Maximum claim | `1e4 * 1e18` wei (10,000 TBAY) |
 | Hourly mint window | `1e5 * 1e18` wei (100,000 TBAY) |
-| Voucher lifetime | 60 minutes (`CLAIM_TTL_MINUTES`) |
+| Voucher presented as current for | 60 minutes (`CLAIM_TTL_MINUTES`) |
+
+### Vouchers do not expire on-chain
+
+`claim()` takes no deadline, so a signature stays valid forever. The platform
+therefore **never refunds an aged-out voucher** — doing so would let someone
+collect the refund and still mint. An aged-out voucher stays claimable and
+appears in `GET /v1/token/claims/outstanding` so the member can submit it later.
+
+**The fix belongs in the contract.** A v2 `Claim` struct should carry a
+`deadline` that `claim()` enforces:
+
+```solidity
+bytes32 claimTypeHash =
+    keccak256("Claim(address user,uint256 amount,uint256 nonce,uint256 deadline)");
+if (block.timestamp > deadline) revert ClaimExpired();
+```
+
+With that deployed, set `CLAIM_REFUND_ON_EXPIRY=true` and expiry becomes safe.
 
 ### Supply modes
 
@@ -225,6 +243,8 @@ The L2 contract exposes `contractURI()` for thirdweb dashboards, and
 - [ ] Move the reserve to a wallet the bridge operator controls
 - [ ] Switch `TBAY_CHAIN_ID` to 324 and deploy the L2 contract to Era mainnet
 - [ ] Grant `CLAIMER_ROLE` to the platform signing key; grant nothing else
+- [ ] Consider redeploying L2 with a `deadline` in the Claim struct, so unclaimed
+      vouchers can be safely refunded
 - [ ] Set `BRIDGE_OPERATOR_TOKEN` and rehearse a release end to end
 - [ ] Decide `mint` vs `treasury` and, for treasury, fund the wallet with gas
 - [ ] Set the network `CREDIT_CENTS_PER_TOKEN`

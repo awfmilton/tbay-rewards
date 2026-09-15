@@ -26,7 +26,7 @@ re-saving the page never wipes a credential you cannot see.
 | `[tbay_badges]` | Badge wall |
 | `[tbay_bridge]` | The L2 → L1 bridge on its own |
 | `[tbay_leaderboard]` | Top members by lifetime points |
-| `[tbay_share]` | Share buttons that pay when the link is clicked |
+| `[tbay_share]` | Share buttons that pay when someone else clicks the link |
 | `[tbay_link product="123"]…[/tbay_link]` | A tracked product link earning the author commission |
 
 Attributes:
@@ -58,6 +58,8 @@ Always:
 - Syncs WordPress users to platform contacts (`external_ref` is the user id, so a
   customer who changes their email address stays the same contact)
 - Counts one visit per member per day toward their streak
+- Sets a first-party visitor cookie, which is what lets checkout attribute an
+  order back to the writer link that brought it
 - Serves `/wp-json/tbay/v1/webhook` for signed platform callbacks
 
 ---

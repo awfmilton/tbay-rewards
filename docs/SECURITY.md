@@ -35,6 +35,16 @@ is hashed and compared.
 - Transfers debit and credit inside one transaction, so points cannot be
   duplicated or destroyed by a half-applied transfer.
 
+### A wallet must be proved before it can receive anything
+
+Binding a wallet requires signing a server-issued, single-use, ten-minute
+challenge with the private key. Redemption, TBAY spending and bridging all pay
+out to that proved address and ignore any address supplied in the request.
+
+Without this, "my wallet is 0xVICTIM" is an unverified assertion, and anything
+downstream that trusts the stored address can be pointed at someone else's
+tokens. Signing costs nothing, needs no gas, and grants no spending permission.
+
 ### Nobody can steal a claim voucher
 
 - A signature authorises exactly one `(user, amount, nonce)` on one chain and one
@@ -45,13 +55,21 @@ is hashed and compared.
 - Nonces are 256 bits of CSPRNG entropy, unique-constrained on
   `(chain_id, contract_address, nonce)` in the database and `isNonceUsed` on
   chain.
-- Vouchers expire; expiry refunds the points and releases supply budget.
+- Ageing out a voucher does **not** refund the points. The deployed
+  `TBAYL2.claim()` takes no deadline, so a signature stays valid on-chain
+  forever; refunding on a timer would let someone take the points back and still
+  mint. The voucher stays claimable and `GET /v1/token/claims/outstanding`
+  surfaces it. `CLAIM_REFUND_ON_EXPIRY` exists for a future contract that
+  enforces a deadline inside `claim()`.
 
 ### Nobody can hijack a bridge withdrawal
 
 - A withdrawal requires a burn **verified on-chain** whose sender matches the
-  address claiming it. Watching the mempool for someone else's burn gets you
+  member's proved wallet. Watching the chain for someone else's burn gets you
   nothing.
+- The L1 release always goes to the address that burned. There is no way to
+  nominate a different recipient, because the burn event is the only evidence of
+  who owned the tokens.
 - `(l2_chain_id, burn_tx_hash)` is unique — one burn funds one withdrawal.
 - Resubmitting an existing burn cannot change its L1 recipient.
 - `crosschainBurn` itself only permits `_from == msg.sender` (absent
@@ -106,18 +124,21 @@ wallet address.
 
 ## Operator responsibilities
 
-1. **Set `TBAY_REWARD_SUPPLY_CAP_WEI` before mainnet.** L1 cannot mint; an
+1. **Leave `CLAIM_REFUND_ON_EXPIRY` off** unless you have deployed a contract
+   whose `claim()` enforces a deadline. Turning it on against the current
+   contract lets a voucher be refunded and then still claimed.
+2. **Set `TBAY_REWARD_SUPPLY_CAP_WEI` before mainnet.** L1 cannot mint; an
    unbounded reward programme can promise more than the bridge can honour. See
    [TOKEN.md](TOKEN.md).
-2. **Grant `CLAIMER_ROLE` and nothing else** to the platform signing key. It
+3. **Grant `CLAIMER_ROLE` and nothing else** to the platform signing key. It
    should not hold `BRIDGE_ROLE`, `PAUSER_ROLE` or `DEFAULT_ADMIN_ROLE`.
-3. **Keep `IDENTITY_SALT` stable.** Changing it un-links every member across
+4. **Keep `IDENTITY_SALT` stable.** Changing it un-links every member across
    retailers.
-4. **Rotate API secrets** with `key:issue` then `key:revoke` — both keys work
+5. **Rotate API secrets** with `key:issue` then `key:revoke` — both keys work
    during the overlap.
-5. **Guard the bridge operator token.** It is the only thing standing between a
+6. **Guard the bridge operator token.** It is the only thing standing between a
    request and a recorded L1 release.
-6. **Use `EMAIL_TRANSPORT=smtp` in production.** The `log` transport writes
+7. **Use `EMAIL_TRANSPORT=smtp` in production.** The `log` transport writes
    message bodies to the application log.
 
 ## Reporting a vulnerability

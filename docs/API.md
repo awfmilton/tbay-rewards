@@ -73,6 +73,7 @@ client id and the effective conversion rates.
 | `GET /r/:code` | Trackable-link redirect; records the click, sets attribution |
 | `GET /n/confirm/:token` | Confirms a double opt-in |
 | `GET /n/unsubscribe/:token` | One-click unsubscribe |
+| `GET /n/unsubscribe-request` | Unsubscribe by address, for automation mail |
 | `GET /c/:token` | Cart recovery link back to checkout |
 | `GET /health` | Liveness and configuration |
 | `GET /tbay.js` | The tracker script |
@@ -106,7 +107,8 @@ Voids commissions and reverses purchase points.
 |---|---|
 | `POST /v1/contacts` | Create or merge a contact |
 | `GET /v1/contacts/lookup` | Contact plus points balance |
-| `POST /v1/contacts/wallet` | Attach a wallet address |
+| `POST /v1/wallet/challenge` | Issue a message for the holder to sign |
+| `POST /v1/contacts/wallet` | Verify the signature and bind the wallet |
 | `POST /v1/newsletter/subscriptions` | Server-side subscribe |
 | `POST /v1/newsletter/unsubscribe` | Unsubscribe by email |
 | `GET /v1/newsletter/lists` | Per-list subscriber counts |
@@ -163,8 +165,27 @@ failing when a cap or cooldown declines the award. Reasons: `rule_missing`,
 
 ## Token (secret)
 
+### Linking a wallet
+
+Two steps, because a wallet address supplied in a request is a claim, not proof.
+
+```
+POST /v1/wallet/challenge { contactId, walletAddress }
+  → { nonce, message, expires_at }
+
+# the holder signs `message` with personal_sign
+
+POST /v1/contacts/wallet { contactId, nonce, message, signature }
+  → { wallet_address, wallet_verified: true }
+```
+
+The challenge is single-use, expires in ten minutes and is scoped to the
+contact it was issued for. **Redemption, spending and bridging all require a
+verified wallet** and always pay out to that address — never to one named in the
+request.
+
 ### `POST /v1/token/redeem`
-`{ contactId, points, walletAddress }` →
+`{ contactId, points }` — the destination is the verified wallet →
 
 ```json
 {
@@ -187,6 +208,7 @@ In treasury mode `delivery` is `treasury_transfer`, `transaction` is `null` and
 | Route | Purpose |
 |---|---|
 | `POST /v1/token/claims/:id/tx` | Report the submitted transaction hash |
+| `GET /v1/token/claims/outstanding` | Vouchers the member can still submit |
 | `GET /v1/token/claims` | A member's claim history |
 | `POST /v1/token/spend` | Open a spend intent; returns the payout wallet |
 | `POST /v1/token/spend/:id/verify` | Verify the transfer, issue store credit |
