@@ -71,18 +71,13 @@ export async function collectRoutes(app: FastifyInstance): Promise<void> {
     const tenant = await requirePublicKey(request);
     const input = parse(identifySchema, request.body);
 
-    if (!input.email && !input.externalRef) {
-      throw ApiError.badRequest('Provide an email or externalRef to identify a visitor');
-    }
-
     return withTransaction(async (client) => {
       const contact = await upsertContact(
         tenant.id,
         {
-          email: input.email ?? null,
+          email: input.email,
           name: input.name ?? null,
           phone: input.phone ?? null,
-          externalRef: input.externalRef ?? null,
           locale: input.locale ?? null,
           country: input.country ?? null,
           attributes: input.attributes ?? {},

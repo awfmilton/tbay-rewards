@@ -170,7 +170,10 @@ export async function collect(
 
       // A click on a share link is the evidence that a share actually happened.
       if (event.type === 'share_click' && event.linkCode) {
-        await recordLinkClickForShare(client, tenant.id, event.linkCode);
+        await recordLinkClickForShare(client, tenant.id, event.linkCode, {
+          visitorId: visitor.id,
+          contactId: session.contact_id,
+        });
       }
     }
 

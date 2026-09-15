@@ -362,7 +362,12 @@ export async function refundOrder(
     let pointsReversed = false;
     if (entry) {
       const { reverse } = await import('./points.js');
-      const compensation = await reverse(tenant.id, entry.id, 'Order refunded', client);
+      // Clamped: if the customer already redeemed those points for TBAY, the
+      // tokens exist and cannot be un-minted. Take back what remains rather
+      // than rolling back the commission void as well.
+      const compensation = await reverse(tenant.id, entry.id, 'Order refunded', client, {
+        clampToBalance: true,
+      });
       pointsReversed = compensation !== null;
     }
 

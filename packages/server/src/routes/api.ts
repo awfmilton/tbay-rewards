@@ -12,7 +12,8 @@ import {
   shareSchema,
   spendSchema,
 } from './schemas.js';
-import { findContactByEmail, requireContact, setWallet, upsertContact } from '../services/contacts.js';
+import { findContactByEmail, requireContact, upsertContact } from '../services/contacts.js';
+import { createChallenge, verifiedWallet, verifyChallenge } from '../services/wallets.js';
 import { recordOrder, refundOrder, commissionSummary, listCommissions, markCommissionsPaid } from '../services/commissions.js';
 import { createLink, linkReport, listLinks } from '../services/links.js';
 import { getBalance, listLedger } from '../services/points.js';
@@ -23,10 +24,12 @@ import {
   createSpendIntent,
   listClaims,
   redeemPointsForTokens,
+  outstandingClaims,
   redeemStoreCredit,
   verifySpendIntent,
   walletSummary,
 } from '../services/token.js';
+import { weiToTokenString } from '../lib/chain.js';
 import { fire } from '../services/automations.js';
 import { listStats, subscribe, unsubscribeByEmail } from '../services/newsletter.js';
 import { z } from 'zod';
@@ -97,15 +100,21 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
     });
     const input = parse(schema, request.body);
 
-    const contact = await upsertContact(tenant.id, {
-      email: input.email ?? null,
-      name: input.name ?? null,
-      phone: input.phone ?? null,
-      externalRef: input.externalRef ?? null,
-      walletAddress: input.walletAddress ?? null,
-      attributes: input.attributes ?? {},
-      tags: input.tags ?? [],
-    });
+    const contact = await upsertContact(
+      tenant.id,
+      {
+        email: input.email ?? null,
+        name: input.name ?? null,
+        phone: input.phone ?? null,
+        externalRef: input.externalRef ?? null,
+        attributes: input.attributes ?? {},
+        tags: input.tags ?? [],
+      },
+      undefined,
+      // Server-to-server, authenticated with the tenant's own secret: a customer
+      // changing their email address has to be able to keep their account.
+      { allowIdentityChange: true },
+    );
 
     if (input.isWriter !== undefined) {
       await db().query('UPDATE contacts SET is_writer = $2 WHERE id = $1', [
@@ -136,13 +145,52 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
     },
   );
 
-  app.post('/v1/contacts/wallet', async (request) => {
+  /**
+   * Step one of binding a wallet: issue a challenge for the holder to sign.
+   *
+   * Wallets are not bound on assertion. Anything downstream that trusts the
+   * stored address — bridge withdrawals above all — would otherwise be
+   * pointable at an address the caller does not control.
+   */
+  app.post('/v1/wallet/challenge', async (request) => {
     const tenant = tenantOf(request);
     const schema = contactHandleSchema.extend({ walletAddress: z.string().length(42) });
     const input = parse(schema, request.body);
     const contact = await requireContact(tenant.id, input);
-    const updated = await setWallet(tenant.id, contact.id, input.walletAddress);
-    return { contact_id: updated.id, wallet_address: updated.wallet_address, member_id: updated.member_id };
+
+    const challenge = await createChallenge(tenant, contact, input.walletAddress);
+    return {
+      contact_id: contact.id,
+      nonce: challenge.nonce,
+      message: challenge.message,
+      wallet_address: challenge.walletAddress,
+      expires_at: challenge.expiresAt,
+    };
+  });
+
+  /** Step two: prove control of the wallet and bind it. */
+  app.post('/v1/contacts/wallet', async (request) => {
+    const tenant = tenantOf(request);
+    const schema = contactHandleSchema.extend({
+      nonce: z.string().min(16).max(128),
+      signature: z.string().min(80).max(400),
+      message: z.string().min(16).max(2000),
+    });
+    const input = parse(schema, request.body);
+    const contact = await requireContact(tenant.id, input);
+
+    const updated = await verifyChallenge(tenant, contact, {
+      nonce: input.nonce,
+      signature: input.signature,
+      message: input.message,
+    });
+
+    return {
+      contact_id: updated.id,
+      wallet_address: updated.wallet_address,
+      wallet_verified: true,
+      member_id: updated.member_id,
+    };
   });
 
   // ── Newsletter ────────────────────────────────────────────────────────────
@@ -402,10 +450,23 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
     const input = parse(redeemSchema, request.body);
     const contact = await requireContact(tenant.id, input);
 
+    // Mint to the wallet this member proved they control, never to an address
+    // supplied in the request. A caller who can name the destination can drain
+    // any balance they can reach into a wallet of their choosing.
+    const wallet = await verifiedWallet(tenant.id, contact.id);
+    if (!wallet) {
+      throw ApiError.forbidden(
+        'Verify your wallet before redeeming. Request a challenge from /v1/wallet/challenge and sign it.',
+      );
+    }
+    if (input.walletAddress && input.walletAddress.toLowerCase() !== wallet.toLowerCase()) {
+      throw ApiError.forbidden('That is not the wallet verified on this account');
+    }
+
     const result = await redeemPointsForTokens(tenant, {
       contact,
       points: input.points,
-      walletAddress: input.walletAddress,
+      walletAddress: wallet,
     });
 
     return {
@@ -414,17 +475,54 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
       expires_at: result.claim.expires_at,
       points_spent: result.claim.points_spent,
       balance: result.balance,
+      delivery: result.delivery,
+      tx_hash: result.txHash,
+      amount_tokens: result.amountTokens,
       transaction: result.transaction,
     };
   });
 
   app.post<{ Params: { claimId: string } }>('/v1/token/claims/:claimId/tx', async (request) => {
     const tenant = tenantOf(request);
-    const input = parse(z.object({ txHash: z.string().min(10).max(80) }), request.body);
-    const claim = await attachClaimTx(tenant.id, request.params.claimId, input.txHash);
+    const input = parse(
+      contactHandleSchema.extend({ txHash: z.string().regex(/^0x[0-9a-fA-F]{64}$/) }),
+      request.body,
+    );
+    const contact = await requireContact(tenant.id, input);
+
+    const claim = await attachClaimTx(tenant.id, request.params.claimId, input.txHash, contact.id);
     if (!claim) throw ApiError.notFound('Claim not found');
     return { claim_id: claim.id, status: claim.status, tx_hash: claim.tx_hash };
   });
+
+  /** Vouchers the member can still submit, including aged-out ones. */
+  app.get<{ Querystring: { contactId?: string; email?: string } }>(
+    '/v1/token/claims/outstanding',
+    async (request) => {
+      const tenant = tenantOf(request);
+      const contact = await requireContact(tenant.id, request.query);
+      const claims = await outstandingClaims(tenant.id, contact.id);
+      return {
+        claims: claims.map((claim) => ({
+          claim_id: claim.id,
+          status: claim.status,
+          created_at: claim.created_at,
+          points_spent: claim.points_spent,
+          amount_tokens: weiToTokenString(BigInt(claim.token_amount_wei)),
+          transaction: {
+            chainId: claim.chain_id,
+            contractAddress: claim.contract_address,
+            method: 'claim' as const,
+            args: {
+              amount: claim.token_amount_wei,
+              nonce: claim.nonce,
+              signature: claim.signature,
+            },
+          },
+        })),
+      };
+    },
+  );
 
   app.get<{ Querystring: { contactId?: string; email?: string } }>(
     '/v1/token/claims',
@@ -440,10 +538,18 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
     const input = parse(spendSchema, request.body);
     const contact = await requireContact(tenant.id, input);
 
+    // Same reasoning as redemption: an unproved `fromAddress` lets an attacker
+    // point a spend intent at a stranger's wallet and then claim the store
+    // credit when that stranger's transfer lands.
+    const spendWallet = await verifiedWallet(tenant.id, contact.id);
+    if (!spendWallet) {
+      throw ApiError.forbidden('Verify your wallet before spending TBAY');
+    }
+
     const result = await createSpendIntent(tenant, {
       contact,
       amountTokens: input.amountTokens,
-      fromAddress: input.fromAddress,
+      fromAddress: spendWallet,
     });
 
     return {

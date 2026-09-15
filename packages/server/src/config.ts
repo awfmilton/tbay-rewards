@@ -83,8 +83,21 @@ export function loadConfig() {
       pointsPerToken: num('POINTS_PER_TOKEN', 100),
       /** Minimum points a member must burn in one redemption. */
       minRedeemPoints: num('MIN_REDEEM_POINTS', 100),
-      /** A signed claim voucher is valid for this long. */
+      /** How long the UI presents a claim voucher as the current one. */
       claimTtlMinutes: num('CLAIM_TTL_MINUTES', 60),
+      /**
+       * Whether an unclaimed voucher may be refunded once it passes that age.
+       *
+       * OFF, and it must stay off against the currently deployed TBAYL2: its
+       * `claim()` takes no deadline, so a signature stays valid on-chain
+       * forever. Refunding on a timer would let someone redeem, collect the
+       * refund an hour later, and still submit the original voucher — minting
+       * tokens for points they got back.
+       *
+       * Turn this on only against a contract whose Claim struct carries a
+       * deadline that `claim()` enforces. See docs/TOKEN.md.
+       */
+      refundExpiredClaims: bool('CLAIM_REFUND_ON_EXPIRY', false),
       /**
        * Network-wide floor: cents of store credit per 1 whole TBAY spent at any
        * retailer. A retailer may offer a bonus on top (settings.creditBonusBps)

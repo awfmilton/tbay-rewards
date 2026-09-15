@@ -145,13 +145,25 @@ export async function redeemPointsForTokens(
         reason: 'Redeemed for TBAY',
         refType: 'token_claim',
         refId: wallet,
-        // One in-flight redemption per contact per second is plenty, and it makes
-        // a double-submitted form idempotent.
-        idempotencyKey: `redeem:${input.contact.id}:${Math.floor(Date.now() / 1000)}`,
+        // Keyed on the exact operation — contact, amount and destination — so a
+        // double-submitted form is idempotent while two DIFFERENT redemptions
+        // in the same second get distinct keys instead of colliding.
+        idempotencyKey: `redeem:${input.contact.id}:${input.points}:${wallet.toLowerCase()}:${Math.floor(
+          Date.now() / 1000,
+        )}`,
         meta: { wallet_address: wallet, amount_wei: amountWei.toString() },
       },
       client,
     );
+
+    // A replayed submission must not produce a second voucher against one debit.
+    // Without this, concurrent redemptions that share an idempotency key would
+    // each go on to sign a claim while only the first actually spent points.
+    if (!debit.created) {
+      throw ApiError.conflict(
+        'A redemption for this amount is already in flight. Check your rewards history before trying again.',
+      );
+    }
 
     const nonce = mintNonce();
     const signature = signer
@@ -358,16 +370,35 @@ export async function supplyStatus(runner: Queryable = db()): Promise<{
   };
 }
 
-/** Return the points behind a voucher that was never claimed. */
+/**
+ * Age out vouchers the customer never submitted.
+ *
+ * Crucially this does NOT return their points by default. The deployed
+ * TBAYL2.claim() takes no deadline, so a signed voucher remains valid on-chain
+ * forever — refunding on a timer would hand back the points while leaving a
+ * live voucher that still mints. The voucher therefore stays claimable and the
+ * points stay spent; `outstandingClaims()` surfaces it so the member can submit
+ * it whenever they like.
+ *
+ * Set CLAIM_REFUND_ON_EXPIRY=true only against a contract that enforces a
+ * deadline inside claim().
+ */
 export async function expireStaleClaims(runner: Queryable = db()): Promise<number> {
+  const cfg = config();
+
   const { rows } = await runner.query<TokenClaim>(
     `UPDATE token_claims SET status = 'expired'
       WHERE status = 'signed' AND expires_at <= now()
       RETURNING *`,
   );
 
+  if (!cfg.rewards.refundExpiredClaims) {
+    // Nothing is released and nothing is reversed: those tokens can still be
+    // minted, so the supply budget stays committed too.
+    return rows.length;
+  }
+
   for (const claim of rows) {
-    // An expired voucher was never claimed on-chain, so its budget is free again.
     await releaseSupplyBudget(runner, BigInt(claim.token_amount_wei));
     if (!claim.ledger_entry_id) continue;
     const compensation = await reverse(
@@ -386,6 +417,27 @@ export async function expireStaleClaims(runner: Queryable = db()): Promise<numbe
 }
 
 /**
+ * Vouchers a member can still submit — signed or aged out, but not yet claimed.
+ * Aged-out vouchers are still valid on-chain, so hiding them would lose the
+ * customer real tokens.
+ */
+export async function outstandingClaims(
+  tenantId: string,
+  contactId: string,
+  runner: Queryable = db(),
+): Promise<TokenClaim[]> {
+  const { rows } = await runner.query<TokenClaim>(
+    `SELECT * FROM token_claims
+      WHERE tenant_id = $1 AND contact_id = $2
+        AND status IN ('signed', 'expired')
+        AND reversal_entry_id IS NULL
+      ORDER BY created_at DESC`,
+    [tenantId, contactId],
+  );
+  return rows;
+}
+
+/**
  * Ask the chain whether outstanding vouchers have been claimed.
  *
  * `isNonceUsed` is the authoritative signal: it is set by claim() itself, so it
@@ -395,8 +447,12 @@ export async function reconcileClaims(limit = 100, runner: Queryable = db()): Pr
   const client = chain();
   if (!client) return 0;
 
+  // 'expired' is included on purpose: an aged-out voucher is still claimable
+  // on-chain, so we keep watching for it rather than losing track of the mint.
   const { rows } = await runner.query<TokenClaim>(
-    `SELECT * FROM token_claims WHERE status = 'signed' ORDER BY created_at LIMIT $1`,
+    `SELECT * FROM token_claims
+      WHERE status IN ('signed', 'expired')
+      ORDER BY created_at LIMIT $1`,
     [limit],
   );
 
@@ -411,7 +467,8 @@ export async function reconcileClaims(limit = 100, runner: Queryable = db()): Pr
     }
     if (!used) continue;
     await runner.query(
-      `UPDATE token_claims SET status = 'claimed', claimed_at = now() WHERE id = $1 AND status = 'signed'`,
+      `UPDATE token_claims SET status = 'claimed', claimed_at = now()
+        WHERE id = $1 AND status IN ('signed', 'expired')`,
       [claim.id],
     );
     settled += 1;
@@ -424,15 +481,20 @@ export async function attachClaimTx(
   tenantId: string,
   claimId: string,
   txHash: string,
+  // Scoped to the owner: without this, anyone holding a claim id could mark
+  // someone else's voucher settled.
+  contactId: string,
   runner: Queryable = db(),
 ): Promise<TokenClaim | null> {
   return queryOne<TokenClaim>(
     runner,
-    `UPDATE token_claims SET tx_hash = $3, status = CASE WHEN status = 'signed' THEN 'claimed' ELSE status END,
+    `UPDATE token_claims
+        SET tx_hash = $4,
+            status = CASE WHEN status IN ('signed', 'expired') THEN 'claimed' ELSE status END,
             claimed_at = COALESCE(claimed_at, now())
-      WHERE tenant_id = $1 AND id = $2
+      WHERE tenant_id = $1 AND id = $2 AND contact_id = $3
       RETURNING *`,
-    [tenantId, claimId, txHash],
+    [tenantId, claimId, contactId, txHash],
   );
 }
 

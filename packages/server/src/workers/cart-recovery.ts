@@ -76,7 +76,7 @@ async function queueRecoveryEmail(cart: RecoveryCandidate): Promise<boolean> {
     item_count: cart.item_count,
     subtotal: formatMoney(cart.subtotal_cents, cart.currency),
     recovery_url: `${base}/c/${cart.recovery_token}`,
-    unsubscribe_url: `${base}/n/unsubscribe-request?email=${encodeURIComponent(cart.email)}`,
+    unsubscribe_url: `${base}/n/unsubscribe-request?t=${tenant.id}&email=${encodeURIComponent(cart.email)}`,
   });
 
   const result = await queueEmail({

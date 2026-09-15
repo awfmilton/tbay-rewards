@@ -98,8 +98,11 @@ class TBAY_Rewards_API {
 			),
 		);
 
-		if ( ! empty( $body ) && in_array( $args['method'], array( 'POST', 'PUT', 'PATCH' ), true ) ) {
-			$args['body'] = wp_json_encode( $body );
+		if ( in_array( $args['method'], array( 'POST', 'PUT', 'PATCH' ), true ) ) {
+			// Always send a body on a write. Declaring application/json and then
+			// sending nothing makes Fastify reject the request as an empty JSON
+			// body, which is how every refund sync used to fail.
+			$args['body'] = wp_json_encode( empty( $body ) ? new stdClass() : $body );
 		}
 
 		$response = wp_remote_request( $url, $args );
@@ -135,7 +138,13 @@ class TBAY_Rewards_API {
 	 * from one round trip instead of one each.
 	 */
 	public function get_cached( string $path, array $query = array(), int $ttl = 60 ): array|WP_Error {
-		$key = md5( $path . wp_json_encode( $query ) );
+		// set_transient() with an expiry of 0 means "never expires" in WordPress,
+		// so a caller asking for fresh data would have pinned a permanent copy.
+		if ( $ttl <= 0 ) {
+			return $this->get( $path, $query );
+		}
+
+		$key = md5( get_option( 'tbay_cache_version', 1 ) . $path . wp_json_encode( $query ) );
 
 		if ( isset( $this->request_cache[ $key ] ) ) {
 			return $this->request_cache[ $key ];
@@ -264,6 +273,12 @@ class TBAY_Rewards_API {
 		global $wpdb;
 		$this->request_cache = array();
 		delete_transient( 'tbay_chain_config' );
+
+		// With a persistent object cache, transients never reach wp_options, so
+		// the DELETE below would be a no-op. Bumping a namespace version makes
+		// every previously cached key unreachable regardless of backend.
+		$version = (int) get_option( 'tbay_cache_version', 1 );
+		update_option( 'tbay_cache_version', $version + 1, false );
 		$wpdb->query(
 			$wpdb->prepare(
 				"DELETE FROM {$wpdb->options} WHERE option_name LIKE %s OR option_name LIKE %s",

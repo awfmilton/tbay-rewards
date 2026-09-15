@@ -5,6 +5,7 @@ import { releaseMaturedPoints } from '../services/points.js';
 import { approveMaturedCommissions } from '../services/commissions.js';
 import { expireStaleShares } from '../services/shares.js';
 import { expireStaleClaims, reconcileClaims } from '../services/token.js';
+import { purgeExpiredChallenges } from '../services/wallets.js';
 
 /**
  * Background jobs.
@@ -35,6 +36,7 @@ export const JOBS: Job[] = [
   { name: 'claim_expiry', intervalMs: 60_000, run: () => expireStaleClaims() },
   { name: 'claim_reconcile', intervalMs: 120_000, run: () => reconcileClaims() },
   { name: 'webhook_delivery', intervalMs: 20_000, run: () => deliverWebhooks() },
+  { name: 'challenge_purge', intervalMs: 3_600_000, run: () => purgeExpiredChallenges() },
 ];
 
 const timers: NodeJS.Timeout[] = [];

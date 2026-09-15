@@ -9,6 +9,7 @@ import {
   setupDatabase,
   testApp,
   truncateAll,
+  TEST_WALLET,
   type TestTenant,
 } from './helpers.js';
 import { setEmailTransport, outbox, flushEmailQueue } from '../src/services/email.js';
@@ -158,7 +159,7 @@ describe('full customer journey', () => {
     let balance = await authed('GET', `/v1/rewards/balance?contactId=${contactId}`);
     expect(balance.json().points.balance).toBe(100); // newsletter reward
 
-    // 3. Share the product, and have somebody click it.
+    // 3. Share the product, and have somebody else click it.
     const share = await authed('POST', '/v1/shares', {
       contactId,
       network: 'x',
@@ -186,6 +187,8 @@ describe('full customer journey', () => {
       items: [{ productRef: 'flag-1', quantity: 1, subtotalCents: 4999 }],
     });
     expect(order.statusCode).toBe(200);
+    // 1 point per whole currency unit; the purchase points are held through the
+    // refund window, and the first-purchase badge pays 50 immediately.
     expect(order.json().points_awarded).toBe(49);
 
     const { rows: carts } = await db().query('SELECT status FROM carts WHERE cart_token = $1', [
@@ -193,21 +196,35 @@ describe('full customer journey', () => {
     ]);
     expect(carts[0].status).toBe('converted');
 
-    // 5. Connect a wallet and redeem points for TBAY.
-    await authed('POST', '/v1/contacts/wallet', {
+    // 5. Prove ownership of a wallet, then redeem points for TBAY.
+    const challenge = await authed('POST', '/v1/wallet/challenge', {
       contactId,
-      walletAddress: '0x2222222222222222222222222222222222222222',
+      walletAddress: TEST_WALLET.address,
     });
+    expect(challenge.statusCode).toBe(200);
+
+    const bound = await authed('POST', '/v1/contacts/wallet', {
+      contactId,
+      nonce: challenge.json().nonce,
+      message: challenge.json().message,
+      signature: await TEST_WALLET.signMessage(challenge.json().message),
+    });
+    expect(bound.statusCode).toBe(200);
+    expect(bound.json().wallet_verified).toBe(true);
+
+    const balanceBeforeRedeem = (
+      await authed('GET', `/v1/rewards/balance?contactId=${contactId}`)
+    ).json().points.balance as number;
 
     const redeem = await authed('POST', '/v1/token/redeem', {
       contactId,
-      points: 125,
-      walletAddress: '0x2222222222222222222222222222222222222222',
+      points: balanceBeforeRedeem,
+      walletAddress: TEST_WALLET.address,
     });
     expect(redeem.statusCode).toBe(200);
     const voucher = redeem.json();
     expect(voucher.transaction.method).toBe('claim');
-    expect(voucher.transaction.amountTokens).toBe('1.25');
+    expect(voucher.delivery).toBe('wallet_claim');
     expect(voucher.balance.balance).toBe(0);
 
     // 6. The reports reflect all of it.

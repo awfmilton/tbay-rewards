@@ -277,11 +277,31 @@ export function setChainClient(custom: ChainClient | null): void {
   chainClient = custom;
 }
 
-/** Whole TBAY (18 decimals) → wei, without floating point. */
+/**
+ * Whole TBAY (18 decimals) → wei, without floating point.
+ *
+ * `String(n)` renders very small and very large numbers in exponent form
+ * (`1e-7`, `5e+21`), which BigInt cannot parse — so this normalises to plain
+ * decimal notation first rather than throwing on a perfectly valid amount.
+ */
 export function tokensToWei(tokens: number): bigint {
-  const [whole, fraction = ''] = String(tokens).split('.');
+  if (!Number.isFinite(tokens) || tokens < 0) {
+    throw ApiError.badRequest('amount must be a positive number');
+  }
+
+  const plain = toPlainDecimal(tokens);
+  const [whole, fraction = ''] = plain.split('.');
   const padded = (fraction + '0'.repeat(18)).slice(0, 18);
   return BigInt(whole || '0') * 10n ** 18n + BigInt(padded || '0');
+}
+
+function toPlainDecimal(value: number): string {
+  const rendered = String(value);
+  if (!rendered.includes('e') && !rendered.includes('E')) return rendered;
+
+  // toFixed(20) covers everything down to 1e-20; anything smaller is dust far
+  // below a single wei anyway.
+  return value.toFixed(20).replace(/0+$/, '').replace(/\.$/, '');
 }
 
 export function weiToTokenString(wei: bigint, decimals = 6): string {

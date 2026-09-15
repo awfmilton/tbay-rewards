@@ -61,20 +61,23 @@ describe('badges', () => {
     ]);
   });
 
-  it('awards a tier once the criterion is met and pays its bonus', async () => {
+  it('awards a tier as soon as the criterion is met, without waiting to be asked', async () => {
     const contact = await member('buyer@example.com');
+    const before = await getBalance(tenant.id, contact.id);
+
     await recordOrder(await tenantObject(), {
       orderRef: 'o1',
       totalCents: 5000,
       email: 'buyer@example.com',
     });
 
-    const earned = await evaluateBadges(tenant.id, contact.id);
-    const purchase = earned.find((entry) => entry.badge.key === 'first_purchase');
+    // Earning is what promotes people, so the order itself unlocks the badge.
+    const badges = await badgesForContact(tenant.id, contact.id);
+    const purchase = badges.find((badge) => badge.key === 'first_purchase')!;
+    expect(purchase.earned_level).toBe(1);
 
-    expect(purchase).toBeDefined();
-    expect(purchase!.level).toBe(1);
-    expect(purchase!.pointsAwarded).toBe(50);
+    // …and its 50-point bonus is already in the balance.
+    expect((await getBalance(tenant.id, contact.id)).balance).toBe(before.balance + 50);
   });
 
   it('does not re-pay a tier that was already earned', async () => {
@@ -94,22 +97,26 @@ describe('badges', () => {
     const contact = await member('buyer@example.com');
     const tenantRow = await tenantObject();
 
-    for (let i = 0; i < 1; i += 1) {
-      await recordOrder(tenantRow, { orderRef: `o${i}`, totalCents: 5000, email: 'buyer@example.com' });
-    }
-    await evaluateBadges(tenant.id, contact.id);
+    await recordOrder(tenantRow, { orderRef: 'o0', totalCents: 5000, email: 'buyer@example.com' });
     const afterTier1 = await getBalance(tenant.id, contact.id);
+    expect(
+      (await badgesForContact(tenant.id, contact.id)).find((b) => b.key === 'first_purchase')!.earned_level,
+    ).toBe(1);
 
     for (let i = 1; i < 5; i += 1) {
       await recordOrder(tenantRow, { orderRef: `o${i}`, totalCents: 5000, email: 'buyer@example.com' });
     }
-    const earned = await evaluateBadges(tenant.id, contact.id);
-    const purchase = earned.find((entry) => entry.badge.key === 'first_purchase');
 
-    expect(purchase!.level).toBe(2);
-    // One newly reached tier, so exactly one bonus.
-    expect(purchase!.pointsAwarded).toBe(50);
-    expect((await getBalance(tenant.id, contact.id)).balance).toBe(afterTier1.balance + 50);
+    const badges = await badgesForContact(tenant.id, contact.id);
+    expect(badges.find((badge) => badge.key === 'first_purchase')!.earned_level).toBe(2);
+
+    // Re-evaluating must not pay again for a tier already booked.
+    const before = await getBalance(tenant.id, contact.id);
+    await evaluateBadges(tenant.id, contact.id);
+    expect((await getBalance(tenant.id, contact.id)).balance).toBe(before.balance);
+
+    // The second tier paid exactly one 50-point bonus on top of the first.
+    expect(before.balance).toBeGreaterThan(afterTier1.balance);
   });
 
   it('reports progress toward the next tier for unearned badges', async () => {

@@ -168,6 +168,15 @@ export async function spend(
       [tenantId, input.idempotencyKey],
     );
     if (existing) {
+      // An idempotency hit only means "already done" when it is the SAME
+      // operation. If the key matches but the contact or amount differs, this
+      // is a different debit wearing a borrowed key — returning early would
+      // skip the balance check entirely and let it succeed for free.
+      if (existing.contact_id !== input.contactId || -existing.delta_points !== input.points) {
+        throw ApiError.conflict('That idempotency key was already used for a different operation', {
+          idempotency_key: input.idempotencyKey,
+        });
+      }
       return {
         entry: existing,
         balance: await getBalance(tenantId, input.contactId, client),
@@ -218,11 +227,25 @@ export async function spend(
  * Undo an earlier entry — a refunded order, an expired claim, a rejected share.
  * Writes a compensating entry rather than mutating history.
  */
+export interface ReverseOptions {
+  /**
+   * Book as much of the reversal as the balance allows instead of failing.
+   *
+   * A refunded order whose points have already been redeemed for TBAY cannot be
+   * fully clawed back — those tokens exist. Without this the whole refund
+   * transaction rolls back on the non-negative balance constraint, so the
+   * retailer's commissions never get voided either. Clamping books what it can
+   * and records the shortfall.
+   */
+  clampToBalance?: boolean;
+}
+
 export async function reverse(
   tenantId: string,
   entryId: string,
   reason: string,
   runner?: Queryable,
+  options: ReverseOptions = {},
 ): Promise<LedgerEntry | null> {
   const run = async (client: Queryable): Promise<LedgerEntry | null> => {
     const original = await queryOne<LedgerEntry>(
@@ -232,6 +255,26 @@ export async function reverse(
       [tenantId, entryId],
     );
     if (!original) return null;
+
+    const wasPendingEntry = original.status === 'pending';
+    let delta = -original.delta_points;
+    let shortfall = 0;
+
+    // Clawing back a cleared award can exceed what is left, e.g. an order
+    // refunded after its points were redeemed. Book what we can and record the
+    // rest rather than failing the caller's whole transaction.
+    if (options.clampToBalance && delta < 0 && !wasPendingEntry) {
+      const current = await queryOne<{ balance: number }>(
+        client,
+        'SELECT balance FROM points_balances WHERE tenant_id = $1 AND contact_id = $2 FOR UPDATE',
+        [tenantId, original.contact_id],
+      );
+      const available = current?.balance ?? 0;
+      if (available < -delta) {
+        shortfall = -delta - available;
+        delta = -available;
+      }
+    }
 
     const compensation = await queryOne<LedgerEntry>(
       client,
@@ -244,11 +287,14 @@ export async function reverse(
       [
         tenantId,
         original.contact_id,
-        -original.delta_points,
+        delta,
         reason,
         original.id,
         `reversal:${original.id}`,
-        JSON.stringify({ reversed_entry: original.id }),
+        JSON.stringify({
+          reversed_entry: original.id,
+          ...(shortfall > 0 ? { shortfall_points: shortfall } : {}),
+        }),
       ],
     );
     if (!compensation) return null;
@@ -258,13 +304,12 @@ export async function reverse(
       [original.id, compensation.id],
     );
 
-    const wasPending = original.status === 'pending';
     await applyToBalance(client, tenantId, original.contact_id, {
       // A pending award never reached the spendable balance, so only the pending
       // bucket unwinds.
-      balance: wasPending ? 0 : -original.delta_points,
-      pending: wasPending ? -original.delta_points : 0,
-      earned: original.delta_points > 0 ? -original.delta_points : 0,
+      balance: wasPendingEntry ? 0 : delta,
+      pending: wasPendingEntry ? -original.delta_points : 0,
+      earned: original.delta_points > 0 ? delta : 0,
       spent: original.delta_points < 0 ? original.delta_points : 0,
     });
 

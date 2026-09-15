@@ -66,18 +66,30 @@ export const collectSchema = z.object({
     .nullish(),
 });
 
+/**
+ * Public identify.
+ *
+ * Deliberately has NO externalRef: this endpoint is reachable by anyone holding
+ * the site key, which is printed in every page's source. Letting a browser
+ * supply an external reference would let an attacker point an arbitrary
+ * identity at an existing contact. Server-to-server callers use /v1/contacts
+ * with the secret key when they need to set one.
+ */
 export const identifySchema = z.object({
   key: z.string().max(128).optional(),
   visitor: z.string().min(8).max(64).optional(),
-  email: z.string().email().max(254).optional(),
+  email: z.string().email().max(254),
   name: z.string().max(255).nullish(),
   phone: z.string().max(64).nullish(),
-  externalRef: z.string().max(128).nullish(),
   locale: z.string().max(16).nullish(),
   country: z.string().max(2).nullish(),
   attributes: z.record(z.unknown()).optional(),
   tags: z.array(z.string().max(64)).max(50).optional(),
-});
+})
+  // Strict on purpose: an unexpected field here is either a client bug or
+  // someone probing for a privileged parameter. Failing loudly beats silently
+  // dropping it and returning 200 as though it had been honoured.
+  .strict();
 
 export const subscribeSchema = z.object({
   key: z.string().max(128).optional(),
@@ -133,14 +145,19 @@ export const shareSchema = contactHandleSchema.extend({
   postRef: z.string().max(128).nullish(),
 });
 
+/**
+ * The wallet address here is an optional *confirmation* that the client and the
+ * server agree on the destination. The authoritative address is always the one
+ * the member proved they control; a mismatch is rejected rather than honoured.
+ */
 export const redeemSchema = contactHandleSchema.extend({
   points: z.number().int().positive(),
-  walletAddress: z.string().min(42).max(42),
+  walletAddress: z.string().length(42).optional(),
 });
 
 export const spendSchema = contactHandleSchema.extend({
   amountTokens: z.number().positive(),
-  fromAddress: z.string().min(42).max(42),
+  fromAddress: z.string().length(42).optional(),
 });
 
 export const createLinkSchema = z.object({

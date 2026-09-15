@@ -179,6 +179,16 @@ class TBAY_Rewards_WooCommerce {
 			}
 		}
 
+		// Written by the tracker on THIS origin when the visitor landed from a
+		// /r/ link. The platform's own signed cookie lives on the API origin and
+		// is invisible here, so this is the one that actually arrives.
+		if ( ! empty( $_COOKIE['tbay_ref'] ) ) {
+			$from_cookie = sanitize_text_field( wp_unslash( $_COOKIE['tbay_ref'] ) );
+			if ( '' !== $from_cookie && preg_match( '/^[A-Za-z0-9_-]{4,64}$/', $from_cookie ) ) {
+				return $from_cookie;
+			}
+		}
+
 		if ( empty( $_COOKIE['tbay_attr'] ) ) {
 			return null;
 		}

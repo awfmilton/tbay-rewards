@@ -1,6 +1,6 @@
 import { db, queryOne } from '../db/pool.js';
 import type { Queryable } from '../db/pool.js';
-import { hashToken, randomToken, sha256 } from '../lib/crypto.js';
+import { constantTimeEqual, hashToken, randomToken, sha256 } from '../lib/crypto.js';
 import { ApiError } from '../lib/errors.js';
 
 export interface Tenant {
@@ -92,7 +92,9 @@ export async function resolveSecretKey(presented: string): Promise<Tenant | null
         AND t.status = 'active'`,
     [keyId],
   );
-  if (!row || row.secret_hash !== hashToken(secret)) return null;
+  // Constant-time: comparing HMAC output with !== leaks nothing forgeable, but
+  // there is no reason to make the comparison time depend on the secret.
+  if (!row || !constantTimeEqual(row.secret_hash, hashToken(secret))) return null;
 
   // Fire-and-forget: last-used is observability, not correctness.
   void db()

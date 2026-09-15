@@ -105,9 +105,12 @@
 				product: container.dataset.product || '',
 				post: container.dataset.post || ''
 			}).then(function (data) {
+				// Deliberately NOT crediting the share here. The reward is meant to
+				// require a genuine third-party click, and reporting one from the
+				// sharer's own browser at the moment they press the button would
+				// hand out the points for nothing.
 				if (window.tbay) {
-					window.tbay.track('share_click', { network: button.dataset.network },
-						{ linkCode: data.link_code });
+					window.tbay.track('share_created', { network: button.dataset.network });
 				}
 
 				if (button.dataset.network === 'copy' || !data.intent_url) {
