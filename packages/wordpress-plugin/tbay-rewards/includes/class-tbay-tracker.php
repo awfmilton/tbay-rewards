@@ -131,6 +131,7 @@ class TBAY_Rewards_Tracker {
 					'transferSending' => __( 'Sending points…', 'tbay-rewards' ),
 					/* translators: %d: number of points sent. */
 					'transferSent'   => __( '%d points sent.', 'tbay-rewards' ),
+					'creditApplying' => __( 'Applying your credit…', 'tbay-rewards' ),
 					'signPrompt'     => __( 'Sign the message in your wallet to prove it is yours. This is free and moves nothing.', 'tbay-rewards' ),
 					'walletLinked'   => __( 'Wallet verified.', 'tbay-rewards' ),
 					'shareCreating'  => __( 'Creating your link…', 'tbay-rewards' ),

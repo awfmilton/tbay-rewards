@@ -45,6 +45,10 @@ class TBAY_Rewards_WooCommerce {
 		// Redeem TBAY store credit as a Woo coupon-equivalent discount.
 		add_action( 'woocommerce_cart_calculate_fees', array( $this, 'apply_store_credit' ), 20 );
 		add_action( 'woocommerce_checkout_order_processed', array( $this, 'consume_store_credit' ), 20 );
+		add_action( 'woocommerce_before_cart_totals', array( $this, 'render_credit_form' ) );
+		add_action( 'woocommerce_review_order_before_payment', array( $this, 'render_credit_form' ) );
+		add_action( 'wp_ajax_tbay_apply_credit', array( $this, 'ajax_apply_credit' ) );
+		add_action( 'wp_ajax_nopriv_tbay_apply_credit', array( $this, 'ajax_apply_credit' ) );
 
 		// Keep contact records current.
 		add_action( 'user_register', array( $this, 'sync_new_user' ) );
@@ -323,6 +327,109 @@ class TBAY_Rewards_WooCommerce {
 	// ─────────────────────────────────────────────────────────────────────────
 	// Store credit earned by spending TBAY
 	// ─────────────────────────────────────────────────────────────────────────
+
+	/**
+	 * Offer any store credit the shopper holds at cart and checkout.
+	 *
+	 * Without this the credit existed on the platform and the discount code was
+	 * written to the session by nothing at all, so "spend TBAY at checkout" was
+	 * a promise with no way to keep it.
+	 */
+	public function render_credit_form(): void {
+		if ( ! is_user_logged_in() || ! $this->api->is_configured() ) {
+			return;
+		}
+
+		$applied = function_exists( 'WC' ) && WC()->session
+			? WC()->session->get( 'tbay_store_credit' )
+			: null;
+
+		if ( is_array( $applied ) && ! empty( $applied['code'] ) ) {
+			printf(
+				'<div class="tbay-root"><p class="tbay-notice">%s</p></div>',
+				esc_html(
+					sprintf(
+						/* translators: %s: formatted credit amount. */
+						__( 'TBAY store credit applied: %s', 'tbay-rewards' ),
+						$this->format_money( (int) ( $applied['amount_cents'] ?? 0 ) )
+					)
+				)
+			);
+			return;
+		}
+
+		$balance = $this->api->balance_for_user( get_current_user_id() );
+		$cents   = is_wp_error( $balance ) ? 0 : (int) ( $balance['store_credit_cents'] ?? 0 );
+		if ( $cents <= 0 ) {
+			return;
+		}
+		?>
+		<div class="tbay-root" data-tbay-credit>
+			<div class="tbay-panel">
+				<span class="tbay-overline"><?php esc_html_e( 'TBAY store credit', 'tbay-rewards' ); ?></span>
+				<p class="tbay-lede">
+					<?php
+					printf(
+						/* translators: %s: formatted credit amount. */
+						esc_html__( 'You have %s of TBAY store credit available.', 'tbay-rewards' ),
+						esc_html( $this->format_money( $cents ) )
+					);
+					?>
+				</p>
+				<button type="button" class="tbay-button" data-tbay-apply-credit
+					data-nonce="<?php echo esc_attr( wp_create_nonce( 'tbay_apply_credit' ) ); ?>">
+					<?php esc_html_e( 'Use my credit', 'tbay-rewards' ); ?>
+				</button>
+				<p class="tbay-wallet__status" role="status" aria-live="polite" data-tbay-credit-status></p>
+			</div>
+		</div>
+		<?php
+	}
+
+	/** Stage the shopper's credit on the session so the fee hook can apply it. */
+	public function ajax_apply_credit(): void {
+		check_ajax_referer( 'tbay_apply_credit', 'nonce' );
+
+		if ( ! is_user_logged_in() || ! function_exists( 'WC' ) || ! WC()->session ) {
+			wp_send_json_error( array( 'message' => __( 'Please log in first.', 'tbay-rewards' ) ), 403 );
+		}
+
+		$contact_id = $this->api->contact_id_for_user( get_current_user_id() );
+		if ( null === $contact_id ) {
+			wp_send_json_error( array( 'message' => __( 'No rewards account found.', 'tbay-rewards' ) ), 404 );
+		}
+
+		// The platform is the source of truth for which credits are still live;
+		// trusting a code from the browser would let anyone apply any credit.
+		$credits = $this->api->get(
+			'/v1/rewards/balance',
+			array( 'contactId' => $contact_id )
+		);
+		if ( is_wp_error( $credits ) || (int) ( $credits['store_credit_cents'] ?? 0 ) <= 0 ) {
+			wp_send_json_error( array( 'message' => __( 'No credit available.', 'tbay-rewards' ) ), 422 );
+		}
+
+		$code = $this->api->post( '/v1/token/credit/reserve', array( 'contactId' => $contact_id ) );
+		if ( is_wp_error( $code ) || empty( $code['code'] ) ) {
+			wp_send_json_error( array( 'message' => __( 'Could not reserve your credit.', 'tbay-rewards' ) ), 502 );
+		}
+
+		WC()->session->set(
+			'tbay_store_credit',
+			array(
+				'code'         => sanitize_text_field( (string) $code['code'] ),
+				'amount_cents' => (int) $code['amount_cents'],
+			)
+		);
+
+		wp_send_json_success( array( 'amount_cents' => (int) $code['amount_cents'] ) );
+	}
+
+	private function format_money( int $cents ): string {
+		return function_exists( 'wc_price' )
+			? wp_strip_all_tags( (string) wc_price( $cents / 100 ) )
+			: number_format_i18n( $cents / 100, 2 );
+	}
 
 	/** Apply a store credit the shopper has chosen to use, as a negative fee. */
 	public function apply_store_credit(): void {

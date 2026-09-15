@@ -163,7 +163,11 @@ export async function subscribe(
         status: 'pending',
         contact,
         subscription: subscription!,
-        ...(config().isProduction ? {} : { confirmToken }),
+        // Returned only when NODE_ENV is explicitly 'test'. Any other
+        // environment — including a misconfigured staging box — would be
+        // handing the opt-in token to whoever asked, which defeats double
+        // opt-in entirely.
+        ...(config().env === 'test' ? { confirmToken } : {}),
       };
     }
 

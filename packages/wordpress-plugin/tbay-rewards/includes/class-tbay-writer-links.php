@@ -24,6 +24,7 @@ class TBAY_Rewards_Writer_Links {
 
 	public function __construct( private TBAY_Rewards_API $api ) {
 		add_shortcode( 'tbay_link', array( $this, 'render_shortcode' ) );
+		add_shortcode( 'tbay_my_commissions', array( $this, 'render_commissions' ) );
 		add_action( 'add_meta_boxes', array( $this, 'add_meta_box' ) );
 		add_action( 'wp_ajax_tbay_mint_writer_link', array( $this, 'ajax_mint_link' ) );
 		add_action( 'admin_enqueue_scripts', array( $this, 'enqueue_admin' ) );
@@ -125,6 +126,121 @@ class TBAY_Rewards_Writer_Links {
 		update_post_meta( $post_id, self::META_LINKS, $links );
 
 		return $links[ $key ];
+	}
+
+	/**
+	 * A writer's own earnings.
+	 *
+	 * Commissions accrued on the platform but there was no way for a writer to
+	 * see them from WordPress, which makes the whole arrangement hard to trust.
+	 */
+	public function render_commissions(): string {
+		if ( ! is_user_logged_in() ) {
+			return sprintf(
+				'<div class="tbay-root"><p class="tbay-notice">%s</p></div>',
+				esc_html__( 'Log in to see what your links have earned.', 'tbay-rewards' )
+			);
+		}
+
+		$contact_id = $this->api->contact_id_for_user( get_current_user_id() );
+		if ( null === $contact_id ) {
+			return '';
+		}
+
+		$report = $this->api->get_cached(
+			'/v1/commissions',
+			array( 'contactId' => $contact_id ),
+			120
+		);
+		if ( is_wp_error( $report ) ) {
+			return sprintf(
+				'<div class="tbay-root"><p class="tbay-notice">%s</p></div>',
+				esc_html__( 'Your earnings are unavailable right now. Please try again shortly.', 'tbay-rewards' )
+			);
+		}
+
+		$summary     = is_array( $report['summary'] ?? null ) ? $report['summary'] : array();
+		$commissions = is_array( $report['commissions'] ?? null ) ? $report['commissions'] : array();
+
+		$links = $this->api->get_cached(
+			'/v1/links/report',
+			array( 'ownerContactId' => $contact_id ),
+			120
+		);
+		$rows = is_wp_error( $links ) ? array() : ( $links['links'] ?? array() );
+
+		ob_start();
+		?>
+		<div class="tbay-root tbay-rewards">
+			<div class="tbay-rewards__grid">
+				<div class="tbay-stat">
+					<span class="tbay-stat__label"><?php esc_html_e( 'Awaiting release', 'tbay-rewards' ); ?></span>
+					<strong class="tbay-stat__value"><?php echo esc_html( $this->money( (int) ( $summary['pending_cents'] ?? 0 ) ) ); ?></strong>
+					<span class="tbay-stat__sub"><?php esc_html_e( 'held until the refund window closes', 'tbay-rewards' ); ?></span>
+				</div>
+				<div class="tbay-stat">
+					<span class="tbay-stat__label"><?php esc_html_e( 'Ready to pay', 'tbay-rewards' ); ?></span>
+					<strong class="tbay-stat__value tbay-stat__value--accent"><?php echo esc_html( $this->money( (int) ( $summary['approved_cents'] ?? 0 ) ) ); ?></strong>
+				</div>
+				<div class="tbay-stat">
+					<span class="tbay-stat__label"><?php esc_html_e( 'Paid to date', 'tbay-rewards' ); ?></span>
+					<strong class="tbay-stat__value"><?php echo esc_html( $this->money( (int) ( $summary['paid_cents'] ?? 0 ) ) ); ?></strong>
+					<span class="tbay-stat__sub">
+						<?php
+						printf(
+							/* translators: %s: number of orders. */
+							esc_html__( 'across %s orders', 'tbay-rewards' ),
+							esc_html( number_format_i18n( (int) ( $summary['orders'] ?? 0 ) ) )
+						);
+						?>
+					</span>
+				</div>
+			</div>
+
+			<?php if ( ! empty( $rows ) ) : ?>
+				<div class="tbay-panel">
+					<span class="tbay-overline"><?php esc_html_e( 'Your links', 'tbay-rewards' ); ?></span>
+					<div class="tbay-table-wrap">
+						<table class="tbay-ledger">
+							<thead>
+								<tr>
+									<th scope="col"><?php esc_html_e( 'Post', 'tbay-rewards' ); ?></th>
+									<th scope="col" class="tbay-num"><?php esc_html_e( 'Clicks', 'tbay-rewards' ); ?></th>
+									<th scope="col" class="tbay-num"><?php esc_html_e( 'Orders', 'tbay-rewards' ); ?></th>
+									<th scope="col" class="tbay-num"><?php esc_html_e( 'Earned', 'tbay-rewards' ); ?></th>
+								</tr>
+							</thead>
+							<tbody>
+							<?php foreach ( $rows as $row ) : ?>
+								<?php
+								$post_ref = (string) ( $row['post_ref'] ?? '' );
+								$title    = is_numeric( $post_ref ) ? (string) get_the_title( (int) $post_ref ) : '';
+								?>
+								<tr>
+									<td><?php echo esc_html( '' !== $title ? $title : ( (string) ( $row['label'] ?? '—' ) ) ); ?></td>
+									<td class="tbay-num"><?php echo esc_html( number_format_i18n( (int) ( $row['human_clicks'] ?? 0 ) ) ); ?></td>
+									<td class="tbay-num"><?php echo esc_html( number_format_i18n( (int) ( $row['orders'] ?? 0 ) ) ); ?></td>
+									<td class="tbay-num tbay-pos"><?php echo esc_html( $this->money( (int) ( $row['commission_cents'] ?? 0 ) ) ); ?></td>
+								</tr>
+							<?php endforeach; ?>
+							</tbody>
+						</table>
+					</div>
+				</div>
+			<?php elseif ( empty( $commissions ) ) : ?>
+				<p class="tbay-empty">
+					<?php esc_html_e( 'No earnings yet. Add a product link to one of your posts to get started.', 'tbay-rewards' ); ?>
+				</p>
+			<?php endif; ?>
+		</div>
+		<?php
+		return (string) ob_get_clean();
+	}
+
+	private function money( int $cents ): string {
+		return function_exists( 'wc_price' )
+			? wp_strip_all_tags( (string) wc_price( $cents / 100 ) )
+			: number_format_i18n( $cents / 100, 2 );
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────

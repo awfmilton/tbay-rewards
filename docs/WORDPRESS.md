@@ -28,6 +28,7 @@ re-saving the page never wipes a credential you cannot see.
 | `[tbay_leaderboard]` | Top members by lifetime points |
 | `[tbay_share]` | Share buttons that pay when someone else clicks the link |
 | `[tbay_link product="123"]…[/tbay_link]` | A tracked product link earning the author commission |
+| `[tbay_my_commissions]` | A writer's own clicks, orders and earnings |
 
 Attributes:
 
@@ -49,7 +50,7 @@ With WooCommerce active:
 - Captures the attribution cookie at checkout onto the order
 - Reports paid orders, awards points, accrues writer commission
 - Voids commissions and claws back points on refund
-- Applies TBAY store credit as a checkout discount
+- Offers TBAY store credit at cart and checkout, and applies it as a discount
 - Marks product tiles so clicks are attributed to the right product
 
 Always:
@@ -107,6 +108,20 @@ add_action( 'tbay_rewards_webhook_points_awarded', function ( array $data ) {} )
 ```
 
 The plugin instance is available via `tbay_rewards()`.
+
+### Receiving platform events
+
+Register the site's webhook endpoint once, from the platform:
+
+```bash
+npm run cli -- webhook:add --slug my-shop \
+  --url https://my-shop.example/wp-json/tbay/v1/webhook \
+  --secret "$(openssl rand -hex 32)" \
+  --topic points_awarded --topic store_credit_issued
+```
+
+Use the same secret in **Settings → TBAY Rewards**. Deliveries are signed, and
+the plugin rejects anything older than five minutes.
 
 ---
 
