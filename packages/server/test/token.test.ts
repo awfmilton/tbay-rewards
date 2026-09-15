@@ -22,6 +22,7 @@ import { award, getBalance } from '../src/services/points.js';
 import {
   createSpendIntent,
   expireStaleClaims,
+  outstandingClaims,
   quote,
   reconcileClaims,
   redeemPointsForTokens,
@@ -315,7 +316,12 @@ describe('redemption', () => {
     expect(await getBalance(tenant.id, contact.id)).toMatchObject({ balance: 600 });
   });
 
-  it('returns the points when a voucher expires unclaimed', async () => {
+  /**
+   * The deployed contract's claim() has no deadline, so a signed voucher stays
+   * valid on-chain forever. Refunding on a timer would let someone take the
+   * points back AND still mint, so ageing out must not refund.
+   */
+  it('does not refund an aged-out voucher, because it is still claimable on-chain', async () => {
     const contact = await fundedContact(1000);
     const result = await redeemPointsForTokens(await tenantObject(), {
       contact,
@@ -329,12 +335,38 @@ describe('redemption', () => {
     ]);
     expect(await expireStaleClaims()).toBe(1);
 
-    expect((await getBalance(tenant.id, contact.id)).balance).toBe(1000);
+    // Points stay spent and no compensating entry is written.
+    expect((await getBalance(tenant.id, contact.id)).balance).toBe(500);
     const { rows } = await db().query('SELECT status, reversal_entry_id FROM token_claims WHERE id = $1', [
       result.claim.id,
     ]);
     expect(rows[0].status).toBe('expired');
-    expect(rows[0].reversal_entry_id).not.toBeNull();
+    expect(rows[0].reversal_entry_id).toBeNull();
+
+    // …and the member can still see and submit it.
+    const outstanding = await outstandingClaims(tenant.id, contact.id);
+    expect(outstanding).toHaveLength(1);
+    expect(outstanding[0].signature).toBe(result.claim.signature);
+  });
+
+  it('still notices an aged-out voucher being claimed on-chain', async () => {
+    const contact = await fundedContact(1000);
+    const result = await redeemPointsForTokens(await tenantObject(), {
+      contact,
+      points: 500,
+      walletAddress: '0x2222222222222222222222222222222222222222',
+    });
+
+    await db().query(`UPDATE token_claims SET expires_at = now() - interval '1 minute' WHERE id = $1`, [
+      result.claim.id,
+    ]);
+    await expireStaleClaims();
+
+    setChainClient(stubChain({ isNonceUsed: async () => true }));
+    expect(await reconcileClaims()).toBe(1);
+
+    const { rows } = await db().query('SELECT status FROM token_claims WHERE id = $1', [result.claim.id]);
+    expect(rows[0].status).toBe('claimed');
   });
 
   it('marks a voucher claimed once the chain reports its nonce used', async () => {

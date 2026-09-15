@@ -310,6 +310,15 @@ export async function trigger(
       client,
     );
 
+    // Earning is what moves someone up, so evaluate here rather than leaving
+    // badges and ranks to catch up on the next unrelated action. Imported
+    // lazily because gamification depends on this module.
+    if (result.created) {
+      const gamification = await import('./gamification.js');
+      await gamification.evaluateBadges(tenantId, input.contactId, client);
+      await gamification.evaluateRank(tenantId, input.contactId, client);
+    }
+
     return { awarded: true, points, result, balance: result.balance };
   };
 

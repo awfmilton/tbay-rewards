@@ -160,6 +160,8 @@ export async function linkVisitorToContact(
   visitorId: string,
   contactId: string,
 ): Promise<void> {
+  await maybeRecordReferral(runner, tenantId, visitorId, contactId);
+
   await runner.query(
     'UPDATE visitors SET contact_id = $3 WHERE tenant_id = $1 AND id = $2 AND contact_id IS DISTINCT FROM $3',
     [tenantId, visitorId, contactId],
@@ -176,6 +178,42 @@ export async function linkVisitorToContact(
     'UPDATE carts SET contact_id = $3 WHERE tenant_id = $1 AND visitor_id = $2 AND contact_id IS NULL',
     [tenantId, visitorId, contactId],
   );
+}
+
+/**
+ * If this visitor arrived on a referral link, credit whoever owns it.
+ *
+ * Runs at the moment an anonymous visitor becomes a known contact, which is the
+ * only point where both halves — the link that brought them and the identity
+ * they just created — are known.
+ */
+async function maybeRecordReferral(
+  runner: Queryable,
+  tenantId: string,
+  visitorId: string,
+  contactId: string,
+): Promise<void> {
+  const touch = await queryOne<{ link_code: string | null }>(
+    runner,
+    `SELECT link_code FROM touchpoints
+      WHERE tenant_id = $1 AND visitor_id = $2 AND link_code IS NOT NULL
+      ORDER BY occurred_at ASC LIMIT 1`,
+    [tenantId, visitorId],
+  );
+  if (!touch?.link_code) return;
+
+  const link = await queryOne<{ id: string; owner_contact_id: string | null; kind: string }>(
+    runner,
+    'SELECT id, owner_contact_id, kind FROM links WHERE tenant_id = $1 AND code = $2',
+    [tenantId, touch.link_code],
+  );
+  // Campaign and writer links pay commission instead; only member-owned
+  // referral and share links create a referral relationship.
+  if (!link?.owner_contact_id) return;
+  if (link.kind !== 'referral' && link.kind !== 'share') return;
+
+  const { recordReferral } = await import('./contacts.js');
+  await recordReferral(runner, tenantId, link.owner_contact_id, contactId, link.id);
 }
 
 export function selfHostsFor(tenant: Tenant): string[] {

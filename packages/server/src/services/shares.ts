@@ -152,7 +152,31 @@ export async function creditShareClick(
   runner: Queryable,
   tenantId: string,
   linkId: string,
+  /** Who clicked, when we know. A sharer clicking their own link earns nothing. */
+  clicker: { visitorId?: string | null; contactId?: string | null } = {},
 ): Promise<boolean> {
+  // Self-clicks are the obvious way to farm share rewards, so they never count.
+  if (clicker.contactId) {
+    const own = await queryOne<{ id: string }>(
+      runner,
+      `SELECT id FROM share_events
+        WHERE tenant_id = $1 AND link_id = $2 AND contact_id = $3`,
+      [tenantId, linkId, clicker.contactId],
+    );
+    if (own) return false;
+  }
+
+  if (clicker.visitorId) {
+    const sameVisitor = await queryOne<{ id: string }>(
+      runner,
+      `SELECT s.id FROM share_events s
+         JOIN visitors v ON v.contact_id = s.contact_id
+        WHERE s.tenant_id = $1 AND s.link_id = $2 AND v.id = $3`,
+      [tenantId, linkId, clicker.visitorId],
+    );
+    if (sameVisitor) return false;
+  }
+
   const share = await queryOne<ShareEvent>(
     runner,
     `UPDATE share_events
@@ -191,10 +215,11 @@ export async function recordLinkClickForShare(
   runner: Queryable,
   tenantId: string,
   linkCode: string,
+  clicker: { visitorId?: string | null; contactId?: string | null } = {},
 ): Promise<void> {
   const link = await getLinkByCode(linkCode, runner);
   if (!link || link.tenant_id !== tenantId || link.kind !== 'share') return;
-  await creditShareClick(runner, tenantId, link.id);
+  await creditShareClick(runner, tenantId, link.id, clicker);
 }
 
 /** Close out pending shares nobody ever clicked. */

@@ -30,11 +30,14 @@ ENV NODE_ENV=production \
 
 WORKDIR /app
 
+# npm workspaces hoist everything to the root node_modules, so that single copy
+# carries the runtime dependencies. There is deliberately no COPY of
+# packages/server/node_modules: a clean `npm ci` does not create one, and naming
+# a path that may not exist fails the build.
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/packages/server/dist ./packages/server/dist
 COPY --from=build /app/packages/server/package.json ./packages/server/package.json
-COPY --from=build /app/packages/server/node_modules ./packages/server/node_modules
 
 # Not compiled, but read at runtime: SQL migrations, the dashboard and the
 # tracker script the API serves to storefronts.

@@ -258,7 +258,7 @@ async function sendEmailAction(
     name: ctx.contact.name ?? '',
     email: ctx.contact.email,
     rewards_url: (tenant.settings?.siteUrl as string) ?? config().publicUrl,
-    unsubscribe_url: `${config().publicUrl}/n/unsubscribe-request?email=${encodeURIComponent(ctx.contact.email)}`,
+    unsubscribe_url: `${config().publicUrl}/n/unsubscribe-request?t=${tenant.id}&email=${encodeURIComponent(ctx.contact.email)}`,
     ...ctx.data,
   });
 

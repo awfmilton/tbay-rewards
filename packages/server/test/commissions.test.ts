@@ -272,7 +272,10 @@ describe('writer commissions', () => {
     const refund = await refundOrder(tenantRow, 'order-7');
     expect(refund).toMatchObject({ voided: 1, pointsReversed: true });
 
-    expect(await getBalance(tenant.id, buyerId)).toMatchObject({ balance: 0, pending: 0 });
+    // The purchase points are clawed back. The 50-point "first purchase" badge
+    // bonus is not: the badge was genuinely earned, and unearning achievements
+    // on a refund is punitive rather than corrective.
+    expect(await getBalance(tenant.id, buyerId)).toMatchObject({ balance: 50, pending: 0 });
     expect(await commissionSummary(tenant.id, author.id)).toMatchObject({ pending_cents: 0 });
   });
 

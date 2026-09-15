@@ -31,6 +31,8 @@ import {
   withdrawalInstructions,
 } from '../services/bridge.js';
 import { tokensToWei } from '../lib/chain.js';
+import { verifiedWallet } from '../services/wallets.js';
+import { constantTimeEqual, sha256 } from '../lib/crypto.js';
 
 /** Gamification and bridge endpoints. Secret-key authenticated throughout. */
 export async function gamificationRoutes(app: FastifyInstance): Promise<void> {
@@ -245,27 +247,47 @@ export async function gamificationRoutes(app: FastifyInstance): Promise<void> {
     const input = parse(
       contactHandleSchema.extend({
         burnTxHash: z.string().length(66),
-        fromAddress: z.string().length(42),
-        l1Recipient: z.string().length(42).nullish(),
+        // Optional: when the caller identifies a contact we use that contact's
+        // PROVED wallet instead, because a request field is not evidence of
+        // ownership. Only an anonymous bridge submission falls back to this.
+        fromAddress: z.string().length(42).optional(),
       }),
       request.body,
     );
 
     let contactId: string | null = null;
     let memberId: string | null = null;
+    let fromAddress: string | null = null;
+
     try {
       const contact = await requireContact(tenant.id, input);
       contactId = contact.id;
       memberId = contact.member_id;
-    } catch {
-      // A withdrawal is a wallet action, not an account action: someone who
-      // never signed up can still bridge tokens they hold.
+
+      // Never take the burner's address from the request for an identified
+      // member: use the wallet they actually proved they control. Otherwise a
+      // member could claim any address and hijack that address's burns.
+      fromAddress = await verifiedWallet(tenant.id, contact.id);
+      if (!fromAddress) {
+        throw ApiError.forbidden(
+          'Verify your wallet before bridging. Sign the challenge from /v1/wallet/challenge first.',
+        );
+      }
+    } catch (err) {
+      if (err instanceof ApiError && err.statusCode === 403) throw err;
+
+      // No contact matched. A withdrawal is a wallet action rather than an
+      // account action, so an unregistered holder can still bridge — but the
+      // burn itself is the only evidence, and the release goes to the burner.
+      fromAddress = input.fromAddress ?? null;
+      if (!fromAddress) {
+        throw ApiError.badRequest('Provide a contact or a fromAddress');
+      }
     }
 
     return recordWithdrawal({
       burnTxHash: input.burnTxHash,
-      fromAddress: input.fromAddress,
-      l1Recipient: input.l1Recipient ?? null,
+      fromAddress,
       tenantId: tenant.id,
       contactId,
       memberId,
@@ -325,14 +347,11 @@ function requireBridgeOperator(presented: string | undefined): void {
   if ('' === expected) {
     throw new ApiError(503, 'operator_unavailable', 'No bridge operator token is configured');
   }
-  if (!presented || presented.length !== expected.length) {
+  // Hash both sides before comparing, so the comparison time depends on the
+  // digest length rather than on how much of the real token was guessed — an
+  // early length check would leak the token's size.
+  if (!presented || !constantTimeEqual(sha256(presented), sha256(expected))) {
     throw ApiError.forbidden('Bridge operator credential required');
   }
-  // Constant-time compare so the token cannot be recovered a byte at a time.
-  let mismatch = 0;
-  for (let i = 0; i < expected.length; i += 1) {
-    mismatch |= expected.charCodeAt(i) ^ presented.charCodeAt(i);
-  }
-  if (mismatch !== 0) throw ApiError.forbidden('Bridge operator credential required');
 }
 

@@ -169,22 +169,26 @@ describe('withdrawal recording', () => {
     const again = await recordWithdrawal({
       burnTxHash: TX,
       fromAddress: HOLDER,
-      l1Recipient: OTHER,
       tenantId: tenant.id,
     });
 
     expect(again.withdrawal.l1_recipient).toBe(HOLDER.toLowerCase());
   });
 
-  it('accepts an explicit L1 recipient on the first submission', async () => {
+  /**
+   * The L1 release always goes to whoever burned. Accepting a recipient from
+   * the request would let anyone watching the chain redirect a stranger's
+   * withdrawal to themselves.
+   */
+  it('always releases to the burner, never to a nominated address', async () => {
     setChainClient(stubChain([burnEvent(HOLDER, tokensToWei(10))]));
     const { withdrawal } = await recordWithdrawal({
       burnTxHash: TX,
       fromAddress: HOLDER,
-      l1Recipient: OTHER,
       tenantId: tenant.id,
     });
-    expect(withdrawal.l1_recipient).toBe(OTHER.toLowerCase());
+    expect(withdrawal.l1_recipient).toBe(HOLDER.toLowerCase());
+    expect(withdrawal.l1_recipient).not.toBe(OTHER.toLowerCase());
   });
 
   it('rejects a malformed transaction hash', async () => {
@@ -310,7 +314,7 @@ describe('reward supply budget', () => {
     }
   });
 
-  it('returns budget when a voucher expires unclaimed', async () => {
+  it('keeps budget committed for an aged-out but still-claimable voucher', async () => {
     process.env.TBAY_REWARD_SUPPLY_CAP_WEI = (10n * 10n ** 18n).toString();
     resetConfig();
 
@@ -337,7 +341,9 @@ describe('reward supply budget', () => {
       );
       await expireStaleClaims();
 
-      expect((await supplyStatus()).committed_wei).toBe('0');
+      // Budget stays committed: an aged-out voucher can still be minted, so
+      // releasing its allocation would let the platform over-promise.
+      expect((await supplyStatus()).committed_wei).toBe((5n * 10n ** 18n).toString());
     } finally {
       delete process.env.TBAY_REWARD_SUPPLY_CAP_WEI;
       resetConfig();

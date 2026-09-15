@@ -119,10 +119,28 @@ export async function upsertMember(
  * Create or merge a tenant-scoped contact. Matching is by email first, then by
  * the retailer's own external reference (e.g. a WordPress user id).
  */
+export interface UpsertOptions {
+  /**
+   * Allow this call to REPLACE an identity key (email or external ref) that is
+   * already set to a different value.
+   *
+   * Off by default, and the public ingest path must never turn it on. With it
+   * off, an attacker who knows one identity key cannot rewrite the other and
+   * take over the account: supplying {email: attacker, externalRef: victim}
+   * is rejected instead of silently moving the victim's contact — and their
+   * points balance — onto the attacker's email.
+   *
+   * Server-to-server callers holding the tenant's own secret key may opt in, so
+   * a customer legitimately changing their email address still works.
+   */
+  allowIdentityChange?: boolean;
+}
+
 export async function upsertContact(
   tenantId: string,
   input: ContactInput,
   runner?: Queryable,
+  options: UpsertOptions = {},
 ): Promise<Contact> {
   const run = async (client: Queryable): Promise<Contact> => {
     const email = input.email ? normaliseEmail(input.email) : null;
@@ -145,6 +163,10 @@ export async function upsertContact(
         'SELECT * FROM contacts WHERE tenant_id = $1 AND external_ref = $2',
         [tenantId, input.externalRef],
       );
+    }
+
+    if (existing && !options.allowIdentityChange) {
+      assertIdentityUnchanged(existing, { email, externalRef: input.externalRef ?? null });
     }
 
     if (existing) {
@@ -227,6 +249,40 @@ export async function upsertContact(
   return runner ? run(runner) : withTransaction(run);
 }
 
+/**
+ * Refuse to move a contact onto a different email or external reference.
+ *
+ * Filling in a key that is currently empty is fine and expected — that is how
+ * an anonymous newsletter subscriber later gains a WordPress user id. Replacing
+ * a key that is already set to something else is an identity takeover.
+ */
+function assertIdentityUnchanged(
+  existing: Contact,
+  incoming: { email: string | null; externalRef: string | null },
+): void {
+  if (
+    incoming.email &&
+    existing.email_normalised &&
+    existing.email_normalised !== incoming.email
+  ) {
+    throw ApiError.conflict(
+      'That reference already belongs to a different email address',
+      { field: 'email' },
+    );
+  }
+
+  if (
+    incoming.externalRef &&
+    existing.external_ref &&
+    existing.external_ref !== incoming.externalRef
+  ) {
+    throw ApiError.conflict(
+      'That email address already belongs to a different account',
+      { field: 'externalRef' },
+    );
+  }
+}
+
 export async function getContact(tenantId: string, contactId: string): Promise<Contact | null> {
   return queryOne<Contact>(db(), 'SELECT * FROM contacts WHERE tenant_id = $1 AND id = $2', [
     tenantId,
@@ -271,6 +327,33 @@ export async function requireContact(
     if (byRef) return byRef;
   }
   throw ApiError.notFound('No matching contact');
+}
+
+/**
+ * Record that one member brought another in.
+ *
+ * Called when a new contact is created during a session that arrived on a
+ * referral link. Without this the referrals table stays empty, which in turn
+ * means the referral reward and the Connector badge can never be earned.
+ */
+export async function recordReferral(
+  runner: Queryable,
+  tenantId: string,
+  referrerContactId: string,
+  refereeContactId: string,
+  linkId: string | null,
+): Promise<boolean> {
+  if (referrerContactId === refereeContactId) return false;
+
+  const row = await queryOne<{ id: string }>(
+    runner,
+    `INSERT INTO referrals (tenant_id, referrer_contact_id, referee_contact_id, link_id)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (tenant_id, referee_contact_id) DO NOTHING
+     RETURNING id`,
+    [tenantId, referrerContactId, refereeContactId, linkId],
+  );
+  return row !== null;
 }
 
 export async function setWallet(

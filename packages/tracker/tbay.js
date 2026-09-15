@@ -82,6 +82,44 @@
   var visitorId = readStore('tbay_visitor');
   if (!visitorId) { visitorId = uuid(); writeStore('tbay_visitor', visitorId); }
 
+  /**
+   * Mirror the visitor id into a first-party cookie.
+   *
+   * localStorage is invisible to the site's own server, and the storefront needs
+   * this id at checkout to attribute the order to the session that earned it.
+   * Without the cookie every order looks like direct traffic and writer
+   * commissions never accrue.
+   */
+  function writeCookie(name, value, days) {
+    try {
+      var expires = new Date(Date.now() + days * 864e5).toUTCString();
+      var secure = location.protocol === 'https:' ? '; Secure' : '';
+      document.cookie = name + '=' + encodeURIComponent(value) +
+        '; Expires=' + expires + '; Path=/; SameSite=Lax' + secure;
+    } catch (e) { /* cookies disabled — analytics still works, attribution does not */ }
+  }
+
+  function readCookie(name) {
+    try {
+      var match = document.cookie.match('(^|;)\\s*' + name + '\\s*=\\s*([^;]+)');
+      return match ? decodeURIComponent(match[2]) : null;
+    } catch (e) { return null; }
+  }
+
+  writeCookie('tbay_visitor', visitorId, 365);
+
+  /**
+   * Persist the trackable-link code on the storefront's own origin.
+   *
+   * The /r/ redirect sets its signed cookie on the API origin, which the shop's
+   * server can never see. Capturing the code here, on the landing page, is what
+   * lets checkout attribute the order to the writer whose link brought it.
+   */
+  (function persistLinkCode() {
+    var code = linkCodeFromUrl();
+    if (code) writeCookie('tbay_ref', code, 30);
+  }());
+
   function currentSession() {
     var id = readStore('tbay_session');
     var last = parseInt(readStore('tbay_session_ts') || '0', 10);

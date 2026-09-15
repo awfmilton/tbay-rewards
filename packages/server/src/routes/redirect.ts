@@ -6,7 +6,7 @@ import { config } from '../config.js';
 import { getLinkByCode, issueAttributionCookie, recordClick } from '../services/links.js';
 import { creditShareClick } from '../services/shares.js';
 import { getTenantById } from '../services/tenants.js';
-import { confirmSubscription, unsubscribeByToken } from '../services/newsletter.js';
+import { confirmSubscription, unsubscribeByEmail, unsubscribeByToken } from '../services/newsletter.js';
 import { getCartByRecoveryToken } from '../services/carts.js';
 
 /**
@@ -34,6 +34,8 @@ export async function redirectRoutes(app: FastifyInstance): Promise<void> {
       if (!recorded.isBot && link.kind === 'share') {
         await creditShareClick(client, tenant.id, link.id);
       }
+      // The tracker credits the click with visitor context once the landing
+      // page loads, which is where a self-click is actually detectable.
       return recorded;
     });
 
@@ -82,6 +84,33 @@ export async function redirectRoutes(app: FastifyInstance): Promise<void> {
       .type('text/html')
       .send(page('Unsubscribed', 'You will not receive any further marketing email from us.'));
   });
+
+  /**
+   * Email-address unsubscribe, for messages sent outside a list subscription.
+   *
+   * Automation and cart-recovery mail is addressed to a contact rather than a
+   * list subscription, so there is no per-subscription token to embed. This
+   * gives those messages a working one-click opt-out — which the law requires
+   * and which was previously a 404.
+   *
+   * Answers identically whether or not the address exists, so it cannot be used
+   * to test which addresses are on file.
+   */
+  app.get<{ Querystring: { email?: string; t?: string } }>(
+    '/n/unsubscribe-request',
+    async (request, reply) => {
+      const email = String(request.query.email ?? '').trim();
+      const tenantId = String(request.query.t ?? '').trim();
+
+      if (email !== '' && tenantId !== '') {
+        await unsubscribeByEmail(tenantId, email).catch(() => false);
+      }
+
+      return reply
+        .type('text/html')
+        .send(page('Unsubscribed', 'You will not receive any further marketing email from us.'));
+    },
+  );
 
   app.get<{ Params: { token: string } }>('/c/:token', async (request, reply) => {
     const cart = await getCartByRecoveryToken(request.params.token);

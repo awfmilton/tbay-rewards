@@ -106,6 +106,39 @@ export function ids(): { visitor: string; session: string } {
   return { visitor: `visitor-${suffix}-aaaa`, session: `session-${suffix}-aaaa` };
 }
 
+/**
+ * Bind a wallet to a contact by actually signing the challenge, the same way a
+ * customer's wallet would. Redemption and bridging both require a proved wallet,
+ * so most token tests need this.
+ */
+export async function verifyWalletFor(
+  tenantId: string,
+  contactId: string,
+  wallet: Wallet,
+): Promise<string> {
+  const { getTenantById } = await import('../src/services/tenants.js');
+  const { getContact } = await import('../src/services/contacts.js');
+  const { createChallenge, verifyChallenge } = await import('../src/services/wallets.js');
+
+  const tenant = (await getTenantById(tenantId))!;
+  const contact = (await getContact(tenantId, contactId))!;
+
+  const challenge = await createChallenge(tenant, contact, wallet.address);
+  const signature = await wallet.signMessage(challenge.message);
+
+  const updated = await verifyChallenge(tenant, contact, {
+    nonce: challenge.nonce,
+    signature,
+    message: challenge.message,
+  });
+  return updated.wallet_address!;
+}
+
+/** A deterministic customer wallet for tests that need one. */
+export const TEST_WALLET = new Wallet(
+  '0x4bbbf85ce3377467afe5d46f804f221813b2bb87f24d81f60f1fcdbf7cbf4356',
+);
+
 export const DESKTOP_UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36';
 export const MOBILE_UA =

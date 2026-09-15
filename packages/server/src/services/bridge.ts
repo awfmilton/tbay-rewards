@@ -83,7 +83,6 @@ export function withdrawalInstructions(amountWei: bigint): {
 export interface RecordWithdrawalInput {
   burnTxHash: string;
   fromAddress: string;
-  l1Recipient?: string | null;
   tenantId?: string | null;
   contactId?: string | null;
   memberId?: string | null;
@@ -109,7 +108,12 @@ export async function recordWithdrawal(
   }
 
   const from = assertAddress(input.fromAddress, 'from_address');
-  const recipient = assertAddress(input.l1Recipient ?? input.fromAddress, 'l1_recipient');
+
+  // The L1 release always goes to the address that burned. There is deliberately
+  // no way to nominate a different recipient: the burn event proves who owned
+  // the tokens and nothing else does, so accepting a recipient from the request
+  // would let anyone who spots a burn on-chain redirect it to themselves.
+  const recipient = from;
 
   if (!/^0x[0-9a-fA-F]{64}$/.test(input.burnTxHash)) {
     throw ApiError.badRequest('burn_tx_hash must be a 32-byte transaction hash');
@@ -176,8 +180,8 @@ export async function recordWithdrawal(
         'SELECT * FROM bridge_withdrawals WHERE l2_chain_id = $1 AND burn_tx_hash = $2',
         [cfg.chain.chainId, input.burnTxHash],
       );
-      // Already recorded. Return it, but never re-point it at a new recipient:
-      // that would let a later caller redirect someone else's withdrawal.
+      // Already recorded. Returned as-is and never re-pointed — the recipient is
+      // derived from the burn, so there is nothing a later caller could change.
       if (existing) {
         return existing;
       }
