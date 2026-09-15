@@ -28,6 +28,9 @@ services:
   app:
     build: .
     restart: unless-stopped
+    # PID 1 reaping and signal forwarding, so SIGTERM reaches Node and the app
+    # closes its database pool instead of being killed mid-query.
+    init: true
     depends_on:
       postgres:
         condition: service_healthy
@@ -58,6 +61,7 @@ services:
   worker:
     build: .
     restart: unless-stopped
+    init: true
     depends_on:
       postgres:
         condition: service_healthy
