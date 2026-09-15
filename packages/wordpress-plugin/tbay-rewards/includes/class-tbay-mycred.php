@@ -26,8 +26,12 @@ class TBAY_Rewards_MyCred {
 			return;
 		}
 
-		// Earning through myCred hooks is mirrored the other way, into TBAY.
-		add_action( 'mycred_add', array( $this, 'on_mycred_add' ), 20, 3 );
+		// myCred's `mycred_add` is a FILTER with the signature
+		// ( bool $reply, array $request, myCRED_Settings $mycred ) — binding it as
+		// an action passed the boolean reply where the reference was expected, so
+		// every mirrored award used a rule key of "mycred_1" and the filter's
+		// reply was discarded for later callbacks.
+		add_filter( 'mycred_add', array( $this, 'on_mycred_add' ), 20, 3 );
 		add_action( 'show_user_profile', array( $this, 'render_profile_balance' ) );
 		add_action( 'edit_user_profile', array( $this, 'render_profile_balance' ) );
 	}
@@ -69,8 +73,8 @@ class TBAY_Rewards_MyCred {
 			return;
 		}
 
-		// Guard against re-entering our own mycred_add listener.
-		remove_action( 'mycred_add', array( $this, 'on_mycred_add' ), 20 );
+		// Guard against re-entering our own listener.
+		remove_filter( 'mycred_add', array( $this, 'on_mycred_add' ), 20 );
 
 		$mycred->add_creds(
 			'tbay_sync',
@@ -82,45 +86,66 @@ class TBAY_Rewards_MyCred {
 			$this->point_type()
 		);
 
-		add_action( 'mycred_add', array( $this, 'on_mycred_add' ), 20, 3 );
+		add_filter( 'mycred_add', array( $this, 'on_mycred_add' ), 20, 3 );
 	}
 
 	/**
 	 * Mirror points earned through a myCred hook into the TBAY ledger, so a site
 	 * already running myCred badges keeps one true balance.
 	 *
-	 * @param string $reference myCred reference key.
-	 * @param array  $data      myCred entry data.
-	 * @param object $mycred    myCred instance.
+	 * This is a filter, not an action: it must return `$reply` unchanged or it
+	 * silently cancels the award for every later callback.
+	 *
+	 * @param bool  $reply   Whether myCred should proceed with the award.
+	 * @param array $request The myCred award request.
+	 * @param mixed $mycred  myCred settings instance.
+	 * @return bool The unmodified reply.
 	 */
-	public function on_mycred_add( $reference, $data, $mycred ): void {
+	public function on_mycred_add( $reply, $request, $mycred ) {
 		unset( $mycred );
 
-		if ( 'tbay_sync' === $reference ) {
-			return; // Our own write coming back around.
+		// Never interfere with the award itself — only observe it.
+		if ( true !== $reply || ! is_array( $request ) ) {
+			return $reply;
 		}
 
-		$user_id = isset( $data['user_id'] ) ? (int) $data['user_id'] : 0;
-		$amount  = isset( $data['amount'] ) ? (int) $data['amount'] : 0;
+		$reference = isset( $request['ref'] ) ? (string) $request['ref'] : '';
+		if ( 'tbay_sync' === $reference ) {
+			return $reply; // Our own write coming back around.
+		}
+
+		$user_id = isset( $request['user_id'] ) ? (int) $request['user_id'] : 0;
+		$amount  = isset( $request['amount'] ) ? (int) $request['amount'] : 0;
 		if ( $user_id <= 0 || $amount <= 0 ) {
-			return;
+			return $reply;
 		}
 
 		$contact_id = $this->api->contact_id_for_user( $user_id );
 		if ( null === $contact_id ) {
-			return;
+			return $reply;
 		}
 
+		// Credit the exact amount myCred awarded rather than routing through a
+		// reward rule: there is no rule for an arbitrary myCred hook, so the old
+		// /v1/rewards/trigger call always came back rule_missing and mirrored
+		// nothing at all.
 		$this->api->post(
-			'/v1/rewards/trigger',
+			'/v1/rewards/adjust',
 			array(
-				'contactId' => $contact_id,
-				'ruleKey'   => 'mycred_' . sanitize_key( (string) $reference ),
-				// The myCred entry id keeps this idempotent across retries.
-				'refId'     => (string) ( $data['entry_id'] ?? md5( wp_json_encode( $data ) ) ),
-				'meta'      => array( 'mycred_reference' => (string) $reference ),
+				'contactId'      => $contact_id,
+				'points'         => $amount,
+				'reason'         => sprintf(
+					/* translators: %s: the myCred reference that awarded the points. */
+					__( 'myCred: %s', 'tbay-rewards' ),
+					$reference
+				),
+				// Keyed on the myCred entry so a retry cannot double-credit.
+				'idempotencyKey' => 'mycred:' . $reference . ':' . $user_id . ':' .
+					( $request['ref_id'] ?? md5( (string) wp_json_encode( $request ) ) ),
 			)
 		);
+
+		return $reply;
 	}
 
 	public function render_profile_balance( WP_User $user ): void {

@@ -123,6 +123,16 @@ export async function award(
       spent: 0,
     });
 
+    // Let the storefront mirror the new balance (myCred, a header badge, a
+    // notification) without polling.
+    const { enqueueWebhook } = await import('./automations.js');
+    await enqueueWebhook(client, tenantId, 'points_awarded', {
+      contact_id: input.contactId,
+      points: input.points,
+      reason: input.reason,
+      balance: balance.balance,
+    });
+
     return { entry, balance, created: true };
   };
 
@@ -215,6 +225,14 @@ export async function spend(
       pending: 0,
       earned: 0,
       spent: input.points,
+    });
+
+    const { enqueueWebhook } = await import('./automations.js');
+    await enqueueWebhook(client, tenantId, 'points_redeemed', {
+      contact_id: input.contactId,
+      points: input.points,
+      reason: input.reason,
+      balance: balance.balance,
     });
 
     return { entry: entry!, balance, created: true };

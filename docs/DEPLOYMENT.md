@@ -41,6 +41,14 @@ docker compose exec app node packages/server/dist/cli.js tenant:create \
 
 Keep the printed **API secret**. It is not shown again.
 
+Configure the retailer (a payout wallet is required before customers can spend
+TBAY at this shop):
+
+```bash
+docker compose exec app node packages/server/dist/cli.js settings:set \
+  --slug my-shop --payout-wallet 0x… --page-pattern /product/:slug
+```
+
 ---
 
 ## TLS

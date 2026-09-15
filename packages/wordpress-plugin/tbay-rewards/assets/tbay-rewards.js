@@ -822,7 +822,39 @@
 
 	// ── Boot ─────────────────────────────────────────────────────────────────
 
+	/** "Use my credit" at cart and checkout. */
+	function initCredit(panel) {
+		var button = panel.querySelector('[data-tbay-apply-credit]');
+		var status = panel.querySelector('[data-tbay-credit-status]');
+		if (!button) return;
+
+		button.addEventListener('click', function () {
+			button.disabled = true;
+			setStatus(status, i18n.creditApplying, 'pending');
+
+			var body = new URLSearchParams();
+			body.append('action', 'tbay_apply_credit');
+			body.append('nonce', button.dataset.nonce);
+
+			fetch(config.ajaxUrl, { method: 'POST', body: body, credentials: 'same-origin' })
+				.then(function (response) { return response.json(); })
+				.then(function (payload) {
+					if (!payload.success) {
+						throw new Error(payload.data && payload.data.message);
+					}
+					// Woo recalculates totals on reload, which is also the moment
+					// the discount becomes visible.
+					window.location.reload();
+				})
+				['catch'](function (error) {
+					setStatus(status, friendlyError(error), 'error');
+					button.disabled = false;
+				});
+		});
+	}
+
 	function boot() {
+		document.querySelectorAll('[data-tbay-credit]').forEach(initCredit);
 		document.querySelectorAll('[data-tbay-newsletter]').forEach(initNewsletter);
 		document.querySelectorAll('[data-tbay-share]').forEach(initShare);
 		document.querySelectorAll('[data-tbay-rewards]').forEach(initRewards);

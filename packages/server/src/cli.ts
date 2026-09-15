@@ -90,6 +90,54 @@ try {
       break;
     }
 
+    case 'settings:set': {
+      const slug = flag('slug');
+      const tenant = await getTenantBySlug(slug);
+      if (!tenant) throw new Error(`No tenant with slug "${slug}"`);
+
+      const patch: Record<string, unknown> = {};
+      if (process.argv.includes('--payout-wallet')) patch.payoutWallet = flag('payout-wallet');
+      if (process.argv.includes('--site-url')) patch.siteUrl = flag('site-url');
+      if (process.argv.includes('--points-per-token')) {
+        patch.pointsPerToken = Number(flag('points-per-token'));
+      }
+      if (process.argv.includes('--credit-bonus-bps')) {
+        patch.creditBonusBps = Number(flag('credit-bonus-bps'));
+      }
+      if (process.argv.includes('--commission-rate-bps')) {
+        patch.commissionRateBps = Number(flag('commission-rate-bps'));
+      }
+      for (const pattern of flags('page-pattern')) {
+        patch.pageKeyPatterns = [...((patch.pageKeyPatterns as string[]) ?? []), pattern];
+      }
+
+      if (Object.keys(patch).length === 0) {
+        console.log('Nothing to change. Current settings:');
+        console.log(JSON.stringify(tenant.settings, null, 2));
+        break;
+      }
+
+      const { updateTenantSettings } = await import('./services/tenants.js');
+      await updateTenantSettings(db(), tenant.id, patch);
+      const updated = await getTenantBySlug(slug);
+      console.log(JSON.stringify(updated?.settings, null, 2));
+      break;
+    }
+
+    case 'webhook:add': {
+      const slug = flag('slug');
+      const tenant = await getTenantBySlug(slug);
+      if (!tenant) throw new Error(`No tenant with slug "${slug}"`);
+
+      const secret = flag('secret');
+      await db().query(
+        `INSERT INTO webhooks (tenant_id, url, secret, topics) VALUES ($1, $2, $3, $4::text[])`,
+        [tenant.id, flag('url'), secret, flags('topic')],
+      );
+      console.log('Webhook registered. Use the same secret in the WordPress settings screen.');
+      break;
+    }
+
     case 'key:revoke': {
       const { rowCount } = await db().query(
         'UPDATE tenant_keys SET revoked_at = now() WHERE key_id = $1 AND revoked_at IS NULL',
@@ -104,7 +152,12 @@ try {
   tenant:create --slug <slug> --name <name> [--currency USD] [--domain example.com ...] [--site-url https://…]
   tenant:list
   key:issue --slug <slug> [--kind public|secret] [--label <label>]
-  key:revoke --key <key_id>`);
+  key:revoke --key <key_id>
+  settings:set --slug <slug> [--payout-wallet 0x…] [--site-url https://…]
+               [--points-per-token 100] [--credit-bonus-bps 0]
+               [--commission-rate-bps 500] [--page-pattern /product/:slug ...]
+  webhook:add --slug <slug> --url https://shop.example/wp-json/tbay/v1/webhook
+              --secret <signing secret> [--topic points_awarded ...]`);
   }
 } catch (err) {
   console.error(err instanceof Error ? err.message : err);

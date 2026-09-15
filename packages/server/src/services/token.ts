@@ -680,6 +680,14 @@ export async function verifySpendIntent(
       [tenant.id, intent.contact_id, code, intent.credit_cents, intent.currency, intent.id],
     );
 
+    const { enqueueWebhook } = await import('./automations.js');
+    await enqueueWebhook(tx, tenant.id, 'store_credit_issued', {
+      contact_id: intent.contact_id,
+      code: credit!.code,
+      amount_cents: credit!.amount_cents,
+      currency: credit!.currency,
+    });
+
     return { intent: updated, credit: credit! };
   });
 }

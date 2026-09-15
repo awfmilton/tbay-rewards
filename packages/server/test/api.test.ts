@@ -427,3 +427,157 @@ describe('email consent in automations', () => {
     expect(outbox()).toHaveLength(0);
   });
 });
+
+describe('tenant settings', () => {
+  it('reads and writes retailer configuration', async () => {
+    const read = await authed('GET', '/v1/settings');
+    expect(read.statusCode).toBe(200);
+    expect(read.json().slug).toBe(tenant.slug);
+
+    const written = await authed('PUT', '/v1/settings', {
+      payoutWallet: '0x5555555555555555555555555555555555555555',
+      creditBonusBps: 2500,
+      pointsPerToken: 250,
+    });
+    expect(written.statusCode).toBe(200);
+    expect(written.json().settings).toMatchObject({ creditBonusBps: 2500, pointsPerToken: 250 });
+
+    // The change takes effect immediately, including the network-rate bonus.
+    const config = await (await testApp()).inject({
+      method: 'GET',
+      url: '/v1/config',
+      headers: { 'x-tbay-key': tenant.publicKey },
+    });
+    expect(config.json().rewards.pointsPerToken).toBe(250);
+    expect(config.json().rewards.retailerBonusBps).toBe(2500);
+    // 100 cents network floor + 25% retailer bonus.
+    expect(config.json().rewards.effectiveCreditCentsPerToken).toBe(125);
+  });
+
+  it('rejects a bad payout wallet and unknown fields', async () => {
+    expect((await authed('PUT', '/v1/settings', { payoutWallet: 'not-an-address' })).statusCode).toBe(400);
+    expect((await authed('PUT', '/v1/settings', { nonsense: true })).statusCode).toBe(400);
+  });
+
+  it('cannot push a retailer below the network credit rate', async () => {
+    // creditBonusBps is a bonus only; there is no negative form of it.
+    expect((await authed('PUT', '/v1/settings', { creditBonusBps: -5000 })).statusCode).toBe(400);
+  });
+});
+
+describe('webhooks', () => {
+  it('registers a subscription and queues deliveries for it', async () => {
+    const created = await authed('POST', '/v1/webhooks', {
+      url: 'https://shop.example.com/wp-json/tbay/v1/webhook',
+      secret: 'a-signing-secret-at-least-16',
+      topics: ['points_awarded'],
+    });
+    expect(created.statusCode).toBe(200);
+
+    const listed = await authed('GET', '/v1/webhooks');
+    expect(listed.json().webhooks).toHaveLength(1);
+    // The signing secret is never handed back.
+    expect(JSON.stringify(listed.json())).not.toContain('a-signing-secret');
+
+    await authed('POST', '/v1/contacts', { email: 'hooked@example.com' });
+    await authed('POST', '/v1/rewards/trigger', {
+      email: 'hooked@example.com',
+      ruleKey: 'account_created',
+      refId: 'x',
+    });
+
+    const { rows } = await db().query(
+      'SELECT topic, payload FROM webhook_deliveries WHERE tenant_id = $1',
+      [tenant.id],
+    );
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows[0].topic).toBe('points_awarded');
+    expect(rows[0].payload).toMatchObject({ points: 50 });
+  });
+
+  it('refuses a plaintext http endpoint', async () => {
+    const response = await authed('POST', '/v1/webhooks', {
+      url: 'http://insecure.example.com/hook',
+      secret: 'a-signing-secret-at-least-16',
+    });
+    expect(response.statusCode).toBe(400);
+  });
+
+  it('deletes a subscription', async () => {
+    const created = await authed('POST', '/v1/webhooks', {
+      url: 'https://shop.example.com/hook',
+      secret: 'a-signing-secret-at-least-16',
+    });
+    const id = created.json().webhook_id as string;
+
+    const app = await testApp();
+    const deleted = await app.inject({
+      method: 'DELETE',
+      url: `/v1/webhooks/${id}`,
+      headers: { authorization: `Bearer ${tenant.secretKey}` },
+    });
+    expect(deleted.statusCode).toBe(200);
+    expect((await authed('GET', '/v1/webhooks')).json().webhooks).toHaveLength(0);
+  });
+});
+
+describe('point adjustments', () => {
+  it('credits an exact amount, once per idempotency key', async () => {
+    await authed('POST', '/v1/contacts', { email: 'adjusted@example.com' });
+
+    const first = await authed('POST', '/v1/rewards/adjust', {
+      email: 'adjusted@example.com',
+      points: 320,
+      reason: 'myCred: comment',
+      idempotencyKey: 'mycred:comment:7:1',
+    });
+    expect(first.json()).toMatchObject({ applied: true, points: 320 });
+    expect(first.json().balance.balance).toBe(320);
+
+    const repeat = await authed('POST', '/v1/rewards/adjust', {
+      email: 'adjusted@example.com',
+      points: 320,
+      reason: 'myCred: comment',
+      idempotencyKey: 'mycred:comment:7:1',
+    });
+    expect(repeat.json().applied).toBe(false);
+    expect(repeat.json().balance.balance).toBe(320);
+  });
+
+  it('debits with a negative amount and refuses to overdraw', async () => {
+    await authed('POST', '/v1/contacts', { email: 'adjusted@example.com' });
+    await authed('POST', '/v1/rewards/adjust', {
+      email: 'adjusted@example.com',
+      points: 100,
+      reason: 'Grant',
+      idempotencyKey: 'grant-1',
+    });
+
+    const debit = await authed('POST', '/v1/rewards/adjust', {
+      email: 'adjusted@example.com',
+      points: -40,
+      reason: 'Correction',
+      idempotencyKey: 'fix-1',
+    });
+    expect(debit.json().balance.balance).toBe(60);
+
+    const overdraw = await authed('POST', '/v1/rewards/adjust', {
+      email: 'adjusted@example.com',
+      points: -500,
+      reason: 'Too much',
+      idempotencyKey: 'fix-2',
+    });
+    expect(overdraw.statusCode).toBe(422);
+  });
+
+  it('rejects a zero adjustment', async () => {
+    await authed('POST', '/v1/contacts', { email: 'adjusted@example.com' });
+    const response = await authed('POST', '/v1/rewards/adjust', {
+      email: 'adjusted@example.com',
+      points: 0,
+      reason: 'Nothing',
+      idempotencyKey: 'zero',
+    });
+    expect(response.statusCode).toBe(400);
+  });
+});

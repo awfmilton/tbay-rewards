@@ -1,5 +1,5 @@
 import type { FastifyInstance } from 'fastify';
-import { db } from '../db/pool.js';
+import { db, queryOne } from '../db/pool.js';
 import { requireSecretKey, tenantOf } from '../lib/auth.js';
 import { ApiError } from '../lib/errors.js';
 import { config } from '../config.js';
@@ -14,9 +14,11 @@ import {
 } from './schemas.js';
 import { findContactByEmail, requireContact, upsertContact } from '../services/contacts.js';
 import { createChallenge, verifiedWallet, verifyChallenge } from '../services/wallets.js';
+import { getTenantById, updateTenantSettings } from '../services/tenants.js';
+import { assertAddress, weiToTokenString } from '../lib/chain.js';
 import { recordOrder, refundOrder, commissionSummary, listCommissions, markCommissionsPaid } from '../services/commissions.js';
 import { createLink, linkReport, listLinks } from '../services/links.js';
-import { getBalance, listLedger } from '../services/points.js';
+import { award, getBalance, listLedger, spend } from '../services/points.js';
 import { leaderboard, listRules, trigger, upsertRule, assertRuleKey } from '../services/rewards.js';
 import { createShare, listShares } from '../services/shares.js';
 import {
@@ -29,7 +31,7 @@ import {
   verifySpendIntent,
   walletSummary,
 } from '../services/token.js';
-import { weiToTokenString } from '../lib/chain.js';
+
 import { fire } from '../services/automations.js';
 import { listStats, subscribe, unsubscribeByEmail } from '../services/newsletter.js';
 import { z } from 'zod';
@@ -41,6 +43,104 @@ import { z } from 'zod';
 export async function apiRoutes(app: FastifyInstance): Promise<void> {
   app.addHook('preHandler', async (request) => {
     await requireSecretKey(request);
+  });
+
+  // ── Tenant settings ───────────────────────────────────────────────────────
+
+  /**
+   * Read and write this retailer's configuration.
+   *
+   * Without a route for this, TBAY spending was unreachable: createSpendIntent
+   * requires settings.payoutWallet and nothing outside the test suite could set
+   * it. Same for the conversion rate and the page-key patterns that group
+   * templated pages in heatmaps.
+   */
+  app.get('/v1/settings', async (request) => {
+    const tenant = tenantOf(request);
+    return {
+      slug: tenant.slug,
+      name: tenant.name,
+      currency: tenant.currency,
+      timezone: tenant.timezone,
+      settings: tenant.settings ?? {},
+    };
+  });
+
+  app.put('/v1/settings', async (request) => {
+    const tenant = tenantOf(request);
+    const schema = z
+      .object({
+        siteUrl: z.string().url().max(512).optional(),
+        payoutWallet: z.string().length(42).optional(),
+        pointsPerToken: z.number().int().positive().max(1_000_000).optional(),
+        // Basis points ON TOP of the network rate. There is deliberately no way
+        // to configure a retailer below it.
+        creditBonusBps: z.number().int().min(0).max(100_000).optional(),
+        commissionRateBps: z.number().int().min(0).max(10_000).optional(),
+        pageKeyPatterns: z.array(z.string().max(255)).max(100).optional(),
+        fromName: z.string().max(128).optional(),
+        fromEmail: z.string().email().max(254).optional(),
+      })
+      .strict();
+
+    const patch = parse(schema, request.body);
+    if (patch.payoutWallet) assertAddress(patch.payoutWallet, 'payoutWallet');
+
+    await updateTenantSettings(db(), tenant.id, patch);
+    const updated = await getTenantById(tenant.id);
+    return { settings: updated?.settings ?? {} };
+  });
+
+  // ── Webhooks ──────────────────────────────────────────────────────────────
+
+  /**
+   * Register a storefront endpoint for platform events.
+   *
+   * The delivery worker and the WordPress receiver both existed, but nothing
+   * could create a subscription, so no webhook had ever fired.
+   */
+  app.post('/v1/webhooks', async (request) => {
+    const tenant = tenantOf(request);
+    const schema = z.object({
+      url: z.string().url().max(1024),
+      secret: z.string().min(16).max(256),
+      topics: z.array(z.string().max(64)).max(50).optional(),
+    });
+    const input = parse(schema, request.body);
+
+    const parsed = new URL(input.url);
+    if (parsed.protocol !== 'https:' && !parsed.hostname.match(/^(localhost|127\.0\.0\.1)$/)) {
+      throw ApiError.badRequest('Webhook URLs must use https');
+    }
+
+    const row = await queryOne<{ id: string }>(
+      db(),
+      `INSERT INTO webhooks (tenant_id, url, secret, topics)
+       VALUES ($1, $2, $3, $4::text[])
+       RETURNING id`,
+      [tenant.id, input.url, input.secret, input.topics ?? []],
+    );
+    return { webhook_id: row!.id, url: input.url, topics: input.topics ?? [] };
+  });
+
+  app.get('/v1/webhooks', async (request) => {
+    const tenant = tenantOf(request);
+    const { rows } = await db().query(
+      // The signing secret is deliberately not returned.
+      'SELECT id, url, topics, enabled, created_at FROM webhooks WHERE tenant_id = $1',
+      [tenant.id],
+    );
+    return { webhooks: rows };
+  });
+
+  app.delete<{ Params: { id: string } }>('/v1/webhooks/:id', async (request) => {
+    const tenant = tenantOf(request);
+    const { rowCount } = await db().query(
+      'DELETE FROM webhooks WHERE tenant_id = $1 AND id = $2',
+      [tenant.id, request.params.id],
+    );
+    if (!rowCount) throw ApiError.notFound('Webhook not found');
+    return { deleted: true };
   });
 
   // ── Orders ────────────────────────────────────────────────────────────────
@@ -407,6 +507,49 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
     },
   );
 
+  /**
+   * Credit or debit an exact number of points.
+   *
+   * Reward rules cover the platform's own earning events; this covers everything
+   * a retailer does for its own reasons — a goodwill gesture, a correction, or
+   * mirroring an award made by another system such as myCred. The caller
+   * supplies the idempotency key, so a retried webhook cannot double-credit.
+   */
+  app.post('/v1/rewards/adjust', async (request) => {
+    const tenant = tenantOf(request);
+    const schema = contactHandleSchema.extend({
+      points: z.number().int().min(-1_000_000).max(1_000_000).refine((n) => n !== 0, {
+        message: 'points must not be zero',
+      }),
+      reason: z.string().min(1).max(255),
+      idempotencyKey: z.string().min(4).max(191),
+      meta: z.record(z.unknown()).optional(),
+    });
+    const input = parse(schema, request.body);
+    const contact = await requireContact(tenant.id, input);
+
+    const result =
+      input.points > 0
+        ? await award(tenant.id, {
+            contactId: contact.id,
+            points: input.points,
+            reason: input.reason,
+            refType: 'adjustment',
+            idempotencyKey: input.idempotencyKey,
+            meta: input.meta,
+          })
+        : await spend(tenant.id, {
+            contactId: contact.id,
+            points: -input.points,
+            reason: input.reason,
+            refType: 'adjustment',
+            idempotencyKey: input.idempotencyKey,
+            meta: input.meta,
+          });
+
+    return { applied: result.created, points: input.points, balance: result.balance };
+  });
+
   app.get('/v1/rewards/leaderboard', async (request) => {
     const tenant = tenantOf(request);
     return { leaders: await leaderboard(tenant.id) };
@@ -575,6 +718,32 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
       status: result.intent.status,
       credit: result.credit,
     };
+  });
+
+  /**
+   * Pick the credit a shopper should use next, without burning it yet.
+   *
+   * Checkout needs to know the code and amount before the order exists, but the
+   * credit must only be consumed once it does — otherwise an abandoned checkout
+   * would silently spend it.
+   */
+  app.post('/v1/token/credit/reserve', async (request) => {
+    const tenant = tenantOf(request);
+    const input = parse(contactHandleSchema, request.body);
+    const contact = await requireContact(tenant.id, input);
+
+    const credit = await queryOne<{ code: string; amount_cents: number; currency: string }>(
+      db(),
+      `SELECT code, amount_cents, currency FROM store_credits
+        WHERE tenant_id = $1 AND contact_id = $2 AND status = 'active'
+          AND (expires_at IS NULL OR expires_at > now())
+        ORDER BY expires_at NULLS LAST, created_at
+        LIMIT 1`,
+      [tenant.id, contact.id],
+    );
+    if (!credit) throw ApiError.notFound('No active store credit');
+
+    return credit;
   });
 
   app.post('/v1/token/credit/redeem', async (request) => {
