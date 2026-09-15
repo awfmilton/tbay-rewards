@@ -142,6 +142,8 @@ class TBAY_Rewards_UI {
 			<?php $this->render_badges_panel( $gamification, 12 ); ?>
 			<?php $this->render_wallet_panel( $wallet, $points, $chain ); ?>
 			<?php $this->render_bridge_panel( $chain, $wallet ); ?>
+			<?php $this->render_coupon_panel(); ?>
+			<?php $this->render_transfer_panel( $points ); ?>
 			<?php $this->render_ledger( $ledger ); ?>
 		</div>
 		<?php
@@ -390,6 +392,66 @@ class TBAY_Rewards_UI {
 					<?php esc_html_e( 'Connect a wallet above before bridging.', 'tbay-rewards' ); ?>
 				</p>
 			<?php endif; ?>
+		</div>
+		<?php
+	}
+
+	private function render_coupon_panel(): void {
+		?>
+		<div class="tbay-panel" data-tbay-coupon>
+			<span class="tbay-overline"><?php esc_html_e( 'Have a code?', 'tbay-rewards' ); ?></span>
+			<h3 class="tbay-title"><?php esc_html_e( 'Redeem a reward code', 'tbay-rewards' ); ?></h3>
+
+			<div class="tbay-wallet__actions">
+				<label class="tbay-field" style="flex:1 1 12rem">
+					<span class="screen-reader-text"><?php esc_html_e( 'Reward code', 'tbay-rewards' ); ?></span>
+					<input type="text" autocomplete="off" spellcheck="false"
+						placeholder="<?php esc_attr_e( 'WELCOME50', 'tbay-rewards' ); ?>"
+						data-tbay-coupon-code>
+				</label>
+
+				<button type="button" class="tbay-button tbay-button--outline" data-tbay-coupon-submit>
+					<?php esc_html_e( 'Redeem code', 'tbay-rewards' ); ?>
+				</button>
+			</div>
+
+			<p class="tbay-wallet__status" role="status" aria-live="polite" data-tbay-coupon-status></p>
+		</div>
+		<?php
+	}
+
+	private function render_transfer_panel( int $points ): void {
+		?>
+		<div class="tbay-panel" data-tbay-transfer>
+			<span class="tbay-overline"><?php esc_html_e( 'Send points', 'tbay-rewards' ); ?></span>
+			<h3 class="tbay-title"><?php esc_html_e( 'Gift points to someone', 'tbay-rewards' ); ?></h3>
+
+			<p class="tbay-lede">
+				<?php esc_html_e( 'Send points to another member by email. They receive them instantly.', 'tbay-rewards' ); ?>
+			</p>
+
+			<div class="tbay-wallet__actions">
+				<label class="tbay-field" style="flex:1 1 12rem">
+					<span class="screen-reader-text"><?php esc_html_e( 'Recipient email', 'tbay-rewards' ); ?></span>
+					<input type="email" autocomplete="off"
+						placeholder="<?php esc_attr_e( 'them@example.com', 'tbay-rewards' ); ?>"
+						data-tbay-transfer-email>
+				</label>
+
+				<label class="tbay-field tbay-field--inline">
+					<span class="screen-reader-text"><?php esc_html_e( 'Points to send', 'tbay-rewards' ); ?></span>
+					<input type="number" inputmode="numeric" min="1" step="1"
+						max="<?php echo esc_attr( (string) $points ); ?>"
+						placeholder="100" data-tbay-transfer-amount>
+				</label>
+
+				<button type="button" class="tbay-button tbay-button--outline"
+					data-tbay-transfer-submit <?php disabled( $points <= 0 ); ?>>
+					<?php esc_html_e( 'Send points', 'tbay-rewards' ); ?>
+				</button>
+			</div>
+
+			<p class="tbay-wallet__status" role="status" aria-live="polite" data-tbay-transfer-status></p>
 		</div>
 		<?php
 	}

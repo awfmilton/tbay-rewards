@@ -19,9 +19,10 @@ RUN npm prune --omit=dev
 # ── Runtime ──────────────────────────────────────────────────────────────────
 FROM node:22-alpine AS runtime
 
-# dumb-init gives us correct signal handling, so SIGTERM reaches Node and the
-# app closes its database pool instead of being killed mid-query.
-RUN apk add --no-cache dumb-init curl
+# No apk packages on purpose: the image needs nothing the base does not already
+# have, which keeps it small and means the build never depends on Alpine's
+# mirrors being reachable. Signal handling comes from `init: true` in compose
+# (Docker's own init), and the healthcheck below uses Node instead of curl.
 
 ENV NODE_ENV=production \
     PORT=4000 \
@@ -48,7 +49,6 @@ USER node
 EXPOSE 4000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD curl -fsS http://127.0.0.1:4000/health || exit 1
+  CMD ["node", "-e", "fetch('http://127.0.0.1:'+(process.env.PORT||4000)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
 
-ENTRYPOINT ["dumb-init", "--"]
 CMD ["node", "packages/server/dist/index.js"]

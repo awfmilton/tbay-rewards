@@ -313,6 +313,13 @@
 
 		var bridge = panel.querySelector('[data-tbay-bridge]');
 		if (bridge) initBridge(bridge, currentAddress);
+
+		var refresh = function () { refreshBalance(panel); };
+		var coupon = panel.querySelector('[data-tbay-coupon]');
+		if (coupon) initCoupon(coupon, refresh);
+
+		var transfer = panel.querySelector('[data-tbay-transfer]');
+		if (transfer) initTransfer(transfer, refresh);
 	}
 
 	/**
@@ -487,6 +494,71 @@
 				.then(function (tx) {
 					return tx.wait().then(function () { return tx.hash; });
 				});
+		});
+	}
+
+	// ── Coupons and point transfers ──────────────────────────────────────────
+
+	function initCoupon(panel, onChange) {
+		var input = panel.querySelector('[data-tbay-coupon-code]');
+		var button = panel.querySelector('[data-tbay-coupon-submit]');
+		var status = panel.querySelector('[data-tbay-coupon-status]');
+		if (!input || !button) return;
+
+		function submit() {
+			var code = input.value.trim();
+			if (!code) return;
+
+			button.disabled = true;
+			setStatus(status, i18n.couponChecking, 'pending');
+
+			rest('coupon', { code: code })
+				.then(function (data) {
+					input.value = '';
+					setStatus(status, (i18n.couponRedeemed || '') .replace('%d', data.points), 'ok');
+					if (onChange) onChange();
+				})
+				['catch'](function (error) {
+					setStatus(status, error.message || i18n.genericError, 'error');
+				})
+				['finally'](function () { button.disabled = false; });
+		}
+
+		button.addEventListener('click', submit);
+		// Enter in the field should submit, like any other single-field form.
+		input.addEventListener('keydown', function (event) {
+			if (event.key === 'Enter') { event.preventDefault(); submit(); }
+		});
+	}
+
+	function initTransfer(panel, onChange) {
+		var email = panel.querySelector('[data-tbay-transfer-email]');
+		var amount = panel.querySelector('[data-tbay-transfer-amount]');
+		var button = panel.querySelector('[data-tbay-transfer-submit]');
+		var status = panel.querySelector('[data-tbay-transfer-status]');
+		if (!email || !amount || !button) return;
+
+		button.addEventListener('click', function () {
+			var points = parseInt(amount.value, 10);
+			if (!email.value || !points || points <= 0) {
+				setStatus(status, i18n.transferInvalid, 'error');
+				return;
+			}
+
+			button.disabled = true;
+			setStatus(status, i18n.transferSending, 'pending');
+
+			rest('transfer', { toEmail: email.value.trim(), points: points })
+				.then(function (data) {
+					email.value = '';
+					amount.value = '';
+					setStatus(status, (i18n.transferSent || '').replace('%d', data.points), 'ok');
+					if (onChange) onChange();
+				})
+				['catch'](function (error) {
+					setStatus(status, error.message || i18n.genericError, 'error');
+				})
+				['finally'](function () { button.disabled = false; });
 		});
 	}
 

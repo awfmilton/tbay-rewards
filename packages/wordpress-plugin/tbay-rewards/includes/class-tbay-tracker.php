@@ -119,6 +119,13 @@ class TBAY_Rewards_Tracker {
 					'bridgeCrossing' => __( 'Burning on zkSync', 'tbay-rewards' ),
 					'bridgeReceiveL1' => __( 'You receive on Ethereum', 'tbay-rewards' ),
 					'bridgeWrongWallet' => __( 'Your wallet is on a different account than the one connected here. Reconnect and try again.', 'tbay-rewards' ),
+					'couponChecking' => __( 'Checking your code…', 'tbay-rewards' ),
+					/* translators: %d: number of points credited. */
+					'couponRedeemed' => __( 'Code accepted — %d points added.', 'tbay-rewards' ),
+					'transferInvalid' => __( 'Enter a recipient and how many points to send.', 'tbay-rewards' ),
+					'transferSending' => __( 'Sending points…', 'tbay-rewards' ),
+					/* translators: %d: number of points sent. */
+					'transferSent'   => __( '%d points sent.', 'tbay-rewards' ),
 				),
 			)
 		);
