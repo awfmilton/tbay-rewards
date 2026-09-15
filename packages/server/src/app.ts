@@ -1,0 +1,90 @@
+import Fastify, { type FastifyInstance } from 'fastify';
+import cors from '@fastify/cors';
+import { readFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { config } from './config.js';
+import { ApiError } from './lib/errors.js';
+import { collectRoutes } from './routes/collect.js';
+import { redirectRoutes } from './routes/redirect.js';
+import { apiRoutes } from './routes/api.js';
+import { reportRoutes } from './routes/reports.js';
+import { gamificationRoutes } from './routes/gamification.js';
+import { healthRoutes } from './routes/health.js';
+
+const here = dirname(fileURLToPath(import.meta.url));
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+export async function buildApp(): Promise<FastifyInstance> {
+  const cfg = config();
+
+  const app = Fastify({
+    logger: { level: cfg.logLevel },
+    trustProxy: true,
+    bodyLimit: 1_048_576, // 1 MB: a tracker batch is a few KB at most.
+  });
+
+  /**
+   * Ingest has to work from any customer storefront, so it is open CORS by
+   * design — the site key is public and only authorises writes. The credentialed
+   * APIs are server-to-server and never sent from a browser, so no allowlist here
+   * grants anything a stolen site key could not already do.
+   */
+  await app.register(cors, {
+    origin: true,
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['content-type', 'x-tbay-key', 'authorization', 'x-tbay-secret'],
+    maxAge: 86_400,
+  });
+
+  app.setErrorHandler((error, request, reply) => {
+    if (error instanceof ApiError) {
+      return reply
+        .code(error.statusCode)
+        .send({ error: error.code, message: error.message, details: error.details });
+    }
+    if ((error as { statusCode?: number }).statusCode === 429) {
+      return reply.code(429).send({ error: 'rate_limited', message: 'Too many requests' });
+    }
+    if ((error as { validation?: unknown }).validation) {
+      return reply.code(400).send({ error: 'bad_request', message: messageOf(error) });
+    }
+
+    request.log.error({ err: error }, 'unhandled error');
+    return reply.code(500).send({
+      error: 'internal_error',
+      message: cfg.isProduction ? 'Something went wrong' : messageOf(error),
+    });
+  });
+
+  app.setNotFoundHandler((request, reply) =>
+    reply.code(404).send({ error: 'not_found', message: `No route for ${request.method} ${request.url}` }),
+  );
+
+  await app.register(healthRoutes);
+  await app.register(collectRoutes);
+  await app.register(redirectRoutes);
+  await app.register(apiRoutes);
+  await app.register(reportRoutes);
+  await app.register(gamificationRoutes);
+
+  // The tracker is served from the API so retailers embed one stable URL and
+  // pick up fixes without redeploying their site.
+  app.get('/tbay.js', async (_request, reply) => {
+    const script = await readFile(join(here, '..', '..', 'tracker', 'tbay.js'), 'utf8');
+    return reply
+      .type('application/javascript; charset=utf-8')
+      .header('cache-control', 'public, max-age=3600')
+      .send(script);
+  });
+
+  app.get('/', async (_request, reply) => {
+    const html = await readFile(join(here, '..', 'public', 'dashboard.html'), 'utf8');
+    return reply.type('text/html; charset=utf-8').send(html);
+  });
+
+  return app;
+}

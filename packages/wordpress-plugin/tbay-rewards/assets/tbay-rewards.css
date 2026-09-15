@@ -1,0 +1,684 @@
+/**
+ * TBAY Rewards — storefront styles.
+ *
+ * Design tokens mirror the tbay.tk WordPress theme (tbay-theme/style.css) so the
+ * rewards UI reads as part of the same product: dark surfaces, teal accent,
+ * Syne for display type, DM Sans for body, JetBrains Mono for anything
+ * numeric or on-chain.
+ *
+ * The components carry their own dark surface rather than inheriting the host
+ * theme's background, so they look correct dropped into a light theme too. Every
+ * value is a custom property on .tbay-root, so a site can retheme the whole
+ * thing by redefining a handful of variables.
+ *
+ * Layout is mobile-first and tested from 320px up: nothing here relies on a
+ * fixed width, and every grid collapses to a single column on a phone.
+ */
+
+.tbay-root,
+.tbay-rewards,
+.tbay-newsletter,
+.tbay-share,
+.tbay-bridge,
+.tbay-badges {
+	/* Surfaces */
+	--tbay-bg:          #08090f;
+	--tbay-bg-2:        #0c0f1a;
+	--tbay-bg-3:        #101624;
+	--tbay-surface:     #141b2d;
+	--tbay-surface-2:   #1a2238;
+	--tbay-border:      rgba(255, 255, 255, .07);
+	--tbay-border-glow: rgba(0, 210, 210, .22);
+
+	/* Brand */
+	--tbay-primary:     #00d4d4;
+	--tbay-primary-dim: #00a0a0;
+	--tbay-accent:      #0055ff;
+	--tbay-accent-2:    #4488ff;
+	--tbay-gold:        #f5a623;
+	--tbay-danger:      #ff4d6d;
+	--tbay-success:     #00e5a0;
+
+	/* Type */
+	--tbay-text:        #e4eaf5;
+	--tbay-text-2:      #8896b4;
+	--tbay-text-3:      #4f5c78;
+	--tbay-font-display: 'Syne', var(--font-display, sans-serif);
+	--tbay-font-body:    'DM Sans', var(--font-body, sans-serif);
+	--tbay-font-mono:    'JetBrains Mono', var(--font-mono, monospace);
+
+	/* Shape and motion */
+	--tbay-r-sm: 4px;
+	--tbay-r-md: 8px;
+	--tbay-r-lg: 16px;
+	--tbay-r-xl: 24px;
+	--tbay-r-full: 9999px;
+	--tbay-shadow-glow: 0 0 40px rgba(0, 212, 212, .12);
+	--tbay-shadow-card: 0 4px 32px rgba(0, 0, 0, .5);
+	--tbay-ease: cubic-bezier(.25, .46, .45, .94);
+	--tbay-t-fast: .15s;
+	--tbay-t-mid: .3s;
+
+	/* Spacing */
+	--tbay-gap: 1rem;
+	--tbay-pad: clamp(1.15rem, 4vw, 2rem);
+
+	box-sizing: border-box;
+	font-family: var(--tbay-font-body);
+	color: var(--tbay-text);
+	line-height: 1.65;
+}
+
+.tbay-root *,
+.tbay-rewards *,
+.tbay-newsletter *,
+.tbay-share *,
+.tbay-bridge *,
+.tbay-badges * {
+	box-sizing: border-box;
+}
+
+/* ── Panels ──────────────────────────────────────────────────────────────── */
+
+.tbay-panel {
+	background: var(--tbay-surface);
+	border: 1px solid var(--tbay-border);
+	border-radius: var(--tbay-r-lg);
+	padding: var(--tbay-pad);
+	box-shadow: var(--tbay-shadow-card);
+}
+
+.tbay-panel + .tbay-panel { margin-top: var(--tbay-gap); }
+
+.tbay-panel--glow {
+	border-color: var(--tbay-border-glow);
+	box-shadow: var(--tbay-shadow-glow);
+}
+
+.tbay-title {
+	font-family: var(--tbay-font-display);
+	font-weight: 700;
+	letter-spacing: -.02em;
+	line-height: 1.15;
+	color: #fff;
+	margin: 0 0 .5rem;
+	font-size: clamp(1.15rem, 3vw, 1.5rem);
+}
+
+.tbay-overline {
+	display: block;
+	font-family: var(--tbay-font-mono);
+	font-size: .72rem;
+	font-weight: 500;
+	letter-spacing: .16em;
+	text-transform: uppercase;
+	color: var(--tbay-primary);
+	margin-bottom: .5rem;
+}
+
+.tbay-muted { color: var(--tbay-text-2); }
+.tbay-mono { font-family: var(--tbay-font-mono); }
+
+.tbay-lede {
+	margin: 0 0 1.25rem;
+	color: var(--tbay-text-2);
+	font-size: clamp(.9rem, 2vw, 1rem);
+}
+
+/* ── Buttons ─────────────────────────────────────────────────────────────── */
+
+.tbay-button {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	gap: .45rem;
+	padding: .65rem 1.4rem;
+	border: 1px solid transparent;
+	border-radius: var(--tbay-r-full);
+	background: var(--tbay-primary);
+	color: #000;
+	font-family: var(--tbay-font-body);
+	font-size: .875rem;
+	font-weight: 600;
+	letter-spacing: .02em;
+	line-height: 1.2;
+	cursor: pointer;
+	text-decoration: none;
+	transition: background var(--tbay-t-fast) var(--tbay-ease),
+	            box-shadow var(--tbay-t-fast) var(--tbay-ease),
+	            transform var(--tbay-t-fast) var(--tbay-ease),
+	            color var(--tbay-t-fast) var(--tbay-ease);
+	/* Comfortable thumb target on a phone. */
+	min-height: 44px;
+}
+
+.tbay-button:hover:not(:disabled),
+.tbay-button:focus-visible:not(:disabled) {
+	background: #fff;
+	color: #000;
+	box-shadow: 0 6px 24px rgba(0, 212, 212, .35);
+	transform: translateY(-1px);
+}
+
+.tbay-button:disabled { opacity: .45; cursor: not-allowed; transform: none; }
+
+.tbay-button--outline {
+	background: transparent;
+	color: var(--tbay-text);
+	border-color: var(--tbay-border);
+}
+
+.tbay-button--outline:hover:not(:disabled),
+.tbay-button--outline:focus-visible:not(:disabled) {
+	border-color: var(--tbay-primary);
+	color: var(--tbay-primary);
+	background: rgba(0, 212, 212, .05);
+	box-shadow: none;
+}
+
+.tbay-button--ghost {
+	background: transparent;
+	color: var(--tbay-text-2);
+	border-color: transparent;
+}
+
+.tbay-button--ghost:hover:not(:disabled) {
+	color: var(--tbay-primary);
+	background: var(--tbay-surface-2);
+	box-shadow: none;
+	transform: none;
+}
+
+.tbay-button--sm { padding: .45rem 1rem; font-size: .8rem; min-height: 36px; }
+.tbay-button--block { width: 100%; }
+
+/* Visible keyboard focus everywhere, not just on buttons. */
+.tbay-root :focus-visible,
+.tbay-rewards :focus-visible,
+.tbay-newsletter :focus-visible,
+.tbay-share :focus-visible,
+.tbay-bridge :focus-visible {
+	outline: 2px solid var(--tbay-primary);
+	outline-offset: 2px;
+}
+
+/* ── Fields ──────────────────────────────────────────────────────────────── */
+
+.tbay-field { display: block; }
+
+.tbay-field input,
+.tbay-field select {
+	width: 100%;
+	padding: .7rem .9rem;
+	border: 1px solid var(--tbay-border);
+	border-radius: var(--tbay-r-md);
+	background: var(--tbay-bg-3);
+	color: var(--tbay-text);
+	font-family: var(--tbay-font-body);
+	/* 16px stops iOS Safari zooming the page on focus. */
+	font-size: 16px;
+	min-height: 44px;
+}
+
+.tbay-field input::placeholder { color: var(--tbay-text-3); }
+
+.tbay-field input:focus,
+.tbay-field select:focus {
+	border-color: var(--tbay-primary);
+	outline: none;
+	box-shadow: 0 0 0 3px rgba(0, 212, 212, .15);
+}
+
+.tbay-field--inline { flex: 0 0 auto; max-width: 9rem; }
+.tbay-field--inline input { font-family: var(--tbay-font-mono); text-align: right; }
+
+/* Off-screen rather than display:none — plenty of bots skip hidden inputs. */
+.tbay-hp {
+	position: absolute !important;
+	left: -9999px !important;
+	width: 1px;
+	height: 1px;
+	overflow: hidden;
+}
+
+.screen-reader-text {
+	position: absolute !important;
+	width: 1px; height: 1px;
+	padding: 0; margin: -1px;
+	overflow: hidden;
+	clip: rect(0, 0, 0, 0);
+	white-space: nowrap;
+	border: 0;
+}
+
+/* ── Newsletter ──────────────────────────────────────────────────────────── */
+
+.tbay-newsletter {
+	background: var(--tbay-surface);
+	border: 1px solid var(--tbay-border);
+	border-radius: var(--tbay-r-lg);
+	padding: var(--tbay-pad);
+	box-shadow: var(--tbay-shadow-card);
+	position: relative;
+	overflow: hidden;
+}
+
+/* The faint teal grid from the tbay.tk hero sections. */
+.tbay-newsletter::before {
+	content: '';
+	position: absolute;
+	inset: 0;
+	background-image:
+		linear-gradient(rgba(0, 212, 212, .035) 1px, transparent 1px),
+		linear-gradient(90deg, rgba(0, 212, 212, .035) 1px, transparent 1px);
+	background-size: 52px 52px;
+	pointer-events: none;
+}
+
+.tbay-newsletter > * { position: relative; }
+
+.tbay-newsletter__title {
+	font-family: var(--tbay-font-display);
+	font-weight: 700;
+	letter-spacing: -.02em;
+	color: #fff;
+	margin: 0 0 .4rem;
+	font-size: clamp(1.25rem, 3.5vw, 1.75rem);
+}
+
+.tbay-newsletter__description { margin: 0 0 1.25rem; color: var(--tbay-text-2); font-size: .95rem; }
+
+.tbay-newsletter__fields {
+	display: flex;
+	flex-wrap: wrap;
+	gap: .65rem;
+	align-items: stretch;
+}
+
+.tbay-newsletter__fields .tbay-field { flex: 1 1 13rem; min-width: 0; }
+
+.tbay-newsletter__status { margin: .85rem 0 0; font-size: .875rem; }
+.tbay-newsletter__status:empty { display: none; }
+
+/* ── Share ───────────────────────────────────────────────────────────────── */
+
+.tbay-share {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: .75rem;
+	margin: 1.5rem 0;
+	padding: 1rem var(--tbay-pad);
+	background: var(--tbay-bg-3);
+	border: 1px solid var(--tbay-border);
+	border-radius: var(--tbay-r-lg);
+}
+
+.tbay-share__title {
+	font-family: var(--tbay-font-mono);
+	font-size: .72rem;
+	letter-spacing: .16em;
+	text-transform: uppercase;
+	color: var(--tbay-primary);
+}
+
+.tbay-share__buttons { display: flex; flex-wrap: wrap; gap: .4rem; }
+
+.tbay-share__button {
+	padding: .45rem 1rem;
+	border: 1px solid var(--tbay-border);
+	border-radius: var(--tbay-r-full);
+	background: transparent;
+	color: var(--tbay-text-2);
+	font-family: var(--tbay-font-body);
+	font-size: .8rem;
+	font-weight: 500;
+	cursor: pointer;
+	min-height: 36px;
+	transition: color var(--tbay-t-fast), border-color var(--tbay-t-fast), background var(--tbay-t-fast);
+}
+
+.tbay-share__button:hover:not(:disabled),
+.tbay-share__button:focus-visible:not(:disabled) {
+	border-color: var(--tbay-primary);
+	color: var(--tbay-primary);
+	background: rgba(0, 212, 212, .06);
+}
+
+.tbay-share__button:disabled { opacity: .45; cursor: progress; }
+
+.tbay-share__status { flex-basis: 100%; margin: 0; font-size: .85rem; }
+.tbay-share__status:empty { display: none; }
+
+/* ── Stats ───────────────────────────────────────────────────────────────── */
+
+.tbay-rewards__grid {
+	display: grid;
+	/* auto-fit + minmax means one column on a phone and three on a desktop
+	   without a single media query. */
+	grid-template-columns: repeat(auto-fit, minmax(min(100%, 11rem), 1fr));
+	gap: .75rem;
+	margin-bottom: var(--tbay-gap);
+}
+
+.tbay-stat {
+	background: var(--tbay-surface);
+	border: 1px solid var(--tbay-border);
+	border-radius: var(--tbay-r-lg);
+	padding: 1.15rem;
+	transition: border-color var(--tbay-t-mid), box-shadow var(--tbay-t-mid);
+}
+
+.tbay-stat:hover { border-color: var(--tbay-border-glow); box-shadow: var(--tbay-shadow-glow); }
+
+.tbay-stat__label {
+	display: block;
+	font-family: var(--tbay-font-mono);
+	font-size: .68rem;
+	letter-spacing: .14em;
+	text-transform: uppercase;
+	color: var(--tbay-text-3);
+}
+
+.tbay-stat__value {
+	display: block;
+	font-family: var(--tbay-font-display);
+	font-size: clamp(1.6rem, 5vw, 2.1rem);
+	font-weight: 700;
+	line-height: 1.1;
+	letter-spacing: -.02em;
+	color: #fff;
+	margin-top: .35rem;
+	/* Long balances must not blow out the card on a narrow screen. */
+	overflow-wrap: anywhere;
+}
+
+.tbay-stat__value--accent { color: var(--tbay-primary); }
+.tbay-stat__sub { display: block; font-size: .78rem; color: var(--tbay-text-2); margin-top: .3rem; }
+
+/* ── Rank ────────────────────────────────────────────────────────────────── */
+
+.tbay-rank { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; }
+
+.tbay-rank__medal {
+	width: 56px;
+	height: 56px;
+	flex: 0 0 auto;
+	border-radius: var(--tbay-r-full);
+	display: grid;
+	place-items: center;
+	background: linear-gradient(135deg, rgba(0, 212, 212, .22), rgba(0, 85, 255, .22));
+	border: 1px solid var(--tbay-border-glow);
+	font-family: var(--tbay-font-display);
+	font-size: 1.35rem;
+	font-weight: 700;
+	color: var(--tbay-primary);
+}
+
+.tbay-rank__body { flex: 1 1 12rem; min-width: 0; }
+.tbay-rank__name { font-family: var(--tbay-font-display); font-size: 1.15rem; color: #fff; margin: 0; }
+.tbay-rank__desc { margin: .15rem 0 0; font-size: .85rem; color: var(--tbay-text-2); }
+
+.tbay-progress {
+	height: 8px;
+	border-radius: var(--tbay-r-full);
+	background: var(--tbay-bg-3);
+	overflow: hidden;
+	margin-top: .65rem;
+}
+
+.tbay-progress__bar {
+	height: 100%;
+	border-radius: var(--tbay-r-full);
+	background: linear-gradient(90deg, var(--tbay-primary), var(--tbay-accent-2));
+	transition: width var(--tbay-t-mid) var(--tbay-ease);
+}
+
+.tbay-progress__label { font-size: .78rem; color: var(--tbay-text-3); margin-top: .35rem; display: block; }
+
+/* ── Badges ──────────────────────────────────────────────────────────────── */
+
+.tbay-badges__grid {
+	display: grid;
+	grid-template-columns: repeat(auto-fill, minmax(min(100%, 8.5rem), 1fr));
+	gap: .75rem;
+}
+
+.tbay-badge {
+	text-align: center;
+	padding: 1rem .6rem;
+	border-radius: var(--tbay-r-lg);
+	background: var(--tbay-bg-3);
+	border: 1px solid var(--tbay-border);
+}
+
+.tbay-badge--earned { border-color: var(--tbay-border-glow); box-shadow: var(--tbay-shadow-glow); }
+
+/* Unearned badges are dimmed, not hidden: seeing what is next is the point. */
+.tbay-badge--locked { opacity: .55; }
+.tbay-badge--locked .tbay-badge__icon { filter: grayscale(1); }
+
+.tbay-badge__icon {
+	width: 48px;
+	height: 48px;
+	margin: 0 auto .5rem;
+	border-radius: var(--tbay-r-full);
+	display: grid;
+	place-items: center;
+	background: linear-gradient(135deg, rgba(0, 212, 212, .2), rgba(245, 166, 35, .18));
+	font-size: 1.35rem;
+	line-height: 1;
+}
+
+.tbay-badge__icon img { width: 100%; height: 100%; border-radius: inherit; object-fit: cover; }
+
+.tbay-badge__name {
+	font-family: var(--tbay-font-display);
+	font-size: .85rem;
+	font-weight: 600;
+	color: var(--tbay-text);
+	margin: 0;
+	overflow-wrap: anywhere;
+}
+
+.tbay-badge__tier {
+	display: inline-block;
+	margin-top: .3rem;
+	padding: .1rem .5rem;
+	border-radius: var(--tbay-r-full);
+	background: rgba(0, 212, 212, .1);
+	border: 1px solid rgba(0, 212, 212, .2);
+	font-family: var(--tbay-font-mono);
+	font-size: .65rem;
+	letter-spacing: .05em;
+	color: var(--tbay-primary);
+}
+
+.tbay-badge__next { display: block; margin-top: .35rem; font-size: .7rem; color: var(--tbay-text-3); }
+
+/* ── Wallet and bridge ───────────────────────────────────────────────────── */
+
+.tbay-wallet__address {
+	display: flex;
+	align-items: center;
+	gap: .5rem;
+	flex-wrap: wrap;
+	margin: 0 0 1rem;
+	padding: .65rem .85rem;
+	background: var(--tbay-bg-3);
+	border: 1px solid var(--tbay-border);
+	border-radius: var(--tbay-r-md);
+}
+
+.tbay-wallet__address code {
+	font-family: var(--tbay-font-mono);
+	font-size: .8rem;
+	color: var(--tbay-primary);
+	/* A 42-character address must wrap, not overflow, on a 320px screen. */
+	overflow-wrap: anywhere;
+	min-width: 0;
+}
+
+.tbay-wallet__actions { display: flex; flex-wrap: wrap; gap: .65rem; align-items: center; }
+
+.tbay-wallet__status,
+.tbay-bridge__status { margin: .85rem 0 0; font-size: .875rem; overflow-wrap: anywhere; }
+.tbay-wallet__status:empty,
+.tbay-bridge__status:empty { display: none; }
+
+.tbay-wallet__note {
+	margin: 1rem 0 0;
+	font-size: .8rem;
+	color: var(--tbay-text-3);
+	max-width: 62ch;
+	line-height: 1.7;
+}
+
+.tbay-chain-pill {
+	display: inline-flex;
+	align-items: center;
+	gap: .4rem;
+	padding: .2rem .7rem;
+	border-radius: var(--tbay-r-full);
+	background: rgba(0, 212, 212, .1);
+	border: 1px solid rgba(0, 212, 212, .2);
+	font-family: var(--tbay-font-mono);
+	font-size: .68rem;
+	letter-spacing: .05em;
+	color: var(--tbay-primary);
+}
+
+.tbay-chain-pill--testnet {
+	background: rgba(245, 166, 35, .1);
+	border-color: rgba(245, 166, 35, .25);
+	color: var(--tbay-gold);
+}
+
+.tbay-bridge__row {
+	display: flex;
+	flex-wrap: wrap;
+	gap: .65rem;
+	align-items: center;
+	margin-bottom: .75rem;
+}
+
+.tbay-bridge__quote {
+	margin: .75rem 0 0;
+	padding: .85rem 1rem;
+	border-radius: var(--tbay-r-md);
+	background: var(--tbay-bg-3);
+	border: 1px solid var(--tbay-border);
+	font-size: .85rem;
+}
+
+.tbay-bridge__quote dl { display: grid; grid-template-columns: auto 1fr; gap: .3rem .9rem; margin: 0; }
+.tbay-bridge__quote dt { color: var(--tbay-text-3); }
+.tbay-bridge__quote dd { margin: 0; font-family: var(--tbay-font-mono); color: var(--tbay-text); overflow-wrap: anywhere; }
+
+.tbay-bridge__warning {
+	margin: .75rem 0 0;
+	padding: .7rem .9rem;
+	border-radius: var(--tbay-r-md);
+	border-left: 3px solid var(--tbay-gold);
+	background: rgba(245, 166, 35, .08);
+	color: var(--tbay-text-2);
+	font-size: .82rem;
+}
+
+/* ── Ledger and tables ───────────────────────────────────────────────────── */
+
+.tbay-rewards__history-title { margin: 1.75rem 0 .75rem; }
+
+/* Tables scroll horizontally on a phone rather than forcing the page wide. */
+.tbay-table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+
+.tbay-ledger {
+	width: 100%;
+	min-width: 20rem;
+	border-collapse: collapse;
+	font-size: .875rem;
+}
+
+.tbay-ledger th,
+.tbay-ledger td { padding: .7rem .6rem; border-bottom: 1px solid var(--tbay-border); text-align: left; }
+
+.tbay-ledger th {
+	font-family: var(--tbay-font-mono);
+	font-size: .66rem;
+	letter-spacing: .12em;
+	text-transform: uppercase;
+	color: var(--tbay-text-3);
+	font-weight: 500;
+}
+
+.tbay-ledger td { color: var(--tbay-text-2); }
+.tbay-ledger tr:last-child td { border-bottom: none; }
+.tbay-ledger .tbay-num { text-align: right; font-family: var(--tbay-font-mono); font-variant-numeric: tabular-nums; }
+.tbay-ledger .tbay-pos { color: var(--tbay-success); }
+.tbay-ledger .tbay-neg { color: var(--tbay-danger); }
+
+/* ── Status tones ────────────────────────────────────────────────────────── */
+
+.tbay-status--ok { color: var(--tbay-success); }
+.tbay-status--error { color: var(--tbay-danger); }
+.tbay-status--pending { color: var(--tbay-text-2); }
+
+.tbay-points-badge {
+	display: inline-flex;
+	align-items: center;
+	gap: .35rem;
+	padding: .2rem .7rem;
+	border-radius: var(--tbay-r-full);
+	background: rgba(0, 212, 212, .1);
+	border: 1px solid rgba(0, 212, 212, .2);
+	font-family: var(--tbay-font-mono);
+	font-size: .75rem;
+	font-weight: 500;
+	color: var(--tbay-primary);
+}
+
+.tbay-notice {
+	padding: 1rem 1.15rem;
+	border-left: 3px solid var(--tbay-primary);
+	border-radius: var(--tbay-r-md);
+	background: var(--tbay-surface);
+	color: var(--tbay-text-2);
+	font-size: .9rem;
+	margin: 1rem 0;
+}
+
+.tbay-empty { padding: 1.5rem 0; color: var(--tbay-text-3); font-size: .9rem; text-align: center; }
+
+/* ── Responsive refinements ──────────────────────────────────────────────── */
+
+/* Below 30rem the wallet controls stack: a redeem input beside a button is
+   unusable at 320px. */
+@media (max-width: 30rem) {
+	.tbay-newsletter__fields { flex-direction: column; }
+	.tbay-newsletter__fields .tbay-button,
+	.tbay-wallet__actions .tbay-button,
+	.tbay-bridge__row .tbay-button { width: 100%; }
+	.tbay-field--inline { max-width: none; flex: 1 1 100%; }
+	.tbay-field--inline input { text-align: left; }
+	.tbay-wallet__actions,
+	.tbay-bridge__row { flex-direction: column; align-items: stretch; }
+	.tbay-share { flex-direction: column; align-items: flex-start; }
+	.tbay-share__buttons { width: 100%; }
+	.tbay-share__button { flex: 1 1 8rem; }
+	.tbay-rank { flex-direction: column; align-items: flex-start; text-align: left; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.tbay-button,
+	.tbay-share__button,
+	.tbay-stat,
+	.tbay-progress__bar { transition: none; }
+	.tbay-button:hover:not(:disabled) { transform: none; }
+}
+
+/* High-contrast mode: keep borders visible when the UA drops our colours. */
+@media (forced-colors: active) {
+	.tbay-panel,
+	.tbay-stat,
+	.tbay-badge { border: 1px solid CanvasText; }
+}

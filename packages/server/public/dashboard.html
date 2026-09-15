@@ -1,0 +1,624 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="robots" content="noindex">
+<meta name="color-scheme" content="dark">
+<title>TBAY Rewards</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+  /*
+   * Design tokens mirror the tbay.tk WordPress theme so the operator dashboard
+   * and the storefront components read as one product.
+   *
+   * Layout is mobile-first: every grid uses auto-fit/minmax, tables scroll
+   * rather than widening the page, and the header wraps instead of overflowing.
+   * Tested from 320px up.
+   */
+  :root {
+    --bg:          #08090f;
+    --bg-2:        #0c0f1a;
+    --bg-3:        #101624;
+    --surface:     #141b2d;
+    --surface-2:   #1a2238;
+    --border:      rgba(255,255,255,.07);
+    --border-glow: rgba(0,210,210,.22);
+    --primary:     #00d4d4;
+    --accent:      #0055ff;
+    --accent-2:    #4488ff;
+    --gold:        #f5a623;
+    --danger:      #ff4d6d;
+    --success:     #00e5a0;
+    --text:        #e4eaf5;
+    --text-2:      #8896b4;
+    --text-3:      #4f5c78;
+    --font-display:'Syne', system-ui, sans-serif;
+    --font-body:   'DM Sans', system-ui, sans-serif;
+    --font-mono:   'JetBrains Mono', ui-monospace, monospace;
+    --r-md: 8px; --r-lg: 16px; --r-full: 9999px;
+    --shadow-card: 0 4px 32px rgba(0,0,0,.5);
+    --shadow-glow: 0 0 40px rgba(0,212,212,.12);
+    --ease: cubic-bezier(.25,.46,.45,.94);
+  }
+
+  *, *::before, *::after { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-body);
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+    /* Respect notches on phones. */
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+
+  h1, h2 { font-family: var(--font-display); font-weight: 700; letter-spacing: -.02em; color: #fff; }
+
+  header {
+    position: sticky; top: 0; z-index: 10;
+    background: rgba(8,9,15,.94);
+    backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px);
+    border-bottom: 1px solid var(--border);
+    padding: .85rem clamp(1rem, 4vw, 1.5rem);
+    display: flex; gap: .6rem; align-items: center; flex-wrap: wrap;
+  }
+  header h1 { font-size: 1rem; margin: 0; flex: 0 0 auto; }
+  header .spacer { flex: 1 1 auto; }
+
+  input, select, button {
+    font: inherit; font-family: var(--font-body);
+    color: var(--text); background: var(--bg-3);
+    border: 1px solid var(--border); border-radius: var(--r-md);
+    padding: .5rem .75rem; min-height: 40px;
+  }
+  input:focus, select:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(0,212,212,.15); }
+  input[type=password] { flex: 1 1 15rem; min-width: 0; font-family: var(--font-mono); font-size: 14px; }
+
+  button {
+    cursor: pointer; font-weight: 600; font-size: .875rem;
+    background: var(--primary); color: #000; border-color: transparent;
+    border-radius: var(--r-full); padding: .5rem 1.25rem;
+    transition: background var(--ease) .15s, transform var(--ease) .15s, box-shadow var(--ease) .15s;
+  }
+  button:hover { background: #fff; transform: translateY(-1px); box-shadow: 0 6px 24px rgba(0,212,212,.3); }
+  button.ghost { background: transparent; color: var(--text-2); border-color: var(--border); }
+  button.ghost:hover { color: var(--primary); border-color: var(--primary); background: rgba(0,212,212,.05); box-shadow: none; }
+  :focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+
+  main { padding: clamp(1rem, 4vw, 1.5rem); max-width: 1240px; margin: 0 auto; display: grid; gap: 1.25rem; }
+
+  nav { display: flex; gap: .4rem; flex-wrap: wrap; }
+  nav button {
+    background: var(--surface); color: var(--text-2);
+    border: 1px solid var(--border); font-weight: 500; padding: .45rem 1rem;
+  }
+  nav button[aria-current=true] { background: var(--primary); color: #000; border-color: transparent; }
+  nav button:hover { transform: none; box-shadow: none; }
+
+  section { display: none; }
+  section[data-active] { display: grid; gap: 1rem; }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 11rem), 1fr)); gap: .75rem; }
+
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--r-lg); padding: 1.15rem;
+    transition: border-color .3s var(--ease), box-shadow .3s var(--ease);
+  }
+  .card:hover { border-color: var(--border-glow); box-shadow: var(--shadow-glow); }
+  .card .label {
+    display: block; font-family: var(--font-mono); font-size: .66rem;
+    letter-spacing: .14em; text-transform: uppercase; color: var(--text-3);
+  }
+  .card .value {
+    display: block; font-family: var(--font-display);
+    font-size: clamp(1.5rem, 5vw, 1.9rem); font-weight: 700; line-height: 1.1;
+    letter-spacing: -.02em; color: #fff; margin-top: .35rem; overflow-wrap: anywhere;
+  }
+  .card .sub { display: block; color: var(--text-2); font-size: .78rem; margin-top: .25rem; }
+
+  .panel {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--r-lg); overflow: hidden; box-shadow: var(--shadow-card);
+  }
+  .panel h2 {
+    margin: 0; padding: .95rem 1.15rem; font-size: .8rem; font-weight: 600;
+    font-family: var(--font-mono); letter-spacing: .12em; text-transform: uppercase;
+    color: var(--primary); border-bottom: 1px solid var(--border);
+  }
+
+  /* Tables scroll inside their panel instead of stretching the page. */
+  .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  table { width: 100%; min-width: 30rem; border-collapse: collapse; font-size: .875rem; }
+  th, td { text-align: left; padding: .7rem 1.15rem; border-bottom: 1px solid var(--border); }
+  th {
+    color: var(--text-3); font-weight: 500; font-size: .66rem;
+    font-family: var(--font-mono); letter-spacing: .12em; text-transform: uppercase;
+  }
+  td { color: var(--text-2); }
+  tr:last-child td { border-bottom: none; }
+  td.num, th.num { text-align: right; font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+  td code { font-family: var(--font-mono); color: var(--primary); font-size: .8rem; }
+
+  .empty { padding: 1.5rem 1.15rem; color: var(--text-3); font-size: .9rem; }
+
+  .toolbar {
+    display: flex; gap: .6rem; align-items: center; flex-wrap: wrap;
+    padding: .85rem 1.15rem; border-bottom: 1px solid var(--border);
+  }
+  .toolbar label { color: var(--text-3); font-size: .8rem; }
+  .toolbar select { flex: 1 1 10rem; min-width: 0; }
+
+  #heatCanvas { width: 100%; height: auto; display: block; background: #0b0b0f; }
+  .legend { display: flex; gap: .65rem; align-items: center; padding: .7rem 1.15rem; color: var(--text-3); font-size: .72rem; flex-wrap: wrap; }
+  .swatch { width: 120px; height: 10px; border-radius: 5px; background: linear-gradient(90deg,#001b44,#0a84ff,#00e5a0,#f5a623,#ff4d6d); }
+
+  .err {
+    background: rgba(255,77,109,.1); border: 1px solid rgba(255,77,109,.35);
+    color: #ff8fa3; padding: .85rem 1.1rem; border-radius: var(--r-md); font-size: .9rem;
+  }
+
+  .chart { display: flex; align-items: flex-end; gap: 2px; height: 120px; padding: 1.15rem; }
+  .chart div { flex: 1; background: linear-gradient(180deg, var(--primary), var(--accent)); border-radius: 2px 2px 0 0; min-height: 2px; opacity: .9; }
+
+  @media (max-width: 40rem) {
+    header { padding: .7rem 1rem; }
+    header h1 { flex: 1 1 100%; }
+    input[type=password] { flex: 1 1 100%; }
+    header select, header button { flex: 1 1 auto; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    button, .card { transition: none; }
+    button:hover { transform: none; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>TBAY Rewards</h1>
+  <input id="secret" type="password" placeholder="API secret (tbs_….…)" autocomplete="off">
+  <select id="range">
+    <option value="7">Last 7 days</option>
+    <option value="30" selected>Last 30 days</option>
+    <option value="90">Last 90 days</option>
+  </select>
+  <button id="load">Load</button>
+  <span class="spacer"></span>
+  <button class="ghost" id="forget">Forget key</button>
+</header>
+
+<main>
+  <div id="error" class="err" hidden></div>
+  <nav>
+    <button data-tab="overview" aria-current="true">Overview</button>
+    <button data-tab="sources">Sources</button>
+    <button data-tab="products">Products</button>
+    <button data-tab="heatmap">Heatmaps</button>
+    <button data-tab="carts">Carts</button>
+    <button data-tab="blog">Blog &amp; commissions</button>
+    <button data-tab="rewards">Rewards &amp; TBAY</button>
+    <button data-tab="bridge">Bridge</button>
+  </nav>
+
+  <section id="overview" data-active>
+    <div class="cards" id="overviewCards"></div>
+    <div class="panel">
+      <h2>Sessions per day</h2>
+      <div class="chart" id="chart"></div>
+    </div>
+    <div class="panel">
+      <h2>Top pages</h2>
+      <div id="pagesTable"></div>
+    </div>
+  </section>
+
+  <section id="sources"><div class="panel"><h2>Where customers came from</h2><div id="sourcesTable"></div></div></section>
+
+  <section id="products">
+    <div class="panel">
+      <div class="toolbar">
+        <label for="productMetric">Rank by</label>
+        <select id="productMetric">
+          <option value="clicks" selected>Clicks</option>
+          <option value="views">Views</option>
+          <option value="add_to_carts">Add to cart</option>
+          <option value="purchases">Purchases</option>
+        </select>
+      </div>
+      <div id="productsTable"></div>
+    </div>
+  </section>
+
+  <section id="heatmap">
+    <div class="panel">
+      <div class="toolbar">
+        <select id="heatPage"></select>
+        <select id="heatKind">
+          <option value="click">Clicks</option>
+          <option value="move">Movement</option>
+          <option value="scroll">Scroll depth</option>
+        </select>
+        <select id="heatDevice">
+          <option value="desktop">Desktop</option>
+          <option value="mobile">Mobile</option>
+          <option value="tablet">Tablet</option>
+        </select>
+        <button class="ghost" id="heatLoad">Render</button>
+        <span id="heatMeta" style="color:var(--muted);font-size:13px"></span>
+      </div>
+      <canvas id="heatCanvas" width="1000" height="2000"></canvas>
+      <div class="legend"><span>cold</span><span class="swatch"></span><span>hot</span></div>
+    </div>
+  </section>
+
+  <section id="carts">
+    <div class="cards" id="cartCards"></div>
+  </section>
+
+  <section id="blog"><div class="panel"><h2>Blog links and writer commissions</h2><div id="blogTable"></div></div></section>
+
+  <section id="bridge">
+    <div class="cards" id="bridgeCards"></div>
+    <div class="panel"><h2>L2 &rarr; L1 withdrawals</h2><div id="bridgeTable"></div></div>
+    <div class="panel">
+      <h2>Reward supply budget</h2>
+      <div id="supplyPanel" class="empty"></div>
+    </div>
+  </section>
+
+  <section id="rewards">
+    <div class="cards" id="rewardCards"></div>
+    <div class="panel"><h2>Top earners</h2><div id="leaderTable"></div></div>
+  </section>
+</main>
+
+<script>
+(function () {
+  'use strict';
+
+  var secretInput = document.getElementById('secret');
+  var errorBox = document.getElementById('error');
+  var stored = null;
+  try { stored = localStorage.getItem('tbay_dash_secret'); } catch (e) {}
+  if (stored) secretInput.value = stored;
+
+  function secret() { return secretInput.value.trim(); }
+
+  function rangeParams() {
+    var days = parseInt(document.getElementById('range').value, 10);
+    var to = new Date();
+    var from = new Date(to.getTime() - days * 86400000);
+    return 'from=' + from.toISOString() + '&to=' + to.toISOString();
+  }
+
+  function api(path) {
+    return fetch(path, { headers: { authorization: 'Bearer ' + secret() } }).then(function (res) {
+      return res.json().then(function (body) {
+        if (!res.ok) throw new Error(body.message || ('HTTP ' + res.status));
+        return body;
+      });
+    });
+  }
+
+  function showError(message) {
+    errorBox.textContent = message;
+    errorBox.hidden = !message;
+  }
+
+  function money(cents, currency) {
+    try {
+      return new Intl.NumberFormat(undefined, { style: 'currency', currency: currency || 'USD' })
+        .format((cents || 0) / 100);
+    } catch (e) { return ((cents || 0) / 100).toFixed(2); }
+  }
+
+  function pct(value) { return ((value || 0) * 100).toFixed(2) + '%'; }
+  function num(value) { return (value || 0).toLocaleString(); }
+
+  function card(label, value, sub) {
+    return '<div class="card"><div class="label">' + label + '</div>' +
+           '<div class="value">' + value + '</div>' +
+           (sub ? '<div class="sub">' + sub + '</div>' : '') + '</div>';
+  }
+
+  function table(columns, rows, emptyMessage) {
+    if (!rows || rows.length === 0) return '<div class="empty">' + emptyMessage + '</div>';
+    var head = columns.map(function (col) {
+      return '<th' + (col.num ? ' class="num"' : '') + '>' + col.label + '</th>';
+    }).join('');
+    var body = rows.map(function (row) {
+      return '<tr>' + columns.map(function (col) {
+        return '<td' + (col.num ? ' class="num"' : '') + '>' + col.render(row) + '</td>';
+      }).join('') + '</tr>';
+    }).join('');
+    return '<div class="table-wrap"><table><thead><tr>' + head +
+           '</tr></thead><tbody>' + body + '</tbody></table></div>';
+  }
+
+  function escape(value) {
+    return String(value === null || value === undefined ? '' : value)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  // ── Tabs ──────────────────────────────────────────────────────────────────
+
+  document.querySelectorAll('nav button').forEach(function (button) {
+    button.addEventListener('click', function () {
+      document.querySelectorAll('nav button').forEach(function (other) {
+        other.setAttribute('aria-current', String(other === button));
+      });
+      document.querySelectorAll('main section').forEach(function (section) {
+        if (section.id === button.dataset.tab) section.setAttribute('data-active', '');
+        else section.removeAttribute('data-active');
+      });
+    });
+  });
+
+  // ── Loaders ───────────────────────────────────────────────────────────────
+
+  function loadOverview() {
+    return api('/v1/reports/overview?' + rangeParams()).then(function (data) {
+      var o = data.overview;
+      document.getElementById('overviewCards').innerHTML =
+        card('Sessions', num(o.sessions), num(o.visitors) + ' visitors') +
+        card('Pageviews', num(o.pageviews)) +
+        card('Orders', num(o.orders), pct(o.conversion_rate) + ' conversion') +
+        card('Revenue', money(o.revenue_cents)) +
+        card('Subscribers', num(o.subscribers), num(o.new_contacts) + ' new contacts') +
+        card('Points issued', num(o.points_awarded), num(o.points_redeemed) + ' redeemed');
+
+      var series = data.timeseries || [];
+      var peak = series.reduce(function (max, point) { return Math.max(max, point.sessions); }, 1);
+      document.getElementById('chart').innerHTML = series.map(function (point) {
+        var height = Math.round((point.sessions / peak) * 100);
+        return '<div style="height:' + height + '%" title="' + point.bucket + ': ' +
+               point.sessions + ' sessions"></div>';
+      }).join('');
+    }).then(function () {
+      return api('/v1/reports/pages?' + rangeParams());
+    }).then(function (data) {
+      document.getElementById('pagesTable').innerHTML = table([
+        { label: 'Path', render: function (r) { return escape(r.path); } },
+        { label: 'Views', num: true, render: function (r) { return num(r.pageviews); } },
+        { label: 'Visitors', num: true, render: function (r) { return num(r.visitors); } }
+      ], data.pages, 'No pageviews recorded yet.');
+    });
+  }
+
+  function loadSources() {
+    return api('/v1/reports/sources?' + rangeParams()).then(function (data) {
+      document.getElementById('sourcesTable').innerHTML = table([
+        { label: 'Source', render: function (r) { return escape(r.source); } },
+        { label: 'Medium', render: function (r) { return escape(r.medium || '—'); } },
+        { label: 'Sessions', num: true, render: function (r) { return num(r.sessions); } },
+        { label: 'Orders', num: true, render: function (r) { return num(r.orders); } },
+        { label: 'Revenue', num: true, render: function (r) { return money(r.revenue_cents); } },
+        { label: 'Conv.', num: true, render: function (r) { return pct(r.conversion_rate); } }
+      ], data.sources, 'No traffic recorded yet.');
+    });
+  }
+
+  function loadProducts() {
+    var metric = document.getElementById('productMetric').value;
+    return api('/v1/reports/products?' + rangeParams() + '&metric=' + metric).then(function (data) {
+      document.getElementById('productsTable').innerHTML = table([
+        { label: 'Product', render: function (r) { return escape(r.name || r.product_ref); } },
+        { label: 'Views', num: true, render: function (r) { return num(r.views); } },
+        { label: 'Clicks', num: true, render: function (r) { return num(r.clicks); } },
+        { label: 'Carts', num: true, render: function (r) { return num(r.add_to_carts); } },
+        { label: 'Sales', num: true, render: function (r) { return num(r.purchases); } },
+        { label: 'Revenue', num: true, render: function (r) { return money(r.revenue_cents); } },
+        { label: 'CTR', num: true, render: function (r) { return pct(r.click_through_rate); } }
+      ], data.products, 'No product engagement recorded yet.');
+    });
+  }
+
+  function loadCarts() {
+    return api('/v1/reports/carts?' + rangeParams()).then(function (data) {
+      var c = data.carts;
+      document.getElementById('cartCards').innerHTML =
+        card('Active carts', num(c.active)) +
+        card('Abandoned', num(c.abandoned), money(c.abandoned_value_cents) + ' at risk') +
+        card('Recovered', num(c.recovered), money(c.recovered_value_cents) + ' won back') +
+        card('Converted', num(c.converted)) +
+        card('Abandonment rate', pct(c.abandonment_rate)) +
+        card('Recovery rate', pct(c.recovery_rate));
+    });
+  }
+
+  function loadBlog() {
+    return api('/v1/reports/blog-links?' + rangeParams()).then(function (data) {
+      document.getElementById('blogTable').innerHTML = table([
+        { label: 'Post', render: function (r) { return escape(r.post_ref || r.label || '—'); } },
+        { label: 'Writer', render: function (r) { return escape(r.writer_name || '—'); } },
+        { label: 'Code', render: function (r) { return '<code>' + escape(r.code) + '</code>'; } },
+        { label: 'Clicks', num: true, render: function (r) { return num(r.clicks); } },
+        { label: 'Orders', num: true, render: function (r) { return num(r.orders); } },
+        { label: 'Revenue', num: true, render: function (r) { return money(r.revenue_cents); } },
+        { label: 'Commission', num: true, render: function (r) { return money(r.commission_cents); } }
+      ], data.links, 'No writer links yet.');
+    });
+  }
+
+  function loadRewards() {
+    return api('/v1/reports/rewards').then(function (data) {
+      var r = data.rewards;
+      var claimed = (Number(r.tokens_claimed_wei) / 1e18);
+      document.getElementById('rewardCards').innerHTML =
+        card('Members with points', num(r.members_with_points)) +
+        card('Points outstanding', num(r.total_balance), num(r.total_pending) + ' pending') +
+        card('Lifetime issued', num(r.lifetime_awarded), num(r.lifetime_redeemed) + ' redeemed') +
+        card('TBAY claimed', claimed.toFixed(4), num(r.claims_completed) + ' completed claims') +
+        card('Vouchers open', num(r.claims_signed)) +
+        card('Shares verified', num(r.shares_verified), num(r.shares_pending) + ' pending');
+    }).then(function () {
+      return api('/v1/rewards/leaderboard');
+    }).then(function (data) {
+      document.getElementById('leaderTable').innerHTML = table([
+        { label: 'Member', render: function (r) { return escape(r.name || r.contact_id.slice(0, 8)); } },
+        { label: 'Lifetime points', num: true, render: function (r) { return num(r.lifetime_earned); } }
+      ], data.leaders, 'No points issued yet.');
+    });
+  }
+
+  function loadBridge() {
+    return api('/v1/bridge/withdrawals').then(function (data) {
+      var rows = data.withdrawals || [];
+      var awaiting = rows.filter(function (r) { return r.status === 'burn_verified'; });
+      var released = rows.filter(function (r) { return r.status === 'released'; });
+
+      // L1 amounts carry 9 decimals, so scale by 1e9 rather than 1e18.
+      function l1(value) { return (Number(value || 0) / 1e9).toFixed(9).replace(/0+$/, '').replace(/\.$/, ''); }
+
+      var owed = awaiting.reduce(function (sum, r) { return sum + Number(r.l1_amount || 0); }, 0);
+
+      document.getElementById('bridgeCards').innerHTML =
+        card('Awaiting release', num(awaiting.length), l1(owed) + ' TBAY owed on L1') +
+        card('Released', num(released.length)) +
+        card('Total withdrawals', num(rows.length));
+
+      document.getElementById('bridgeTable').innerHTML = table([
+        { label: 'From', render: function (r) { return '<code>' + escape(r.from_address.slice(0, 10)) + '…</code>'; } },
+        { label: 'L1 recipient', render: function (r) { return '<code>' + escape(r.l1_recipient.slice(0, 10)) + '…</code>'; } },
+        { label: 'Amount (L1)', num: true, render: function (r) { return l1(r.l1_amount); } },
+        { label: 'Status', render: function (r) { return escape(r.status); } },
+        { label: 'Burn tx', render: function (r) { return '<code>' + escape(r.burn_tx_hash.slice(0, 12)) + '…</code>'; } }
+      ], rows, 'No bridge withdrawals yet.');
+    });
+  }
+
+  function loadSupply() {
+    // /health is unauthenticated and carries the chain configuration; the
+    // budget itself comes back on the public config endpoint.
+    return fetch('/health').then(function (res) { return res.json(); }).then(function (health) {
+      var panel = document.getElementById('supplyPanel');
+      panel.className = '';
+      panel.innerHTML =
+        '<div class="cards" style="padding:1.15rem">' +
+        card('Chain', escape(String(health.chain && health.chain.chain_id))) +
+        card('Signer', health.signer_configured ? 'configured' : 'missing') +
+        card('RPC', health.rpc_configured ? 'configured' : 'missing') +
+        '</div>' +
+        '<p class="empty">L1 TBAY is a fixed 1,000,000 supply with no mint function, so every ' +
+        'bridged withdrawal is released from reserve. Set TBAY_REWARD_SUPPLY_CAP_WEI to the size ' +
+        'of that reserve to cap what the platform can ever promise.</p>';
+    });
+  }
+
+  // ── Heatmap rendering ─────────────────────────────────────────────────────
+
+  function loadHeatPages() {
+    return api('/v1/reports/heatmap/pages').then(function (data) {
+      var select = document.getElementById('heatPage');
+      select.innerHTML = (data.pages || []).map(function (page) {
+        return '<option value="' + escape(page.page_key) + '" data-device="' + escape(page.device_class) + '">' +
+               escape(page.page_key) + ' (' + page.device_class + ', ' + num(page.sample_points) + ' pts)</option>';
+      }).join('') || '<option value="">No heatmap data yet</option>';
+    });
+  }
+
+  /** Blue → green → yellow → red ramp, keyed off the hottest cell on the page. */
+  function rampColor(t) {
+    var stops = [
+      [0.00, [0, 27, 68]], [0.25, [10, 132, 255]], [0.55, [0, 229, 160]],
+      [0.80, [245, 166, 35]], [1.00, [255, 77, 109]]
+    ];
+    for (var i = 1; i < stops.length; i++) {
+      if (t <= stops[i][0]) {
+        var lo = stops[i - 1], hi = stops[i];
+        var span = (t - lo[0]) / (hi[0] - lo[0] || 1);
+        return [
+          Math.round(lo[1][0] + (hi[1][0] - lo[1][0]) * span),
+          Math.round(lo[1][1] + (hi[1][1] - lo[1][1]) * span),
+          Math.round(lo[1][2] + (hi[1][2] - lo[1][2]) * span)
+        ];
+      }
+    }
+    return stops[stops.length - 1][1];
+  }
+
+  function renderHeatmap() {
+    var page = document.getElementById('heatPage').value;
+    if (!page) return Promise.resolve();
+    var kind = document.getElementById('heatKind').value;
+    var device = document.getElementById('heatDevice').value;
+
+    return api('/v1/reports/heatmap?page=' + encodeURIComponent(page) +
+               '&kind=' + kind + '&device=' + device).then(function (data) {
+      var map = data.heatmap;
+      var canvas = document.getElementById('heatCanvas');
+      var ctx = canvas.getContext('2d');
+      var cellW = canvas.width / map.xBins;
+      var cellH = canvas.height / map.yBins;
+
+      ctx.fillStyle = '#0b0b0f';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      document.getElementById('heatMeta').textContent =
+        map.cells.length + ' cells · ' + num(map.totalWeight) + ' samples · ' +
+        num(map.sampleSessions) + ' sessions' +
+        (map.avgDocHeight ? ' · avg page ' + map.avgDocHeight + 'px' : '');
+
+      if (map.maxWeight === 0) return;
+
+      // Scale by sqrt so a handful of extreme cells do not wash out the rest.
+      var peak = Math.sqrt(map.maxWeight);
+      map.cells.forEach(function (cell) {
+        var t = Math.min(1, Math.sqrt(cell.weight) / peak);
+        var rgb = rampColor(t);
+        ctx.fillStyle = 'rgba(' + rgb[0] + ',' + rgb[1] + ',' + rgb[2] + ',' + (0.25 + t * 0.75) + ')';
+        if (kind === 'scroll') {
+          // Scroll depth is one-dimensional: draw full-width bands.
+          ctx.fillRect(0, cell.y_bin * cellH, canvas.width, Math.ceil(cellH));
+        } else {
+          ctx.fillRect(cell.x_bin * cellW, cell.y_bin * cellH, Math.ceil(cellW), Math.ceil(cellH));
+        }
+      });
+    });
+  }
+
+  // ── Wiring ────────────────────────────────────────────────────────────────
+
+  function loadAll() {
+    if (!secret()) { showError('Enter your API secret to load reports.'); return; }
+    try { localStorage.setItem('tbay_dash_secret', secret()); } catch (e) {}
+    showError('');
+
+    Promise.all([
+      loadOverview(), loadSources(), loadProducts(), loadCarts(),
+      loadBlog(), loadRewards(), loadHeatPages(), loadBridge(), loadSupply()
+    ]).then(function () {
+      return renderHeatmap();
+    })['catch'](function (err) {
+      showError(err.message || 'Could not load reports');
+    });
+  }
+
+  document.getElementById('load').addEventListener('click', loadAll);
+  document.getElementById('heatLoad').addEventListener('click', function () {
+    renderHeatmap()['catch'](function (err) { showError(err.message); });
+  });
+  document.getElementById('productMetric').addEventListener('change', function () {
+    loadProducts()['catch'](function (err) { showError(err.message); });
+  });
+  document.getElementById('range').addEventListener('change', loadAll);
+  document.getElementById('forget').addEventListener('click', function () {
+    try { localStorage.removeItem('tbay_dash_secret'); } catch (e) {}
+    secretInput.value = '';
+  });
+  document.getElementById('heatPage').addEventListener('change', function () {
+    var option = this.options[this.selectedIndex];
+    if (option && option.dataset.device) document.getElementById('heatDevice').value = option.dataset.device;
+  });
+
+  if (stored) loadAll();
+}());
+</script>
+</body>
+</html>

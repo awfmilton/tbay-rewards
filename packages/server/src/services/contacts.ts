@@ -1,0 +1,302 @@
+import { db, queryOne, withTransaction, type Queryable } from '../db/pool.js';
+import { identityHash, normaliseEmail } from '../lib/crypto.js';
+import { ApiError } from '../lib/errors.js';
+
+export interface Contact {
+  id: string;
+  tenant_id: string;
+  member_id: string | null;
+  email: string | null;
+  email_normalised: string | null;
+  name: string | null;
+  phone: string | null;
+  external_ref: string | null;
+  locale: string | null;
+  country: string | null;
+  wallet_address: string | null;
+  is_writer: boolean;
+  marketing_consent: boolean;
+  attributes: Record<string, unknown>;
+  tags: string[];
+  first_seen_at: Date;
+  last_seen_at: Date;
+}
+
+export interface ContactInput {
+  email?: string | null;
+  name?: string | null;
+  phone?: string | null;
+  externalRef?: string | null;
+  locale?: string | null;
+  country?: string | null;
+  walletAddress?: string | null;
+  attributes?: Record<string, unknown>;
+  tags?: string[];
+  marketingConsent?: boolean;
+  consentSource?: string | null;
+}
+
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+
+export function isValidEmail(email: string): boolean {
+  return EMAIL_PATTERN.test(email) && email.length <= 254;
+}
+
+/**
+ * Find or create the global member for an email and/or wallet.
+ *
+ * A member is the cross-retailer identity that a TBAY balance belongs to. We key
+ * on a salted hash of the email so the platform can recognise the same person at
+ * retailer B without retailer A's plaintext address ever being shared.
+ */
+export async function upsertMember(
+  runner: Queryable,
+  opts: { email?: string | null; walletAddress?: string | null },
+): Promise<string | null> {
+  const emailHash = opts.email ? identityHash(opts.email) : null;
+  const wallet = opts.walletAddress ? opts.walletAddress.toLowerCase() : null;
+  if (!emailHash && !wallet) return null;
+
+  // Prefer an existing wallet match: a connected wallet is the stronger claim.
+  if (wallet) {
+    const byWallet = await queryOne<{ id: string; email_hash: string | null }>(
+      runner,
+      'SELECT id, email_hash FROM members WHERE wallet_address = $1',
+      [wallet],
+    );
+    if (byWallet) {
+      if (emailHash && !byWallet.email_hash) {
+        await runner.query(
+          `UPDATE members SET email_hash = $2, updated_at = now()
+            WHERE id = $1 AND email_hash IS NULL`,
+          [byWallet.id, emailHash],
+        );
+      }
+      return byWallet.id;
+    }
+  }
+
+  if (emailHash) {
+    const byEmail = await queryOne<{ id: string; wallet_address: string | null }>(
+      runner,
+      'SELECT id, wallet_address FROM members WHERE email_hash = $1',
+      [emailHash],
+    );
+    if (byEmail) {
+      if (wallet && !byEmail.wallet_address) {
+        await runner.query(
+          `UPDATE members SET wallet_address = $2, updated_at = now()
+            WHERE id = $1 AND wallet_address IS NULL`,
+          [byEmail.id, wallet],
+        );
+      }
+      return byEmail.id;
+    }
+  }
+
+  const created = await queryOne<{ id: string }>(
+    runner,
+    `INSERT INTO members (wallet_address, email_hash) VALUES ($1, $2)
+     ON CONFLICT DO NOTHING
+     RETURNING id`,
+    [wallet, emailHash],
+  );
+  if (created) return created.id;
+
+  // Lost a race; re-read whichever key we have.
+  const existing = await queryOne<{ id: string }>(
+    runner,
+    `SELECT id FROM members
+      WHERE ($1::text IS NOT NULL AND wallet_address = $1)
+         OR ($2::text IS NOT NULL AND email_hash = $2)
+      LIMIT 1`,
+    [wallet, emailHash],
+  );
+  return existing?.id ?? null;
+}
+
+/**
+ * Create or merge a tenant-scoped contact. Matching is by email first, then by
+ * the retailer's own external reference (e.g. a WordPress user id).
+ */
+export async function upsertContact(
+  tenantId: string,
+  input: ContactInput,
+  runner?: Queryable,
+): Promise<Contact> {
+  const run = async (client: Queryable): Promise<Contact> => {
+    const email = input.email ? normaliseEmail(input.email) : null;
+    if (email && !isValidEmail(email)) throw ApiError.badRequest('Invalid email address');
+
+    const wallet = input.walletAddress ? input.walletAddress.toLowerCase() : null;
+    const memberId = await upsertMember(client, { email, walletAddress: wallet });
+
+    let existing: Contact | null = null;
+    if (email) {
+      existing = await queryOne<Contact>(
+        client,
+        'SELECT * FROM contacts WHERE tenant_id = $1 AND email_normalised = $2',
+        [tenantId, email],
+      );
+    }
+    if (!existing && input.externalRef) {
+      existing = await queryOne<Contact>(
+        client,
+        'SELECT * FROM contacts WHERE tenant_id = $1 AND external_ref = $2',
+        [tenantId, input.externalRef],
+      );
+    }
+
+    if (existing) {
+      const updated = await queryOne<Contact>(
+        client,
+        `UPDATE contacts SET
+            email             = COALESCE($2, email),
+            email_normalised  = COALESCE($3, email_normalised),
+            name              = COALESCE($4, name),
+            phone             = COALESCE($5, phone),
+            external_ref      = COALESCE($6, external_ref),
+            locale            = COALESCE($7, locale),
+            country           = COALESCE($8, country),
+            wallet_address    = COALESCE($9, wallet_address),
+            member_id         = COALESCE(member_id, $10),
+            attributes        = attributes || $11::jsonb,
+            tags              = (
+              SELECT COALESCE(array_agg(DISTINCT tag), '{}')
+                FROM unnest(tags || $12::text[]) AS tag
+            ),
+            marketing_consent = COALESCE($13, marketing_consent),
+            consent_source    = COALESCE($14, consent_source),
+            consent_at        = CASE WHEN $13 IS TRUE AND NOT marketing_consent
+                                     THEN now() ELSE consent_at END,
+            last_seen_at      = now(),
+            updated_at        = now()
+          WHERE id = $1
+          RETURNING *`,
+        [
+          existing.id,
+          input.email ?? null,
+          email,
+          input.name ?? null,
+          input.phone ?? null,
+          input.externalRef ?? null,
+          input.locale ?? null,
+          input.country ?? null,
+          wallet,
+          memberId,
+          JSON.stringify(input.attributes ?? {}),
+          input.tags ?? [],
+          input.marketingConsent ?? null,
+          input.consentSource ?? null,
+        ],
+      );
+      return updated!;
+    }
+
+    const created = await queryOne<Contact>(
+      client,
+      `INSERT INTO contacts (
+         tenant_id, member_id, email, email_normalised, name, phone, external_ref,
+         locale, country, wallet_address, attributes, tags, marketing_consent,
+         consent_source, consent_at
+       ) VALUES (
+         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::text[], $13, $14,
+         CASE WHEN $13 IS TRUE THEN now() ELSE NULL END
+       )
+       RETURNING *`,
+      [
+        tenantId,
+        memberId,
+        input.email ?? null,
+        email,
+        input.name ?? null,
+        input.phone ?? null,
+        input.externalRef ?? null,
+        input.locale ?? null,
+        input.country ?? null,
+        wallet,
+        JSON.stringify(input.attributes ?? {}),
+        input.tags ?? [],
+        input.marketingConsent ?? false,
+        input.consentSource ?? null,
+      ],
+    );
+    return created!;
+  };
+
+  return runner ? run(runner) : withTransaction(run);
+}
+
+export async function getContact(tenantId: string, contactId: string): Promise<Contact | null> {
+  return queryOne<Contact>(db(), 'SELECT * FROM contacts WHERE tenant_id = $1 AND id = $2', [
+    tenantId,
+    contactId,
+  ]);
+}
+
+export async function findContactByEmail(
+  tenantId: string,
+  email: string,
+  runner: Queryable = db(),
+): Promise<Contact | null> {
+  return queryOne<Contact>(
+    runner,
+    'SELECT * FROM contacts WHERE tenant_id = $1 AND email_normalised = $2',
+    [tenantId, normaliseEmail(email)],
+  );
+}
+
+/**
+ * Resolve the contact a caller means from any of the accepted handles.
+ * Throws rather than silently creating when nothing identifies a person.
+ */
+export async function requireContact(
+  tenantId: string,
+  handles: { contactId?: string | null; email?: string | null; externalRef?: string | null },
+): Promise<Contact> {
+  if (handles.contactId) {
+    const byId = await getContact(tenantId, handles.contactId);
+    if (byId) return byId;
+  }
+  if (handles.email) {
+    const byEmail = await findContactByEmail(tenantId, handles.email);
+    if (byEmail) return byEmail;
+  }
+  if (handles.externalRef) {
+    const byRef = await queryOne<Contact>(
+      db(),
+      'SELECT * FROM contacts WHERE tenant_id = $1 AND external_ref = $2',
+      [tenantId, handles.externalRef],
+    );
+    if (byRef) return byRef;
+  }
+  throw ApiError.notFound('No matching contact');
+}
+
+export async function setWallet(
+  tenantId: string,
+  contactId: string,
+  walletAddress: string,
+): Promise<Contact> {
+  const wallet = walletAddress.toLowerCase();
+  return withTransaction(async (client) => {
+    const contact = await queryOne<Contact>(
+      client,
+      'SELECT * FROM contacts WHERE tenant_id = $1 AND id = $2 FOR UPDATE',
+      [tenantId, contactId],
+    );
+    if (!contact) throw ApiError.notFound('Contact not found');
+
+    const memberId =
+      (await upsertMember(client, { email: contact.email_normalised, walletAddress: wallet })) ??
+      contact.member_id;
+
+    const updated = await queryOne<Contact>(
+      client,
+      `UPDATE contacts SET wallet_address = $3, member_id = COALESCE($4, member_id), updated_at = now()
+        WHERE tenant_id = $1 AND id = $2 RETURNING *`,
+      [tenantId, contactId, wallet, memberId],
+    );
+    return updated!;
+  });
+}

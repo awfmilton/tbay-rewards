@@ -1,0 +1,21 @@
+{
+  "name": "tbay-rewards",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TBAY Rewards — unified marketing automation, analytics and token-backed loyalty platform",
+  "license": "UNLICENSED",
+  "workspaces": [
+    "packages/server"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace @tbay/rewards-server",
+    "build": "npm run build --workspace @tbay/rewards-server",
+    "start": "npm run start --workspace @tbay/rewards-server",
+    "migrate": "npm run migrate --workspace @tbay/rewards-server",
+    "test": "npm run test --workspace @tbay/rewards-server",
+    "typecheck": "npm run typecheck --workspace @tbay/rewards-server"
+  },
+  "engines": {
+    "node": ">=20.11"
+  }
+}
