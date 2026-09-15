@@ -440,3 +440,78 @@ describe('ingest scope', () => {
     }
   });
 });
+
+describe('configuration preflight', () => {
+  /**
+   * The expensive launch mistakes here are all silent: a mainnet deployment
+   * with no reward budget works perfectly until the first person tries to
+   * bridge and finds the reserve empty.
+   */
+  it('refuses to call an uncapped mainnet deployment healthy', async () => {
+    const { resetConfig } = await import('../src/config.js');
+    const { preflight } = await import('../src/lib/preflight.js');
+
+    process.env.TBAY_CHAIN_ID = '324'; // zkSync Era mainnet
+    process.env.TBAY_REWARD_SUPPLY_CAP_WEI = '0';
+    resetConfig();
+
+    try {
+      const codes = preflight().map((f) => f.code);
+      expect(codes).toContain('uncapped_on_mainnet');
+      expect(preflight().find((f) => f.code === 'uncapped_on_mainnet')!.level).toBe('error');
+    } finally {
+      delete process.env.TBAY_CHAIN_ID;
+      delete process.env.TBAY_REWARD_SUPPLY_CAP_WEI;
+      resetConfig();
+    }
+  });
+
+  it('rejects a cap larger than the L1 supply that has to back it', async () => {
+    const { resetConfig } = await import('../src/config.js');
+    const { preflight } = await import('../src/lib/preflight.js');
+
+    // 2,000,000 TBAY, against an L1 supply that is fixed at 1,000,000.
+    process.env.TBAY_REWARD_SUPPLY_CAP_WEI = (2_000_000n * 10n ** 18n).toString();
+    resetConfig();
+
+    try {
+      expect(preflight().map((f) => f.code)).toContain('cap_exceeds_l1_supply');
+    } finally {
+      delete process.env.TBAY_REWARD_SUPPLY_CAP_WEI;
+      resetConfig();
+    }
+  });
+
+  it('flags claim refunds as unsafe against a contract with no deadline', async () => {
+    const { resetConfig } = await import('../src/config.js');
+    const { preflight } = await import('../src/lib/preflight.js');
+
+    process.env.CLAIM_REFUND_ON_EXPIRY = 'true';
+    resetConfig();
+
+    try {
+      const finding = preflight().find((f) => f.code === 'unsafe_claim_refunds');
+      expect(finding?.level).toBe('error');
+    } finally {
+      delete process.env.CLAIM_REFUND_ON_EXPIRY;
+      resetConfig();
+    }
+  });
+
+  it('is quiet on a correctly configured testnet', async () => {
+    const { preflight } = await import('../src/lib/preflight.js');
+    // The test environment is zkSync Sepolia with an uncapped budget, which is
+    // exactly right for a testnet.
+    expect(preflight().filter((f) => f.level === 'error')).toHaveLength(0);
+  });
+
+  it('reports preflight findings on /health', async () => {
+    const app = await testApp();
+    const response = await app.inject({ method: 'GET', url: '/health' });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toHaveProperty('preflight');
+    expect(response.json()).toHaveProperty('supply');
+    expect(response.json().status).toBe('ok');
+  });
+});

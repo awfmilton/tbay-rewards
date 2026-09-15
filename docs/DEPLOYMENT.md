@@ -126,8 +126,10 @@ Docker secrets or your platform's secret store — particularly for
 curl -s https://rewards.example.com/health | jq
 ```
 
-Reports database reachability, the configured chain, and whether the signer and
-RPC are present. The container healthcheck polls the same endpoint.
+Reports database reachability, the configured chain, the reward-supply headroom
+and a `preflight` list of configuration problems. `status` is `misconfigured`
+when any of those is an error — most importantly an uncapped reward budget on a
+mainnet chain. The container healthcheck polls the same endpoint.
 
 ### Logs
 

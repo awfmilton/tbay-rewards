@@ -5,6 +5,39 @@ back to Ethereum — plus the supply arithmetic that keeps all of it solvent.
 
 ---
 
+## Verified on-chain
+
+Read from Ethereum mainnet, not assumed from source:
+
+```
+0xC17e078E914aB6023dd48831358067d428409116
+  name()          Thunder Bay Token
+  symbol()        TBAY
+  decimals()      9
+  totalSupply()   1,000,000 TBAY          (1000000000000000 base units)
+  owner()         0x33ea3c51…ccdee
+  bytecode        2,614 bytes
+
+  mint(address,uint256)       absent
+  burn(uint256)               absent
+  burnFrom(address,uint256)   absent
+  pause()                     absent
+  renounceOwnership()         absent
+  transferOwnership(address)  present
+```
+
+Two things worth saying plainly about that:
+
+**The owner has no power over the token.** `TBAY` declares no `onlyOwner`
+functions at all, so ownership confers nothing but the title. The owner cannot
+mint, burn, pause, freeze or blacklist. That is unusually good for holder
+confidence — worth saying so publicly.
+
+**`renounceOwnership` was removed** from the OpenZeppelin `Ownable` copy, so
+`owner()` will always return an address. Some token scanners flag "ownership not
+renounced" as a risk; here it is cosmetic, because there is nothing to renounce
+power over.
+
 ## The two contracts
 
 | | L1 (Ethereum) | L2 (zkSync Era) |
@@ -52,6 +85,45 @@ deployer wallet on day one — those count).
 reward budget  =  L1 tokens held for bridging
                 − L2 tokens already circulating that could bridge
 ```
+
+### The arithmetic today
+
+All 1,000,000 L1 TBAY sit in the treasury wallet; none are circulating. So the
+maximum possible reserve is the full supply:
+
+```
+TBAY_REWARD_SUPPLY_CAP_WEI=1000000000000000000000000   # 1,000,000 TBAY
+```
+
+**But the L2 contract's constructor mints another 1,000,000 to the deployer:**
+
+```solidity
+// TBAY-L2-1-0-1.sol:144
+_mint(myWallet, 1_000_000 * 10**18);
+```
+
+Those L2 tokens can be bridged to L1 and draw on the same reserve. If that line
+ships unchanged to Era mainnet, the constructor alone consumes the entire L1
+backing capacity and the reward budget is **zero** before a single point is
+redeemed.
+
+Three ways out, in rough order of preference:
+
+1. **Drop or shrink the constructor mint** before deploying to Era mainnet. The
+   L2 supply then grows only as rewards are earned, and every L2 token is backed
+   1:1 by held L1. Cleanest story, and it needs a one-line contract change.
+2. **Treat the constructor mint as the reward pool.** Deploy as-is, run
+   `TBAY_SUPPLY_MODE=treasury` so redemptions transfer from that 1,000,000
+   instead of minting, and never bridge it. Rewards are then non-inflationary
+   and visibly budgeted on-chain. No contract change, but the platform needs a
+   funded hot wallet.
+3. **Split the L1 million explicitly.** Decide how much is bridge reserve (say
+   600,000) and how much is treasury, set the cap to the reserve, and accept
+   that the L2 constructor mint is not fully bridgeable.
+
+The platform refuses to pretend either way: booting on a mainnet chain with no
+cap set logs an `uncapped_on_mainnet` error and `/health` reports
+`status: "misconfigured"`.
 
 Every redemption books against the budget before a voucher is signed. When it is
 exhausted, redemption fails with a clear message for the person redeeming — which
