@@ -23,6 +23,14 @@ export interface TenantSettings {
   pointsPerToken?: number;
   creditCentsPerToken?: number;
   commissionRateBps?: number;
+  /**
+   * This retailer's own TBAY issuance budget, as a decimal wei string.
+   * Operator-set, not retailer-set: they bound what this tenant can take of
+   * the platform's shared mint window and reward supply. '0' means no
+   * per-tenant limit; absent means the platform default.
+   */
+  tokenMintPerWindowWei?: string;
+  tokenSupplyCapWei?: string;
   /** Sender identity for this retailer's transactional email. */
   fromName?: string;
   fromEmail?: string;
@@ -122,6 +130,16 @@ export async function createTenant(input: {
 }): Promise<CreatedTenant> {
   const existing = await getTenantBySlug(input.slug);
   if (existing) throw ApiError.conflict(`Tenant "${input.slug}" already exists`);
+
+  // Rejected here rather than discovered later. A zone Postgres does not know
+  // is caught at every award instead, which used to be a far more expensive
+  // way to find out about a typo.
+  if (input.timezone) {
+    const { isKnownTimezone } = await import('./rewards.js');
+    if (!(await isKnownTimezone(input.timezone.trim(), db()))) {
+      throw ApiError.badRequest(`"${input.timezone}" is not a timezone this server knows`);
+    }
+  }
 
   const tenant = await queryOne<Tenant>(
     db(),

@@ -16,6 +16,7 @@ import {
   verifyUnsubscribeRequest,
 } from '../src/services/newsletter.js';
 import { bufferCells, bufferedCounts, droppedCounters, flushCounters } from '../src/services/counters.js';
+import { forgetTimezone } from '../src/services/rewards.js';
 
 /**
  * Regression tests for an adversarial review of the surface added after the
@@ -438,5 +439,102 @@ describe('the public site key cannot rewrite reward roles (HIGH)', () => {
     // And the leaderboard, which evaluates the same predicate per row.
     const board = await authed('GET', '/v1/rewards/leaderboard');
     expect(board.statusCode).toBe(200);
+  });
+});
+
+describe('bad input is a 400, not a 500 (LOW)', () => {
+  it('rejects a non-uuid contactId instead of letting Postgres raise', async () => {
+    for (const url of [
+      '/v1/rewards/ledger?contactId=not-a-uuid',
+      '/v1/rewards/leaderboard?contactId=not-a-uuid',
+      '/v1/rewards/exclusions/not-a-uuid',
+    ]) {
+      const method = url.includes('exclusions') ? 'DELETE' : 'GET';
+      const res = await (await testApp()).inject({
+        method,
+        url,
+        headers: { authorization: `Bearer ${tenant.secretKey}` },
+      });
+      expect(res.statusCode, url).toBe(400);
+    }
+  });
+
+  it('refuses an order total large enough to overflow the ledger', async () => {
+    // Unbounded, this multiplied out to more than a signed integer and the
+    // whole order transaction rolled back with "integer out of range" — the
+    // store lost the order record, not just the points.
+    const res = await authed('POST', '/v1/orders', {
+      orderRef: 'huge-1',
+      totalCents: 999_999_999_999,
+    });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it('treats a search term as text, not as a wildcard pattern', async () => {
+    const contact = JSON.parse(
+      (await authed('POST', '/v1/contacts', { email: 'search@example.com' })).body,
+    ).contact_id;
+
+    await authed('POST', '/v1/rewards/adjust', {
+      contactId: contact, points: 10, reason: '10xoff', idempotencyKey: 'search-1',
+    });
+    await authed('POST', '/v1/rewards/adjust', {
+      contactId: contact, points: 10, reason: '10_off', idempotencyKey: 'search-2',
+    });
+
+    const body = JSON.parse((await authed('GET', '/v1/rewards/ledger?search=10_off')).body);
+    expect(body.entries.map((entry: { reason: string }) => entry.reason)).toEqual(['10_off']);
+  });
+});
+
+describe('a bad tenant timezone does not abort the transaction (MEDIUM)', () => {
+  it('records the order instead of rolling it back once a minute forever', async () => {
+    // A zone Postgres does not know used to be discovered by running
+    // `SELECT now() AT TIME ZONE $1` inside the caller's transaction. The
+    // catch around it set 'UTC', but the raise had already aborted the
+    // transaction, so the award, the order row, its commissions and its cart
+    // conversion all went with it.
+    await db().query('UPDATE tenants SET timezone = $2 WHERE id = $1', [
+      tenant.id,
+      'Mars/Olympus_Mons',
+    ]);
+    forgetTimezone(tenant.id);
+
+    const res = await authed('POST', '/v1/orders', {
+      orderRef: 'tz-1',
+      totalCents: 10_000,
+      email: 'tz@example.com',
+    });
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body).points_awarded).toBeGreaterThan(0);
+  });
+
+  it('refuses to store an unknown zone in the first place', async () => {
+    const { createTenant } = await import('../src/services/tenants.js');
+    await expect(
+      createTenant({ slug: `tz-bad-${Date.now()}`, name: 'Bad zone', timezone: 'Mars/Olympus_Mons' }),
+    ).rejects.toMatchObject({ statusCode: 400 });
+  });
+});
+
+describe('an idempotency key names one operation (LOW)', () => {
+  it('will not report success for an award wearing another award’s key', async () => {
+    const first = JSON.parse(
+      (await authed('POST', '/v1/contacts', { email: 'key-a@example.com' })).body,
+    ).contact_id;
+    const second = JSON.parse(
+      (await authed('POST', '/v1/contacts', { email: 'key-b@example.com' })).body,
+    ).contact_id;
+
+    await authed('POST', '/v1/rewards/adjust', {
+      contactId: first, points: 100, reason: 'Theirs', idempotencyKey: 'shared-key',
+    });
+
+    // Same key, different contact. This used to return 200 "applied" with
+    // nobody's balance having changed.
+    const res = await authed('POST', '/v1/rewards/adjust', {
+      contactId: second, points: 100, reason: 'Mine', idempotencyKey: 'shared-key',
+    });
+    expect(res.statusCode).toBe(409);
   });
 });

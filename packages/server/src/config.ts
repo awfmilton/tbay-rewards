@@ -133,6 +133,16 @@ export function loadConfig() {
       minClaimWei: str('TBAY_MIN_CLAIM_WEI', '1000000000000000'),
       maxClaimWei: str('TBAY_MAX_CLAIM_WEI', '10000000000000000000000'),
       maxMintPerWindowWei: str('TBAY_MAX_MINT_PER_WINDOW_WEI', '100000000000000000000000'),
+      // What ONE retailer may issue in a window, in front of the shared
+      // ceiling above. Default 25,000 TBAY/hour — a quarter of the platform
+      // default, so a retailer has real headroom while no single one can
+      // exhaust the window for everybody else. '0' disables the per-tenant
+      // check, which is right for a single-tenant deployment.
+      tenantMintPerWindowWei: str('TBAY_TENANT_MINT_PER_WINDOW_WEI', '25000000000000000000000'),
+      // Lifetime issuance ceiling per retailer. '0' is unlimited, which is the
+      // sane default: the platform-wide reward supply cap is the real limit,
+      // and this exists for operators who want a per-retailer allocation.
+      tenantSupplyCapWei: str('TBAY_TENANT_SUPPLY_CAP_WEI', '0'),
       /**
        * Lifetime ceiling on reward tokens this platform will ever issue, in wei.
        * '0' means unlimited.

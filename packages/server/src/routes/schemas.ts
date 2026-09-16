@@ -132,11 +132,22 @@ export const subscribeSchema = z.object({
   website: z.string().max(0).optional(),
 });
 
+/**
+ * A hundred million currency units — a million dollars on one order.
+ *
+ * Unbounded, a fat-fingered or crafted total multiplied by a per-currency-unit
+ * rule overflowed `points_ledger.delta_points`, which is an integer: the order
+ * did not over-award, it failed with "integer out of range" and rolled the
+ * whole transaction back. A store loses the order record rather than the
+ * points. Refusing the absurd total up front says which number is wrong.
+ */
+const MAX_ORDER_CENTS = 100_000_000_00;
+
 export const orderSchema = z.object({
   orderRef: z.string().min(1).max(128),
   status: z.string().max(32).optional(),
-  totalCents: z.number().int().min(0),
-  subtotalCents: z.number().int().min(0).optional(),
+  totalCents: z.number().int().min(0).max(MAX_ORDER_CENTS),
+  subtotalCents: z.number().int().min(0).max(MAX_ORDER_CENTS).optional(),
   currency: z.string().length(3).optional(),
   items: z
     .array(
@@ -144,7 +155,7 @@ export const orderSchema = z.object({
         productRef: z.string().min(1).max(128),
         name: z.string().max(255).nullish(),
         quantity: z.number().int().positive().max(10_000),
-        subtotalCents: z.number().int().min(0),
+        subtotalCents: z.number().int().min(0).max(MAX_ORDER_CENTS),
         commissionRateBps: z.number().int().min(0).max(10_000).nullish(),
         // Category slugs, so per-category reward overrides can match a line.
         // Zod strips unknown keys, so without this the field was silently
