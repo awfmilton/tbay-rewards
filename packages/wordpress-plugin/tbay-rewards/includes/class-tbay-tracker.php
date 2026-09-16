@@ -116,6 +116,12 @@ class TBAY_Rewards_Tracker {
 					'noWalletMobile' => __( 'Phone browsers cannot talk to a wallet directly.', 'tbay-rewards' ),
 					'openInWallet'  => __( 'Open in MetaMask', 'tbay-rewards' ),
 					'redeeming'     => __( 'Preparing your claim…', 'tbay-rewards' ),
+					'redeemAmount'  => __( 'How many points would you like to use?', 'tbay-rewards' ),
+					'creditTooFew'  => __( 'You need a few more points before that is worth any credit.', 'tbay-rewards' ),
+					/* translators: 1: points, 2: money amount */
+					'creditConfirm' => __( 'Use {points} points for {amount} off your next order? This cannot be undone.', 'tbay-rewards' ),
+					'creditIssued'  => __( 'Done — your credit code is below.', 'tbay-rewards' ),
+					'creditCode'    => __( 'Your code', 'tbay-rewards' ),
 					'confirmWallet' => __( 'Confirm the transaction in your wallet.', 'tbay-rewards' ),
 					'claimed'       => __( 'Claimed. Your TBAY is on its way.', 'tbay-rewards' ),
 					'bridgeAmount'  => __( 'Enter how much TBAY to bridge.', 'tbay-rewards' ),

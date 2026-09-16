@@ -139,6 +139,25 @@
 	 * loses exactly the digits that matter and prints "0" for a real balance.
 	 * String arithmetic keeps all 18 decimals honest.
 	 */
+
+	/**
+	 * Cents to a readable amount.
+	 *
+	 * Intl when the browser has it, a plain two-decimal fallback when it does
+	 * not — a currency code beside a number is still clearer than raw cents.
+	 */
+	function formatMoney(cents, currency) {
+		var amount = (Number(cents) || 0) / 100;
+		try {
+			return new Intl.NumberFormat(undefined, {
+				style: 'currency',
+				currency: currency || 'USD'
+			}).format(amount);
+		} catch (e) {
+			return amount.toFixed(2) + ' ' + (currency || '');
+		}
+	}
+
 	function weiToTokens(wei) {
 		var digits = String(wei == null ? '0' : wei).replace(/[^0-9]/g, '') || '0';
 		while (digits.length < 19) digits = '0' + digits;
@@ -413,8 +432,74 @@
 		var addressEl = panel.querySelector('[data-tbay-wallet-address]');
 		var connectButton = panel.querySelector('[data-tbay-connect-wallet]');
 		var redeemButton = panel.querySelector('[data-tbay-redeem]');
+		var creditButton = panel.querySelector('[data-tbay-credit]');
+		var creditResult = panel.querySelector('[data-tbay-credit-result]');
 		var amountInput = panel.querySelector('[data-tbay-redeem-amount]');
 		var connected = null;
+
+		/**
+		 * Spend points for a store credit code.
+		 *
+		 * Confirmed first, because it is irreversible: the points are gone and
+		 * what comes back is a code for money off an order. A single click
+		 * should not be able to empty someone's balance.
+		 */
+		if (creditButton) {
+			creditButton.addEventListener('click', function () {
+				var points = parseInt(amountInput ? amountInput.value : '0', 10);
+				if (!points || points <= 0) {
+					setStatus(status, i18n.redeemAmount, 'error');
+					return;
+				}
+
+				rest('credit-quote?points=' + encodeURIComponent(points), null, 'GET')
+					.then(function (quote) {
+						var usable = quote.points || 0;
+						if (usable <= 0) {
+							throw new Error(
+								(i18n.creditTooFew || 'That is not enough points yet.') +
+								' (' + (quote.points_per_token || 0) + ')'
+							);
+						}
+
+						// Shows what they get before they lose anything, which
+						// is the whole reason the quote endpoint exists.
+						var confirmed = window.confirm(
+							(i18n.creditConfirm || 'Use {points} points for {amount}?')
+								.replace('{points}', String(usable))
+								.replace('{amount}', formatMoney(quote.amount_cents, quote.currency))
+						);
+						if (!confirmed) return null;
+
+						creditButton.disabled = true;
+						setStatus(status, i18n.redeeming, 'pending');
+						return rest('credit', { points: usable });
+					})
+					.then(function (result) {
+						if (!result) return;
+						setStatus(status, i18n.creditIssued || '', 'ok');
+						if (creditResult) {
+							creditResult.innerHTML =
+								'<p class="tbay-credit-code">' +
+								escapeHtml(i18n.creditCode || 'Your code') + ': <code>' +
+								escapeHtml(result.code) + '</code> — ' +
+								escapeHtml(formatMoney(result.amount_cents, result.currency)) +
+								'</p>';
+							creditResult.hidden = false;
+						}
+						if (amountInput && result.balance) {
+							amountInput.max = String(result.balance.balance);
+							amountInput.value = String(result.balance.balance);
+						}
+					})
+					['catch'](function (error) {
+						setStatus(status, friendlyError(error), 'error');
+					})
+					['finally'](function () {
+						creditButton.disabled = false;
+					});
+			});
+		}
 
 		function currentAddress() {
 			if (connected) return connected;

@@ -245,3 +245,98 @@ describe('flagswag import', () => {
     expect(rows[0].n).toBe(1);
   });
 });
+
+describe('myCred log history', () => {
+  it('brings the history across without moving the balance', async () => {
+    const { importMyCredBalances, importMyCredHistory } = await import(
+      '../src/importers/mycred.js'
+    );
+
+    await importMyCredBalances({
+      tenantId: tenant.id,
+      csv: 'user_email,balance\nveteran@example.com,750\n',
+    });
+
+    const history = await importMyCredHistory({
+      tenantId: tenant.id,
+      csv:
+        'id,user_email,creds,entry,ref,ctime\n' +
+        '1,veteran@example.com,100,Signed up,registration,1600000000\n' +
+        '2,veteran@example.com,250,Bought something,woocommerce_payment,1610000000\n' +
+        '3,veteran@example.com,400,Referred a friend,referral,1620000000\n',
+    });
+
+    expect(history.created).toBe(3);
+
+    const { rows } = await db().query<{ balance: number }>(
+      `SELECT balance FROM points_balances b
+         JOIN contacts c ON c.id = b.contact_id
+        WHERE c.email_normalised = 'veteran@example.com'`,
+    );
+    // The opening balance already accounts for every one of those entries.
+    // Replaying the deltas as well would double it.
+    expect(rows[0]!.balance).toBe(750);
+
+    const entries = await db().query<{ reason: string; delta_points: number; meta: { original_points: number } }>(
+      `SELECT reason, delta_points, meta FROM points_ledger
+        WHERE ref_type = 'import_history' ORDER BY created_at`,
+    );
+    expect(entries.rows.map((row) => row.reason)).toEqual([
+      'Signed up',
+      'Bought something',
+      'Referred a friend',
+    ]);
+    expect(entries.rows.every((row) => row.delta_points === 0)).toBe(true);
+    // The real number is kept so the history can still be read and reported on.
+    expect(entries.rows.map((row) => row.meta.original_points)).toEqual([100, 250, 400]);
+  });
+
+  it('keeps the original timestamps so history reads in order', async () => {
+    const { importMyCredBalances, importMyCredHistory } = await import(
+      '../src/importers/mycred.js'
+    );
+    await importMyCredBalances({
+      tenantId: tenant.id,
+      csv: 'user_email,balance\nold@example.com,10\n',
+    });
+    await importMyCredHistory({
+      tenantId: tenant.id,
+      csv: 'id,user_email,creds,entry,ctime\n9,old@example.com,10,Ancient,1600000000\n',
+    });
+
+    const { rows } = await db().query<{ created_at: Date }>(
+      `SELECT created_at FROM points_ledger WHERE ref_type = 'import_history'`,
+    );
+    expect(new Date(rows[0]!.created_at).getUTCFullYear()).toBe(2020);
+  });
+
+  it('re-runs without duplicating anything', async () => {
+    const { importMyCredBalances, importMyCredHistory } = await import(
+      '../src/importers/mycred.js'
+    );
+    const csv = 'id,user_email,creds,entry,ctime\n1,rerun@example.com,50,Thing,1600000000\n';
+
+    await importMyCredBalances({
+      tenantId: tenant.id,
+      csv: 'user_email,balance\nrerun@example.com,50\n',
+    });
+    await importMyCredHistory({ tenantId: tenant.id, csv });
+    const second = await importMyCredHistory({ tenantId: tenant.id, csv });
+
+    expect(second.created).toBe(0);
+    expect(second.skipped).toBe(1);
+  });
+
+  it('says so when a history row has no matching contact', async () => {
+    const { importMyCredHistory } = await import('../src/importers/mycred.js');
+    const report = await importMyCredHistory({
+      tenantId: tenant.id,
+      csv: 'id,user_email,creds,entry,ctime\n1,ghost@example.com,50,Thing,1600000000\n',
+    });
+
+    // Two exports that disagree is worth reporting, not silently creating a
+    // member out of a log line.
+    expect(report.created).toBe(0);
+    expect(report.warnings.join(' ')).toContain('import balances first');
+  });
+});
