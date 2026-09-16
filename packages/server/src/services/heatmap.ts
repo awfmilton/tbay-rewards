@@ -1,4 +1,11 @@
 import type { Queryable } from '../db/pool.js';
+import {
+  bufferCells,
+  bufferPage,
+  countersEnabled,
+  flushCounters,
+  shouldFlushNow,
+} from './counters.js';
 
 /**
  * Heatmaps are stored as a normalised grid, never as raw pointer traces.
@@ -70,6 +77,20 @@ export async function recordHeatmap(
   const cells = binSamples(batch.samples);
   if (cells.length === 0) return 0;
 
+  // With the buffer running, the increments are folded in memory and written
+  // by the flush timer. That takes the hot-row locks out of the request
+  // transaction entirely, which is where they were doing the damage.
+  if (countersEnabled()) {
+    bufferCells(tenantId, batch.pageKey, batch.deviceClass, batch.kind, cells);
+    bufferPage(tenantId, batch.pageKey, batch.deviceClass, {
+      points: cells.reduce((sum, cell) => sum + cell.weight, 0),
+      docHeight: batch.docHeight ?? null,
+      viewportWidth: batch.viewportWidth ?? null,
+    });
+    if (shouldFlushNow()) await flushCounters(runner);
+    return cells.length;
+  }
+
   const values: unknown[] = [tenantId, batch.pageKey, batch.deviceClass, batch.kind];
   const tuples: string[] = [];
   for (const cell of cells) {
@@ -128,6 +149,11 @@ export async function countHeatmapSession(
   pageKey: string,
   deviceClass: string,
 ): Promise<void> {
+  if (countersEnabled()) {
+    bufferPage(tenantId, pageKey, deviceClass, { sessions: 1 });
+    return;
+  }
+
   await runner.query(
     `INSERT INTO heatmap_pages (tenant_id, page_key, device_class, sample_sessions)
      VALUES ($1, $2, $3, 1)
