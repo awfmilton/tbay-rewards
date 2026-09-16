@@ -140,6 +140,51 @@ wallet address.
    request and a recorded L1 release.
 7. **Use `EMAIL_TRANSPORT=smtp` in production.** The `log` transport writes
    message bodies to the application log.
+8. **Size `TBAY_TENANT_MINT_PER_WINDOW_WEI` for your busiest retailer.** It is
+   what stops one store's misconfigured conversion rate consuming the hourly
+   mint allowance every other store's customers redeem against. Setting it to
+   `0` removes that protection, which is correct only when a single retailer
+   runs on the deployment.
+9. **Keep tenant timezones to IANA names.** The platform validates them at
+   tenant creation; a zone written straight into the database is checked at
+   award time and falls back to UTC, which silently shifts every daily cap.
+
+---
+
+## Tenant isolation
+
+A retailer's API key reaches that retailer's data and nothing else. Two layers
+enforce it, deliberately:
+
+- **Every query is tenant-scoped**, including the joins. A contact join matches
+  on `(id, tenant_id)`, not on `id` alone — otherwise a ledger row naming
+  another tenant's contact would hand the caller that stranger's name and
+  email.
+- **Composite foreign keys**, `(contact_id, tenant_id) -> contacts (id,
+  tenant_id)`, on the fifteen tables that hold money, a claim on the retailer,
+  or personal data. An endpoint that forgets to resolve a caller-supplied
+  contact id against the tenant gets a constraint violation rather than quietly
+  writing across the boundary.
+
+Contact ids supplied in a request body are resolved against the calling
+tenant *before* anything is written, not after — a check that runs once the
+transaction has committed reports an error while the rows persist.
+
+## What a public site key can and cannot do
+
+The public key sits in every page's source, so what it can reach is the
+platform's real anonymous attack surface. It can identify a contact by email,
+subscribe them to a list, and record events. It **cannot** write reserved
+contact attributes: `roles` in particular drives reward exclusions, so a
+visitor who could set it could clear an excluded staff account's exclusion, or
+set one on a customer's address to stop them earning. Reserved keys are
+dropped from public writes; the secret-key `/v1/contacts` endpoint still writes
+them.
+
+Separately, anything that is not a JSON array in `attributes.roles` reads as no
+roles at all, wherever it came from. A retailer's own integration can still
+write a bad value; it cannot turn that into an exception in the middle of a
+customer's checkout.
 
 ## Reporting a vulnerability
 

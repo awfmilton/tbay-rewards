@@ -23,22 +23,43 @@ The bugs those reviews found are all fixed; see the commit history for
 | **Bounce and complaint handling** | Conservative SMTP classification, an address-keyed suppression list, and RFC 8058 one-click `List-Unsubscribe` |
 | **Campaign delays and branching** | Automations are resumable step sequences: waits, branches evaluated against live data, gotos, and per-run step caps |
 | **Contact timeline** | One endpoint merging eleven sources, each limited before the union so a noisy source cannot crowd out a rare one |
-| **WordPress admin screens** | Six screens: customers, ledger, earning rules, badges and ranks, segments and sends, email |
+| **WordPress admin screens** | Seven screens: customers, ledger, earning rules, badges and ranks, segments and sends, email, currencies |
 | **Counter write amplification** | In-process buffering flushed on a timer, off the request path entirely |
 | **myCred control surfaces** | Exclusions, per-product overrides, weekly/monthly caps, per-award clamps, badge and rank CRUD, manual rank pinning, coupon balance bands and grants |
+| **Multiple point types** | A currency per retailer-defined type, each with its own rules, ranks, badges, coupons, transfers, leaderboard and balance |
+
+### Multiple point types, in detail
+
+The largest remaining myCred gap, and the one that touched every table
+referencing points. "Points" you spend and "status credits" you only
+accumulate is the classic pair, and the second only means anything if it
+genuinely cannot be spent — so `convertible` and `transferable` are properties
+of the currency rather than checks scattered through the call sites.
+
+What that buys, and what it cost:
+
+- `points_balances` is keyed per currency, so the non-negative constraint
+  applies per row and a spend in one can never draw on another.
+- A rule, rank, badge, coupon or transfer belongs to exactly one currency.
+  That is what keeps the cap and cooldown queries correct without a type
+  predicate: they scope by `rule_key`, and a rule's entries are all
+  denominated in the same thing.
+- Ranks are a ladder per currency, so a member holds one rank on each. The
+  manual pin moved from `contacts` to the balance row it pins — freezing the
+  spend ladder must not freeze the status ladder.
+- An unknown type key is an error, not a silent fall back to the default.
+  Quietly awarding the wrong currency is worse than refusing, because nobody
+  notices until a status board has spendable points on it.
+- An edit that does not name a currency leaves the existing one alone, rather
+  than resolving to the tenant default and moving the rule.
+
+Everything is additive and defaulted. A retailer who never creates a second
+type sees exactly what they saw before: the default `points` currency is
+installed with the tenant and every endpoint falls back to it.
 
 ---
 
 ## Still open
-
-### Multiple point types
-
-One ledger per tenant, no `point_type` column. Store credit and the TBAY token
-are separate stores of value, but there is no second *earn-and-spend* currency
-with its own rules, ranks and leaderboard.
-
-This is the largest remaining myCred gap and it touches every table that
-references points. Worth doing when a retailer asks for it, not before.
 
 ### Earning hooks beyond commerce
 

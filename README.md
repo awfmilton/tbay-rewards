@@ -36,8 +36,7 @@ Built for [tbay.tk LLC](https://tbay.tk).
   data, and cancellation when someone unsubscribes
 - A contact timeline merging orders, points, email, visits and everything else
 
-  *Not yet:* multiple point types, form-plugin earning hooks, buying points for
-  money. See [docs/ROADMAP.md](docs/ROADMAP.md).
+  *Not yet:* buying points for money. See [docs/ROADMAP.md](docs/ROADMAP.md).
 
 **Rewards and gamification (the myCred replacement)**
 - An append-only points ledger with idempotency keys and transactional balances
@@ -51,6 +50,9 @@ Built for [tbay.tk LLC](https://tbay.tk).
   balance bands and badge/rank grants, points-gated content
 - Social sharing that pays only when the shared link is actually clicked
 - Blog-writer commission links with refund-protection holds
+- More than one currency per retailer: spendable points beside status credits
+  that can never be cashed out or handed to another member, each with its own
+  rules, ranks, badges and leaderboard
 
 **TBAY token**
 - Points → TBAY via EIP-712 claim vouchers the customer submits themselves

@@ -107,6 +107,8 @@ The ones that matter most:
 | `TBAY_CHAIN_ID` | 300 = zkSync Sepolia, 324 = Era mainnet |
 | `TBAY_CLAIM_SIGNER_KEY` | Must hold `CLAIMER_ROLE`. Signing only — no gas needed |
 | `TBAY_REWARD_SUPPLY_CAP_WEI` | **Set before mainnet.** See [TOKEN.md](TOKEN.md) |
+| `TBAY_TENANT_MINT_PER_WINDOW_WEI` | What one retailer may issue per window, in front of the shared ceiling. Default 25,000 TBAY/hour; `0` disables it, which suits a single-tenant deployment |
+| `TBAY_TENANT_SUPPLY_CAP_WEI` | Lifetime issuance ceiling per retailer. Default `0`, unlimited |
 | `BRIDGE_OPERATOR_TOKEN` | Required before any L1 release can be recorded |
 | `EMAIL_TRANSPORT` | Use `smtp` in production — `log` writes bodies to the log |
 
@@ -187,6 +189,7 @@ Run exactly one `worker` container. More is safe (every job claims work with
 | Tracker 404s | `PUBLIC_URL` wrong, or the proxy is not forwarding `/tbay.js` |
 | `chain_unavailable` on bridging | No RPC configured; burns cannot be verified without one |
 | Reward allocation exhausted | `TBAY_REWARD_SUPPLY_CAP_WEI` reached — see [TOKEN.md](TOKEN.md) |
+| One store hits its allowance for the hour | `TBAY_TENANT_MINT_PER_WINDOW_WEI` reached. Working as intended: check that store's `pointsPerToken` before raising it |
 
 ---
 

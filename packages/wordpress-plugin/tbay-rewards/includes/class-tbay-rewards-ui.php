@@ -84,6 +84,7 @@ class TBAY_Rewards_UI {
 		$wallet       = (string) ( $balance['wallet_address'] ?? '' );
 		$credit_cents = (int) ( $balance['store_credit_cents'] ?? 0 );
 		$ledger       = is_array( $balance['ledger'] ?? null ) ? $balance['ledger'] : array();
+		$balances     = is_array( $balance['balances'] ?? null ) ? $balance['balances'] : array();
 
 		ob_start();
 		?>
@@ -138,6 +139,7 @@ class TBAY_Rewards_UI {
 				</div>
 			</div>
 
+			<?php $this->render_other_currencies( $balances ); ?>
 			<?php $this->render_rank_panel( $gamification ); ?>
 			<?php $this->render_badges_panel( $gamification, 12 ); ?>
 			<?php $this->render_wallet_panel( $wallet, $points, $chain ); ?>
@@ -148,6 +150,71 @@ class TBAY_Rewards_UI {
 		</div>
 		<?php
 		return (string) ob_get_clean();
+	}
+
+	/**
+	 * Every currency besides the default one.
+	 *
+	 * A store running only points never sees this: the list has one entry and
+	 * the panel does not render. A store running status credits alongside
+	 * points needs both on the page, or the second may as well not exist.
+	 *
+	 * @param array<int,array<string,mixed>> $balances One row per currency.
+	 */
+	private function render_other_currencies( array $balances ): void {
+		$others = array();
+		foreach ( $balances as $row ) {
+			if ( ! is_array( $row ) || 'points' === ( $row['point_type'] ?? 'points' ) ) {
+				continue;
+			}
+			$others[] = $row;
+		}
+		if ( empty( $others ) ) {
+			return;
+		}
+		?>
+		<div class="tbay-rewards__grid tbay-rewards__grid--secondary">
+			<?php foreach ( $others as $row ) : ?>
+				<div class="tbay-stat">
+					<span class="tbay-stat__label">
+						<?php echo esc_html( $this->currency_label( $row ) ); ?>
+					</span>
+					<strong class="tbay-stat__value">
+						<?php echo esc_html( number_format_i18n( (int) ( $row['balance'] ?? 0 ) ) ); ?>
+					</strong>
+					<?php if ( (int) ( $row['pending'] ?? 0 ) > 0 ) : ?>
+						<span class="tbay-stat__sub">
+							<?php
+							printf(
+								/* translators: %s: formatted number of pending points. */
+								esc_html__( '%s pending', 'tbay-rewards' ),
+								esc_html( number_format_i18n( (int) $row['pending'] ) )
+							);
+							?>
+						</span>
+					<?php endif; ?>
+				</div>
+			<?php endforeach; ?>
+		</div>
+		<?php
+	}
+
+	/**
+	 * What the retailer calls this currency.
+	 *
+	 * The name travels with the balance, so a currency named "Status Credits"
+	 * says so. Titlecasing the key is the fallback for an older server that
+	 * does not send one — and it is a poor one: it renders "status" as
+	 * "Status", which is why the name is sent at all.
+	 *
+	 * @param array<string,mixed> $row One balance row.
+	 */
+	private function currency_label( array $row ): string {
+		$name = trim( (string) ( $row['name'] ?? '' ) );
+		if ( '' !== $name ) {
+			return $name;
+		}
+		return ucwords( str_replace( '_', ' ', (string) ( $row['point_type'] ?? '' ) ) );
 	}
 
 	/**
@@ -591,10 +658,17 @@ class TBAY_Rewards_UI {
 	 */
 	public function render_leaderboard( $atts = array() ): string {
 		$atts = shortcode_atts(
-			array( 'limit' => '10', 'window' => 'all' ),
+			array( 'limit' => '10', 'window' => 'all', 'point_type' => '' ),
 			is_array( $atts ) ? $atts : array(),
 			'tbay_leaderboard'
 		);
+
+		// One board per currency. A store running status credits puts up
+		// [tbay_leaderboard point_type="status"] beside the points board;
+		// omitting it gives the retailer's default currency, as before.
+		$point_type = preg_match( '/^[a-z0-9_]{2,32}$/', (string) $atts['point_type'] )
+			? (string) $atts['point_type']
+			: '';
 
 		// A board nobody can still win is a board nobody looks at twice, so the
 		// timeframe is a shortcode attribute rather than a fixed all-time list.
@@ -615,6 +689,7 @@ class TBAY_Rewards_UI {
 					'limit'     => max( 1, (int) $atts['limit'] ),
 					'window'    => $atts['window'],
 					'contactId' => $contact_id,
+					'pointType' => $point_type,
 				)
 			),
 			// Short for a signed-in viewer, because their own position moves;

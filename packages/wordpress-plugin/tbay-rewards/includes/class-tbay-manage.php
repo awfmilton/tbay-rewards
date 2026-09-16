@@ -29,6 +29,7 @@ class TBAY_Rewards_Manage {
 		'gamification' => 'Badges & ranks',
 		'marketing'    => 'Segments & sends',
 		'email'        => 'Email',
+		'currencies'   => 'Currencies',
 	);
 
 	public function __construct( private TBAY_Rewards_API $api ) {
@@ -111,6 +112,9 @@ class TBAY_Rewards_Manage {
 			case 'email':
 				$this->screen_email();
 				break;
+			case 'currencies':
+				$this->screen_currencies();
+				break;
 			default:
 				$this->screen_customers();
 		}
@@ -189,6 +193,8 @@ class TBAY_Rewards_Manage {
 			'send_broadcast'   => $this->do_send_broadcast(),
 			'cancel_broadcast' => $this->do_cancel_broadcast(),
 			'save_template'    => $this->do_save_template(),
+			'save_point_type'  => $this->do_save_point_type(),
+			'delete_point_type' => $this->do_delete_point_type(),
 			'suppress_email'   => $this->do_suppress_email(),
 			'unsuppress_email' => $this->do_unsuppress_email(),
 			default            => new WP_Error( 'tbay_unknown', __( 'Unknown action.', 'tbay-rewards' ) ),
@@ -508,6 +514,7 @@ class TBAY_Rewards_Manage {
 				<tr>
 					<th><?php esc_html_e( 'Rule', 'tbay-rewards' ); ?></th>
 					<th><?php esc_html_e( 'Points', 'tbay-rewards' ); ?></th>
+					<th><?php esc_html_e( 'Currency', 'tbay-rewards' ); ?></th>
 					<th><?php esc_html_e( 'Caps', 'tbay-rewards' ); ?></th>
 					<th><?php esc_html_e( 'On', 'tbay-rewards' ); ?></th>
 					<th></th>
@@ -527,6 +534,7 @@ class TBAY_Rewards_Manage {
 							: esc_html( number_format_i18n( (int) ( $rule['points'] ?? 0 ) ) );
 						?>
 					</td>
+					<td><code><?php echo esc_html( (string) ( $rule['point_type'] ?? 'points' ) ); ?></code></td>
 					<td><?php echo esc_html( $this->cap_summary( $rule ) ); ?></td>
 					<td><?php echo ( $rule['enabled'] ?? false ) ? esc_html__( 'Yes', 'tbay-rewards' ) : esc_html__( 'No', 'tbay-rewards' ); ?></td>
 					<td>
@@ -1330,4 +1338,148 @@ class TBAY_Rewards_Manage {
 		);
 		return is_wp_error( $result ) ? $result : __( 'That address can be emailed again.', 'tbay-rewards' );
 	}
+
+	// ── Currencies ───────────────────────────────────────────────────────────
+
+	/**
+	 * More than one currency, side by side.
+	 *
+	 * "Points" you spend and "status credits" you only accumulate is the
+	 * classic pair, and the second only means anything if it genuinely cannot
+	 * be spent — which is what the two checkboxes here decide. A store that
+	 * never adds a second currency sees one row and can ignore this screen.
+	 */
+	private function screen_currencies(): void {
+		$result = $this->api->request( 'GET', '/v1/point-types' );
+		$types  = is_wp_error( $result ) ? array() : ( $result['point_types'] ?? array() );
+
+		echo '<h2>' . esc_html__( 'What customers earn', 'tbay-rewards' ) . '</h2>';
+		?>
+		<table class="widefat striped">
+			<thead>
+				<tr>
+					<th><?php esc_html_e( 'Currency', 'tbay-rewards' ); ?></th>
+					<th><?php esc_html_e( 'Default', 'tbay-rewards' ); ?></th>
+					<th><?php esc_html_e( 'Cashable', 'tbay-rewards' ); ?></th>
+					<th><?php esc_html_e( 'Sendable', 'tbay-rewards' ); ?></th>
+					<th></th>
+				</tr>
+			</thead>
+			<tbody>
+			<?php foreach ( $types as $type ) : ?>
+				<?php $key = (string) ( $type['key'] ?? '' ); ?>
+				<tr>
+					<td>
+						<strong><?php echo esc_html( (string) ( $type['name'] ?? $key ) ); ?></strong><br />
+						<code><?php echo esc_html( $key ); ?></code>
+					</td>
+					<td><?php echo ( $type['is_default'] ?? false ) ? esc_html__( 'Yes', 'tbay-rewards' ) : '—'; ?></td>
+					<td><?php echo ( $type['convertible'] ?? false ) ? esc_html__( 'Yes', 'tbay-rewards' ) : '—'; ?></td>
+					<td><?php echo ( $type['transferable'] ?? false ) ? esc_html__( 'Yes', 'tbay-rewards' ) : '—'; ?></td>
+					<td>
+						<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="tbay-row-form">
+							<?php wp_nonce_field( 'tbay_manage' ); ?>
+							<input type="hidden" name="action" value="tbay_manage" />
+							<input type="hidden" name="tbay_action" value="save_point_type" />
+							<input type="hidden" name="tbay_screen" value="currencies" />
+							<input type="hidden" name="key" value="<?php echo esc_attr( $key ); ?>" />
+							<label>
+								<input type="checkbox" name="convertible" value="1" <?php checked( (bool) ( $type['convertible'] ?? false ) ); ?> />
+								<?php esc_html_e( 'Cashable', 'tbay-rewards' ); ?>
+							</label>
+							<label>
+								<input type="checkbox" name="transferable" value="1" <?php checked( (bool) ( $type['transferable'] ?? false ) ); ?> />
+								<?php esc_html_e( 'Sendable', 'tbay-rewards' ); ?>
+							</label>
+							<?php submit_button( __( 'Save', 'tbay-rewards' ), 'small', '', false ); ?>
+						</form>
+					</td>
+				</tr>
+			<?php endforeach; ?>
+			</tbody>
+		</table>
+
+		<h3><?php esc_html_e( 'Add a currency', 'tbay-rewards' ); ?></h3>
+		<p class="description">
+			<?php
+			esc_html_e(
+				'Leave both boxes unticked for a status currency: one members accumulate but can never cash out or hand to each other. That restriction is what makes it mean something.',
+				'tbay-rewards'
+			);
+			?>
+		</p>
+		<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
+			<?php wp_nonce_field( 'tbay_manage' ); ?>
+			<input type="hidden" name="action" value="tbay_manage" />
+			<input type="hidden" name="tbay_action" value="save_point_type" />
+			<input type="hidden" name="tbay_screen" value="currencies" />
+			<table class="form-table">
+				<tr>
+					<th scope="row"><label for="tbay-pt-key"><?php esc_html_e( 'Key', 'tbay-rewards' ); ?></label></th>
+					<td>
+						<input type="text" id="tbay-pt-key" name="key" class="regular-text"
+							pattern="[a-z0-9_]{2,32}" required />
+						<p class="description"><?php esc_html_e( '2-32 characters of a-z, 0-9 or underscore. It cannot be changed later.', 'tbay-rewards' ); ?></p>
+					</td>
+				</tr>
+				<tr>
+					<th scope="row"><label for="tbay-pt-name"><?php esc_html_e( 'Name', 'tbay-rewards' ); ?></label></th>
+					<td><input type="text" id="tbay-pt-name" name="name" class="regular-text" /></td>
+				</tr>
+				<tr>
+					<th scope="row"><?php esc_html_e( 'Wording', 'tbay-rewards' ); ?></th>
+					<td>
+						<input type="text" name="singular" placeholder="<?php esc_attr_e( 'status credit', 'tbay-rewards' ); ?>" />
+						<input type="text" name="plural" placeholder="<?php esc_attr_e( 'status credits', 'tbay-rewards' ); ?>" />
+					</td>
+				</tr>
+				<tr>
+					<th scope="row"><?php esc_html_e( 'Rules', 'tbay-rewards' ); ?></th>
+					<td>
+						<label><input type="checkbox" name="convertible" value="1" /> <?php esc_html_e( 'Can be exchanged for store credit or TBAY', 'tbay-rewards' ); ?></label><br />
+						<label><input type="checkbox" name="transferable" value="1" /> <?php esc_html_e( 'Can be sent to another member', 'tbay-rewards' ); ?></label>
+					</td>
+				</tr>
+			</table>
+			<?php submit_button( __( 'Add currency', 'tbay-rewards' ) ); ?>
+		</form>
+		<?php
+	}
+
+	private function do_save_point_type(): string|WP_Error {
+		$key = $this->post( 'key' );
+		if ( ! preg_match( '/^[a-z0-9_]{2,32}$/', $key ) ) {
+			return new WP_Error(
+				'tbay_bad_input',
+				__( 'A currency key is 2-32 characters of a-z, 0-9 or underscore.', 'tbay-rewards' )
+			);
+		}
+
+		$payload = array(
+			'convertible'  => isset( $_POST['convertible'] ),
+			'transferable' => isset( $_POST['transferable'] ),
+		);
+
+		// Only sent when filled in, so the inline row form — which has no name
+		// or wording fields — does not blank them on the way past.
+		foreach ( array( 'name', 'singular', 'plural' ) as $field ) {
+			$value = $this->post( $field );
+			if ( '' !== $value ) {
+				$payload[ $field ] = $value;
+			}
+		}
+
+		$result = $this->api->request( 'PUT', '/v1/point-types/' . rawurlencode( $key ), $payload );
+		return is_wp_error( $result ) ? $result : __( 'Currency saved.', 'tbay-rewards' );
+	}
+
+	private function do_delete_point_type(): string|WP_Error {
+		$key = $this->post( 'key' );
+		if ( '' === $key ) {
+			return new WP_Error( 'tbay_bad_input', __( 'Which currency?', 'tbay-rewards' ) );
+		}
+		$result = $this->api->request( 'DELETE', '/v1/point-types/' . rawurlencode( $key ) );
+		return is_wp_error( $result ) ? $result : __( 'Currency removed.', 'tbay-rewards' );
+	}
+
 }

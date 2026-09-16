@@ -134,7 +134,8 @@ Voids commissions and reverses purchase points.
 | `GET` / `PUT /v1/rewards/rules` | Read and configure reward rules |
 | `POST /v1/rewards/trigger` | Apply a rule to a contact |
 | `GET /v1/rewards/balance` | Balance, conversion quote, recent ledger |
-| `GET /v1/rewards/leaderboard` | Top earners |
+| `GET /v1/rewards/leaderboard` | Top earners, per currency |
+| `GET` / `PUT` / `DELETE /v1/point-types` | Currencies — see below |
 | `POST` / `GET /v1/shares` | Create a share link; list shares |
 
 `POST /v1/rewards/trigger` returns `{ awarded: false, reason }` rather than
@@ -394,11 +395,81 @@ entries visible.
 
 ### Leaderboard
 
-`GET /v1/rewards/leaderboard?window=month&limit=10&contactId=…`
+`GET /v1/rewards/leaderboard?window=month&limit=10&contactId=…&pointType=status`
 
 `window` is `all` (default), `day`, `week`, `month` or `year`. Passing
 `contactId` returns `you` with that member's rank even when they are below the
 cut. Excluded contacts never appear.
+
+`pointType` picks the currency to rank; omitting it gives the retailer's
+default. One board per currency — summing them would rank a member's
+unspendable status credits against another's spendable points. The response
+echoes `point_type`.
+
+---
+
+## Point types (secret)
+
+More than one currency per retailer. A retailer who never creates a second one
+never touches this: the default `points` currency is installed with the tenant
+and every endpoint below falls back to it.
+
+| Route | Purpose |
+|---|---|
+| `GET /v1/point-types` | List the retailer's currencies |
+| `PUT /v1/point-types/:key` | Create or update one |
+| `DELETE /v1/point-types/:key` | Remove one nobody holds |
+
+A key is 2–32 characters of `a-z`, `0-9` or underscore. The body takes `name`,
+`singular`, `plural`, `isDefault`, `convertible`, `transferable`,
+`displayOrder` and `enabled`.
+
+```json
+{
+  "name": "Status Credits",
+  "singular": "status credit",
+  "plural": "status credits",
+  "convertible": false,
+  "transferable": false
+}
+```
+
+`convertible` decides whether it can become store credit or TBAY;
+`transferable` whether it can be sent to another member. Both default to
+**false** on a new currency, because a status currency that can be cashed out
+is just a second wallet. The default `points` currency has both.
+
+Deleting a currency members still hold is refused — the ledger is append-only
+and a balance is a claim on the retailer. Zero the balances first. The default
+currency cannot be deleted at all.
+
+### Naming a currency elsewhere
+
+Every points-bearing endpoint takes an optional `pointType` (or `point_type`
+on a stored record), and falls back to the default when it is absent:
+
+| Where | Field |
+|---|---|
+| `PUT /v1/rewards/rules` | `pointType` — which currency the rule pays |
+| `POST /v1/rewards/adjust` | `pointType` |
+| `GET /v1/rewards/balance`, `GET /v1/rewards/ledger` | `pointType` filters the ledger |
+| `GET /v1/rewards/leaderboard` | `pointType` |
+| `PUT /v1/gamification/badges/:key`, `/ranks/:key` | `pointType` — which ladder |
+| `POST /v1/gamification/transfer` | `pointType` (refused unless transferable) |
+| `POST /v1/gamification/coupons` | `pointType` — what the code pays out |
+| `POST /v1/gamification/content/unlock` | `pointType` |
+| `POST /v1/token/redeem`, `POST /v1/credit/redeem` | `pointType` (refused unless convertible) |
+
+An **unknown key is a 400**, never a silent fall back to the default: quietly
+awarding the wrong currency is worse than refusing, because nobody notices
+until a status board has spendable points on it.
+
+An update that does not name a currency leaves the record's alone. Renaming a
+status rule does not move it onto the default currency.
+
+`GET /v1/rewards/balance` and `GET /v1/contacts/lookup` both return `points`
+(the default currency, unchanged for existing callers) alongside `balances`,
+one row per enabled currency carrying the retailer's own wording.
 
 ### Reward rule fields
 
