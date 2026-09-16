@@ -6,6 +6,7 @@ import { approveMaturedCommissions } from '../services/commissions.js';
 import { expireStaleShares } from '../services/shares.js';
 import { expireStaleClaims, reconcileClaims } from '../services/token.js';
 import { purgeExpiredChallenges } from '../services/wallets.js';
+import { buildAllSegments } from '../services/segments.js';
 
 /**
  * Background jobs.
@@ -37,6 +38,11 @@ export const JOBS: Job[] = [
   { name: 'claim_reconcile', intervalMs: 120_000, run: () => reconcileClaims() },
   { name: 'webhook_delivery', intervalMs: 20_000, run: () => deliverWebhooks() },
   { name: 'challenge_purge', intervalMs: 3_600_000, run: () => purgeExpiredChallenges() },
+  // Every ten minutes rather than every minute: a segment is a marketing
+  // audience, not a real-time signal, and rebuilding one is a full scan of
+  // contacts per segment. Anything needing to act the moment a contact changes
+  // should be an automation trigger instead.
+  { name: 'segment_build', intervalMs: 600_000, run: () => buildAllSegments() },
 ];
 
 const timers: NodeJS.Timeout[] = [];
