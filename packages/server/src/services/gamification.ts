@@ -445,17 +445,24 @@ export async function upsertBadge(
     `INSERT INTO badges (
        tenant_id, key, name, description, image_url, criteria, tiers,
        points_per_tier, manual_only, display_order, enabled
-     ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, $9, $10, $11)
+     ) VALUES (
+       $1, $2, $3, $4, $5,
+       -- COALESCE here, not only in the UPDATE below: on a fresh insert there
+       -- is no existing row to fall back to, and these columns are NOT NULL.
+       COALESCE($6::jsonb, '{}'::jsonb),
+       COALESCE($7::jsonb, '[]'::jsonb),
+       COALESCE($8, 0), COALESCE($9, false), COALESCE($10, 0), COALESCE($11, true)
+     )
      ON CONFLICT (tenant_id, key) DO UPDATE SET
        name = COALESCE(EXCLUDED.name, badges.name),
        description = COALESCE(EXCLUDED.description, badges.description),
        image_url = EXCLUDED.image_url,
-       criteria = COALESCE(EXCLUDED.criteria, badges.criteria),
-       tiers = COALESCE(EXCLUDED.tiers, badges.tiers),
-       points_per_tier = COALESCE(EXCLUDED.points_per_tier, badges.points_per_tier),
-       manual_only = COALESCE(EXCLUDED.manual_only, badges.manual_only),
-       display_order = COALESCE(EXCLUDED.display_order, badges.display_order),
-       enabled = COALESCE(EXCLUDED.enabled, badges.enabled),
+       criteria = COALESCE($6::jsonb, badges.criteria),
+       tiers = COALESCE($7::jsonb, badges.tiers),
+       points_per_tier = COALESCE($8, badges.points_per_tier),
+       manual_only = COALESCE($9, badges.manual_only),
+       display_order = COALESCE($10, badges.display_order),
+       enabled = COALESCE($11, badges.enabled),
        updated_at = now()
      RETURNING *`,
     [
@@ -570,17 +577,21 @@ export async function upsertRank(
     `INSERT INTO ranks (
        tenant_id, key, name, description, image_url, min_points, max_points,
        perks, manual_only, display_order, enabled
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11)
+     ) VALUES (
+       $1, $2, $3, $4, $5, COALESCE($6, 0), $7,
+       COALESCE($8::jsonb, '{}'::jsonb),
+       COALESCE($9, false), COALESCE($10, 0), COALESCE($11, true)
+     )
      ON CONFLICT (tenant_id, key) DO UPDATE SET
        name = COALESCE(EXCLUDED.name, ranks.name),
        description = COALESCE(EXCLUDED.description, ranks.description),
        image_url = EXCLUDED.image_url,
-       min_points = COALESCE(EXCLUDED.min_points, ranks.min_points),
+       min_points = COALESCE($6, ranks.min_points),
        max_points = EXCLUDED.max_points,
-       perks = COALESCE(EXCLUDED.perks, ranks.perks),
-       manual_only = COALESCE(EXCLUDED.manual_only, ranks.manual_only),
-       display_order = COALESCE(EXCLUDED.display_order, ranks.display_order),
-       enabled = COALESCE(EXCLUDED.enabled, ranks.enabled)
+       perks = COALESCE($8::jsonb, ranks.perks),
+       manual_only = COALESCE($9, ranks.manual_only),
+       display_order = COALESCE($10, ranks.display_order),
+       enabled = COALESCE($11, ranks.enabled)
      RETURNING *`,
     [
       tenantId,
@@ -771,6 +782,15 @@ export async function assignRankManually(
 
     await client.query(
       'UPDATE contacts SET rank_locked = true, updated_at = now() WHERE tenant_id = $1 AND id = $2',
+      [tenantId, contactId],
+    );
+    // Seed the balance row first. A member who has never earned anything has
+    // no row, so the UPDATE below would touch nothing and the pin would
+    // silently do nothing — which is exactly the case an admin hand-assigning
+    // a tier is most likely to hit.
+    await client.query(
+      `INSERT INTO points_balances (tenant_id, contact_id) VALUES ($1, $2)
+       ON CONFLICT (tenant_id, contact_id) DO NOTHING`,
       [tenantId, contactId],
     );
     await client.query(
@@ -1023,6 +1043,51 @@ export interface TransferResult {
   points: number;
 }
 
+/** Sending windows, mirroring myCred's daily/weekly/monthly transfer limits. */
+const TRANSFER_WINDOWS = [
+  { key: 'dailyLimit', unit: 'day', label: 'daily' },
+  { key: 'weeklyLimit', unit: 'week', label: 'weekly' },
+  { key: 'monthlyLimit', unit: 'month', label: 'monthly' },
+] as const;
+
+export interface TransferLimits {
+  minimum: number;
+  dailyLimit: number | null;
+  weeklyLimit: number | null;
+  monthlyLimit: number | null;
+}
+
+/**
+ * Per-tenant transfer limits, read from tenant settings.
+ *
+ * Unset means unlimited, which is what every existing tenant has, so this
+ * changes nothing until a retailer opts in. The minimum defaults to 1 — a
+ * zero-point transfer is already rejected as a non-positive integer.
+ */
+export async function transferLimitsFor(
+  tenantId: string,
+  runner: Queryable = db(),
+): Promise<TransferLimits> {
+  const row = await queryOne<{ settings: Record<string, unknown> | null }>(
+    runner,
+    'SELECT settings FROM tenants WHERE id = $1',
+    [tenantId],
+  );
+  const settings = row?.settings ?? {};
+
+  const positive = (value: unknown): number | null => {
+    const n = Number(value);
+    return Number.isFinite(n) && n > 0 ? Math.trunc(n) : null;
+  };
+
+  return {
+    minimum: positive(settings.transferMinimum) ?? 1,
+    dailyLimit: positive(settings.transferDailyLimit),
+    weeklyLimit: positive(settings.transferWeeklyLimit),
+    monthlyLimit: positive(settings.transferMonthlyLimit),
+  };
+}
+
 /**
  * Move points from one member to another.
  *
@@ -1048,6 +1113,49 @@ export async function transferPoints(
       [tenantId, input.toContactId],
     );
     if (!recipient) throw ApiError.notFound('No such recipient');
+
+    // Lock both balances up front, in contact_id order.
+    //
+    // `spend` locks the sender and `award` locks the recipient, so A sending to
+    // B at the same moment B sends to A took the two locks in opposite orders
+    // and deadlocked. A canonical order makes that impossible; the rows may not
+    // exist yet, which is harmless — whichever transaction creates one wins and
+    // the other sees it.
+    const pair = [input.fromContactId, input.toContactId].sort();
+    await client.query(
+      `SELECT contact_id FROM points_balances
+        WHERE tenant_id = $1 AND contact_id = ANY($2::uuid[])
+        ORDER BY contact_id
+        FOR UPDATE`,
+      [tenantId, pair],
+    );
+
+    const limits = await transferLimitsFor(tenantId, client);
+
+    if (input.points < limits.minimum) {
+      throw ApiError.unprocessable(
+        `The smallest transfer is ${limits.minimum} points`,
+        { minimum: limits.minimum },
+      );
+    }
+
+    for (const window of TRANSFER_WINDOWS) {
+      const cap = limits[window.key];
+      if (cap === null) continue;
+      const sent = await queryOne<{ total: string }>(
+        client,
+        `SELECT COALESCE(SUM(points), 0) AS total FROM point_transfers
+          WHERE tenant_id = $1 AND from_contact_id = $2
+            AND created_at >= date_trunc($3, now())`,
+        [tenantId, input.fromContactId, window.unit],
+      );
+      if (Number(sent?.total ?? 0) + input.points > cap) {
+        throw ApiError.unprocessable(
+          `That is over your ${window.label} sending limit of ${cap} points`,
+          { limit: cap, window: window.unit, already_sent: Number(sent?.total ?? 0) },
+        );
+      }
+    }
 
     const reference = `${input.fromContactId}:${input.toContactId}:${Date.now()}`;
 

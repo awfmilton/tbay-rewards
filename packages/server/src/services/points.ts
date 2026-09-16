@@ -426,3 +426,91 @@ export async function listLedger(
   );
   return rows;
 }
+
+export interface LedgerQuery {
+  /** Omit for every contact — the view support needs to answer a question. */
+  contactId?: string | null;
+  ruleKey?: string | null;
+  refType?: string | null;
+  status?: LedgerEntry['status'] | null;
+  /** 'credit' for awards only, 'debit' for spends only. */
+  direction?: 'credit' | 'debit' | null;
+  from?: Date | null;
+  to?: Date | null;
+  /** Matches the reason text or the contact's email. */
+  search?: string | null;
+  limit?: number;
+  offset?: number;
+}
+
+export interface LedgerRow extends LedgerEntry {
+  contact_email: string | null;
+  contact_name: string | null;
+}
+
+/**
+ * Search the ledger across contacts.
+ *
+ * `listLedger` above answers "what did this person earn", which is the
+ * storefront's question. This one answers support's: "why does this customer
+ * say they are missing 250 points", which needs a date range, a rule filter
+ * and a search across everyone.
+ *
+ * The ledger stays append-only — there is deliberately no edit or delete here,
+ * unlike myCred's admin log. A mistake is corrected with `reverse()`, which
+ * leaves both entries visible.
+ */
+export async function queryLedger(
+  tenantId: string,
+  query: LedgerQuery = {},
+  runner: Queryable = db(),
+): Promise<{ rows: LedgerRow[]; total: number }> {
+  const limit = Math.min(Math.max(query.limit ?? 50, 1), 1000);
+  const offset = Math.max(query.offset ?? 0, 0);
+
+  const where: string[] = ['l.tenant_id = $1'];
+  const params: unknown[] = [tenantId];
+  const add = (clause: string, value: unknown) => {
+    params.push(value);
+    where.push(clause.replace('$?', `$${params.length}`));
+  };
+
+  if (query.contactId) add('l.contact_id = $?', query.contactId);
+  if (query.ruleKey) add('l.rule_key = $?', query.ruleKey);
+  if (query.refType) add('l.ref_type = $?', query.refType);
+  if (query.status) add('l.status = $?', query.status);
+  if (query.direction === 'credit') where.push('l.delta_points > 0');
+  if (query.direction === 'debit') where.push('l.delta_points < 0');
+  if (query.from) add('l.created_at >= $?', query.from);
+  if (query.to) add('l.created_at < $?', query.to);
+  if (query.search) {
+    // ILIKE with a leading wildcard cannot use a btree, so this is bounded by
+    // the other filters. Support always has at least a date range in practice.
+    params.push(`%${query.search}%`);
+    where.push(
+      `(l.reason ILIKE $${params.length} OR c.email ILIKE $${params.length} OR c.name ILIKE $${params.length})`,
+    );
+  }
+
+  const clause = where.join(' AND ');
+
+  const totalRow = await queryOne<{ n: string }>(
+    runner,
+    `SELECT COUNT(*) AS n FROM points_ledger l
+       LEFT JOIN contacts c ON c.id = l.contact_id
+      WHERE ${clause}`,
+    params,
+  );
+
+  const { rows } = await runner.query<LedgerRow>(
+    `SELECT l.*, c.email AS contact_email, c.name AS contact_name
+       FROM points_ledger l
+       LEFT JOIN contacts c ON c.id = l.contact_id
+      WHERE ${clause}
+      ORDER BY l.created_at DESC, l.id DESC
+      LIMIT ${limit} OFFSET ${offset}`,
+    params,
+  );
+
+  return { rows, total: Number(totalRow?.n ?? 0) };
+}

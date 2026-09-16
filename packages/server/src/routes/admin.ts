@@ -5,6 +5,7 @@ import { ApiError } from '../lib/errors.js';
 import { parse } from './collect.js';
 import { contactHandleSchema } from './schemas.js';
 import { requireContact } from '../services/contacts.js';
+import { queryLedger, type LedgerQuery } from '../services/points.js';
 import {
   DEFAULT_TEMPLATES,
   deleteTemplate,
@@ -151,6 +152,77 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     return { removed: await deleteProductRule(tenant.id, request.params.id) };
   });
 
+  // ── Ledger search and export ───────────────────────────────────────────────
+
+  app.get<{ Querystring: Record<string, string | undefined> }>(
+    '/v1/rewards/ledger',
+    async (request) => {
+      const tenant = tenantOf(request);
+      const query = parseLedgerQuery(request.query);
+      const result = await queryLedger(tenant.id, query);
+      return {
+        total: result.total,
+        limit: query.limit,
+        offset: query.offset,
+        entries: result.rows,
+      };
+    },
+  );
+
+  /**
+   * CSV of the same query.
+   *
+   * Capped at 50,000 rows and built in memory, which is the honest limit of
+   * this approach — a tenant needing more should page the JSON endpoint. The
+   * cap is enforced rather than silently truncating: a short export that looks
+   * complete is worse than a refusal.
+   */
+  app.get<{ Querystring: Record<string, string | undefined> }>(
+    '/v1/rewards/ledger.csv',
+    async (request, reply) => {
+      const tenant = tenantOf(request);
+      const query = parseLedgerQuery(request.query, { limit: 50_000, maxLimit: 50_000 });
+
+      const result = await queryLedger(tenant.id, query);
+      if (result.total > 50_000) {
+        throw ApiError.unprocessable(
+          `That range has ${result.total} entries, above the 50,000 export limit. Narrow the dates.`,
+          { total: result.total, limit: 50_000 },
+        );
+      }
+
+      const header = [
+        'created_at', 'contact_id', 'contact_email', 'contact_name',
+        'delta_points', 'reason', 'rule_key', 'ref_type', 'ref_id', 'status',
+      ];
+      const lines = [header.join(',')];
+      for (const row of result.rows) {
+        lines.push(
+          [
+            new Date(row.created_at).toISOString(),
+            row.contact_id,
+            row.contact_email ?? '',
+            row.contact_name ?? '',
+            String(row.delta_points),
+            row.reason,
+            row.rule_key ?? '',
+            row.ref_type ?? '',
+            row.ref_id ?? '',
+            row.status,
+          ]
+            .map(csvCell)
+            .join(','),
+        );
+      }
+
+      const stamp = new Date().toISOString().slice(0, 10);
+      reply
+        .header('content-type', 'text/csv; charset=utf-8')
+        .header('content-disposition', `attachment; filename="points-ledger-${stamp}.csv"`);
+      return lines.join('\r\n');
+    },
+  );
+
   // ── Badges ─────────────────────────────────────────────────────────────────
 
   app.get('/v1/gamification/badges/admin', async (request) => {
@@ -278,4 +350,62 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     const input = parse(schema, request.body ?? {});
     return reevaluateAll(tenant.id, input);
   });
+}
+
+/** Shared by the JSON and CSV ledger endpoints so they cannot drift. */
+function parseLedgerQuery(
+  query: Record<string, string | undefined>,
+  defaults: { limit?: number; maxLimit?: number } = {},
+): LedgerQuery & { limit: number; offset: number } {
+  const maxLimit = defaults.maxLimit ?? 1000;
+  const limit = Math.min(
+    Math.max(Number(query.limit) || defaults.limit || 50, 1),
+    maxLimit,
+  );
+
+  const date = (value: string | undefined): Date | null => {
+    if (!value) return null;
+    const parsed = new Date(value);
+    // An unparseable date would become `Invalid Date` and silently match
+    // nothing, which reads as "no results" rather than "bad input".
+    if (Number.isNaN(parsed.getTime())) {
+      throw ApiError.badRequest(`"${value}" is not a date the server understands`);
+    }
+    return parsed;
+  };
+
+  const status = (['pending', 'cleared', 'reversed'] as const).find(
+    (candidate) => candidate === query.status,
+  );
+  const direction = (['credit', 'debit'] as const).find(
+    (candidate) => candidate === query.direction,
+  );
+
+  return {
+    contactId: query.contactId ?? null,
+    ruleKey: query.ruleKey ?? null,
+    refType: query.refType ?? null,
+    status: status ?? null,
+    direction: direction ?? null,
+    from: date(query.from),
+    to: date(query.to),
+    search: query.search ? query.search.slice(0, 120) : null,
+    limit,
+    offset: Math.max(Number(query.offset) || 0, 0),
+  };
+}
+
+/**
+ * Quote a CSV field.
+ *
+ * The leading apostrophe on =, +, - and @ is deliberate: without it a reason
+ * or customer name starting with one of those is executed as a formula when
+ * the file is opened in Excel or Sheets. A ledger export is exactly the kind
+ * of file someone opens in a spreadsheet, and the text came from the public
+ * internet.
+ */
+function csvCell(value: string): string {
+  const text = String(value ?? '');
+  const guarded = /^[=+\-@\t\r]/.test(text) ? `'${text}` : text;
+  return /[",\r\n]/.test(guarded) ? `"${guarded.replace(/"/g, '""')}"` : guarded;
 }
