@@ -449,3 +449,38 @@ describe('notifications', () => {
     expect(await listNotifications(tenant.id, b.id)).toHaveLength(0);
   });
 });
+
+describe('transfers are recorded once (LOW)', () => {
+  it('does not write a second transfer row for a collapsed duplicate', async () => {
+    const from = (await upsertContact(tenant.id, { email: 'dup-from@example.com' })).id;
+    const to = (await upsertContact(tenant.id, { email: 'dup-to@example.com' })).id;
+    await award(tenant.id, {
+      contactId: from,
+      points: 1000,
+      reason: 'Seed',
+      idempotencyKey: 'dup-seed',
+    });
+
+    // Two identical transfers fired together. The reference used to be a
+    // millisecond clock, so both legs collapsed on their idempotency keys
+    // while two point_transfers rows were written — and both counted against
+    // the sender's limits for points that moved once.
+    const results = await Promise.allSettled([
+      transferPoints(tenant.id, { fromContactId: from, toContactId: to, points: 100 }),
+      transferPoints(tenant.id, { fromContactId: from, toContactId: to, points: 100 }),
+    ]);
+
+    const succeeded = results.filter((result) => result.status === 'fulfilled').length;
+    const { rows } = await db().query(
+      'SELECT SUM(points)::int AS total, COUNT(*)::int AS n FROM point_transfers WHERE tenant_id = $1',
+      [tenant.id],
+    );
+
+    // However the race resolves, the rows recorded must match the points that
+    // actually left the sender.
+    expect(rows[0]!.n).toBe(succeeded);
+    expect(rows[0]!.total).toBe(succeeded * 100);
+    expect((await getBalance(tenant.id, from)).balance).toBe(1000 - succeeded * 100);
+    expect((await getBalance(tenant.id, to)).balance).toBe(succeeded * 100);
+  });
+});

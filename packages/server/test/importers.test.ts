@@ -2,10 +2,11 @@ import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import { closeApp, closeDb, db, makeTenant, setupDatabase, truncateAll, type TestTenant } from './helpers.js';
 import { parseCsv, parseCsvTable, pick } from '../src/importers/csv.js';
 import { importMauticContacts } from '../src/importers/mautic.js';
-import { importMyCredBalances } from '../src/importers/mycred.js';
+import { importMyCredBalances, importMyCredHistory } from '../src/importers/mycred.js';
 import { importFlagswagCommissions, importFlagswagLinks } from '../src/importers/flagswag.js';
-import { getBalance } from '../src/services/points.js';
-import { findContactByEmail } from '../src/services/contacts.js';
+import { award, getBalance } from '../src/services/points.js';
+import { findContactByEmail, upsertContact } from '../src/services/contacts.js';
+import { trigger } from '../src/services/rewards.js';
 import { getLinkByCode } from '../src/services/links.js';
 import { subscribersFor } from '../src/services/newsletter.js';
 
@@ -338,5 +339,44 @@ describe('myCred log history', () => {
     // member out of a log line.
     expect(report.created).toBe(0);
     expect(report.warnings.join(' ')).toContain('import balances first');
+  });
+});
+
+describe('imported history stays in the past', () => {
+  it('does not let a future-dated row sit inside every cooldown window', async () => {
+    const contact = await upsertContact(tenant.id, { email: 'future@example.com' });
+    await award(tenant.id, {
+      contactId: contact.id,
+      points: 500,
+      reason: 'Opening balance',
+      idempotencyKey: 'future-open',
+    });
+
+    const year = new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString();
+    await importMyCredHistory({
+      tenantId: tenant.id,
+      csv: [
+        'id,user_email,ref,entry,creds,ctime',
+        `9001,future@example.com,purchase,Historic purchase,100,${year}`,
+      ].join('\n'),
+    });
+
+    const { rows } = await db().query(
+      `SELECT created_at FROM points_ledger
+        WHERE tenant_id = $1 AND ref_type = 'import_history'`,
+      [tenant.id],
+    );
+    expect(rows).toHaveLength(1);
+    expect(new Date(rows[0]!.created_at).getTime()).toBeLessThanOrEqual(Date.now() + 5_000);
+
+    // And the rule it names still fires, rather than being cooled down for a
+    // year by a row dated next spring.
+    const outcome = await trigger(tenant.id, {
+      contactId: contact.id,
+      ruleKey: 'purchase',
+      refId: 'order-after-import',
+      valueCents: 5_000,
+    });
+    expect(outcome.awarded).toBe(true);
   });
 });

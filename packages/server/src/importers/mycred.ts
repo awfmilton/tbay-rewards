@@ -287,13 +287,17 @@ export async function importMyCredHistory(
  * the row — a history entry with a wrong date is still better than no entry.
  */
 function parseMyCredTime(value: string): Date {
+  const now = new Date();
   const trimmed = value.trim();
-  if (trimmed === '') return new Date();
+  if (trimmed === '') return now;
 
-  if (/^\d{9,11}$/.test(trimmed)) {
-    return new Date(Number(trimmed) * 1000);
-  }
+  const parsed = /^\d{9,11}$/.test(trimmed)
+    ? new Date(Number(trimmed) * 1000)
+    : new Date(trimmed);
+  if (Number.isNaN(parsed.getTime())) return now;
 
-  const parsed = new Date(trimmed);
-  return Number.isNaN(parsed.getTime()) ? new Date() : parsed;
+  // History is history. A future-dated row — a clock-skewed export, a mangled
+  // column, a crafted CSV — sat permanently inside every cooldown window for
+  // its rule, which silently stopped that member ever earning under it again.
+  return parsed > now ? now : parsed;
 }
