@@ -81,6 +81,24 @@ export async function recordOrder(
     const subtotal = input.subtotalCents ?? input.totalCents;
 
     let contactId = input.contactId ?? null;
+
+    // Resolved against THIS tenant before anything is written.
+    //
+    // It arrives in the request body, so without this check a retailer could
+    // name another retailer's contact and have the whole order pipeline —
+    // ledger, balances, badges, ranks, notifications — write rows under its own
+    // tenant_id against a stranger. The route's own `requireContact` runs
+    // after `recordOrder` has already committed, so it returned 404 while the
+    // rows persisted.
+    if (contactId) {
+      const owned = await queryOne<{ id: string }>(
+        client,
+        'SELECT id FROM contacts WHERE tenant_id = $1 AND id = $2',
+        [tenant.id, contactId],
+      );
+      if (!owned) throw ApiError.notFound('No matching contact');
+    }
+
     if (!contactId && (input.email || input.externalRef)) {
       const contact = await upsertContact(
         tenant.id,

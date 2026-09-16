@@ -106,7 +106,7 @@ export async function isExcluded(
        SELECT id,
               lower(coalesce(email_normalised, email, '')) AS email,
               tags,
-              coalesce(attributes->'roles', '[]'::jsonb) AS roles
+              contact_roles(attributes) AS roles
          FROM contacts
         WHERE tenant_id = $1 AND id = $2
      )

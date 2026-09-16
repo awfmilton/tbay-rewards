@@ -264,3 +264,179 @@ describe('the ledger CSV is honest (LOW)', () => {
     expect((await authed('GET', '/v1/rewards/ledger.csv')).body).toContain("'=1+1");
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Second adversarial review — the myCred-parity surface
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('a tenant cannot name another tenant’s contact (HIGH)', () => {
+  it('refuses a foreign contactId on /v1/orders instead of writing the rows anyway', async () => {
+    const other = await makeTenant();
+    const app = await testApp();
+
+    const victim = JSON.parse(
+      (
+        await app.inject({
+          method: 'POST',
+          url: '/v1/contacts',
+          headers: { authorization: `Bearer ${other.secretKey}` },
+          payload: { email: 'victim@other.example', name: 'Victim' },
+        })
+      ).body,
+    ).contact_id as string;
+
+    const res = await authed('POST', '/v1/orders', {
+      orderRef: 'cross-1',
+      totalCents: 10_000,
+      contactId: victim,
+    });
+    expect(res.statusCode).toBe(404);
+
+    // The old bug returned 404 *after* committing: the route's own contact
+    // check ran once recordOrder's transaction had already closed.
+    const ledger = await db().query(
+      'SELECT id FROM points_ledger WHERE contact_id = $1',
+      [victim],
+    );
+    expect(ledger.rows).toHaveLength(0);
+
+    const balances = await db().query(
+      'SELECT contact_id FROM points_balances WHERE contact_id = $1',
+      [victim],
+    );
+    expect(balances.rows).toHaveLength(0);
+  });
+
+  it('keeps the database from accepting such a row even if a caller slips past', async () => {
+    const other = await makeTenant();
+    const victim = JSON.parse(
+      (
+        await (await testApp()).inject({
+          method: 'POST',
+          url: '/v1/contacts',
+          headers: { authorization: `Bearer ${other.secretKey}` },
+          payload: { email: 'fk@other.example' },
+        })
+      ).body,
+    ).contact_id as string;
+
+    // Straight past the service layer: the composite foreign key is the thing
+    // under test, not the application check above it.
+    await expect(
+      db().query(
+        `INSERT INTO points_ledger (tenant_id, contact_id, delta_points, reason, idempotency_key)
+         VALUES ($1, $2, 100, 'Forced', 'forced-cross-tenant')`,
+        [tenant.id, victim],
+      ),
+    ).rejects.toThrow(/foreign key/i);
+  });
+
+  it('does not leak another tenant’s name and email through the ledger join', async () => {
+    const other = await makeTenant();
+    const app = await testApp();
+    const victim = JSON.parse(
+      (
+        await app.inject({
+          method: 'POST',
+          url: '/v1/contacts',
+          headers: { authorization: `Bearer ${other.secretKey}` },
+          payload: { email: 'private@other.example', name: 'Private Person' },
+        })
+      ).body,
+    ).contact_id as string;
+
+    await app.inject({
+      method: 'POST',
+      url: '/v1/rewards/adjust',
+      headers: { authorization: `Bearer ${other.secretKey}` },
+      payload: { contactId: victim, points: 10, reason: 'Theirs', idempotencyKey: 'leak-1' },
+    });
+
+    const body = JSON.parse((await authed('GET', `/v1/rewards/ledger?contactId=${victim}`)).body);
+    expect(body.entries).toHaveLength(0);
+    expect(JSON.stringify(body)).not.toContain('private@other.example');
+    expect(JSON.stringify(body)).not.toContain('Private Person');
+  });
+});
+
+describe('the public site key cannot rewrite reward roles (HIGH)', () => {
+  const identify = async (attributes: unknown) =>
+    (await testApp()).inject({
+      method: 'POST',
+      url: '/v1/identify',
+      payload: { key: tenant.publicKey, email: 'staff@example.com', attributes },
+    });
+
+  const rolesOf = async () =>
+    (
+      await db().query(
+        `SELECT attributes -> 'roles' AS roles FROM contacts
+          WHERE tenant_id = $1 AND email = 'staff@example.com'`,
+        [tenant.id],
+      )
+    ).rows[0]?.roles;
+
+  beforeEach(async () => {
+    const excluded = await authed('POST', '/v1/rewards/exclusions', {
+      kind: 'role',
+      value: 'administrator',
+    });
+    expect(excluded.statusCode).toBe(200);
+    await authed('POST', '/v1/contacts', {
+      email: 'staff@example.com',
+      attributes: { roles: ['administrator'] },
+    });
+  });
+
+  it('will not clear an exclusion role to start earning again', async () => {
+    expect((await identify({ roles: [] })).statusCode).toBe(200);
+    expect(await rolesOf()).toEqual(['administrator']);
+
+    // Still excluded, so an order for them still earns nothing.
+    const order = JSON.parse(
+      (await authed('POST', '/v1/orders', {
+        orderRef: 'staff-1',
+        totalCents: 10_000,
+        email: 'staff@example.com',
+      })).body,
+    );
+    expect(order.points_awarded).toBe(0);
+  });
+
+  it('keeps other attributes while dropping the reserved one', async () => {
+    expect((await identify({ roles: [], plan: 'gold' })).statusCode).toBe(200);
+    expect(await rolesOf()).toEqual(['administrator']);
+
+    const { rows } = await db().query(
+      `SELECT attributes ->> 'plan' AS plan FROM contacts
+        WHERE tenant_id = $1 AND email = 'staff@example.com'`,
+      [tenant.id],
+    );
+    expect(rows[0]!.plan).toBe('gold');
+  });
+
+  it('survives a roles value that is not an array, whatever wrote it', async () => {
+    // The public endpoint can no longer send this, but a retailer's own
+    // integration can through /v1/contacts — and it used to take down every
+    // order for that customer with "cannot extract elements from a scalar".
+    await authed('POST', '/v1/contacts', {
+      email: 'staff@example.com',
+      attributes: { roles: 'administrator' },
+    });
+
+    const order = await authed('POST', '/v1/orders', {
+      orderRef: 'scalar-1',
+      totalCents: 10_000,
+      email: 'staff@example.com',
+    });
+    expect(order.statusCode).toBe(200);
+    // A non-array reads as no roles at all, so the exclusion no longer matches
+    // and they earn — wrong-ish, but a retailer's own data error, and vastly
+    // better than 500ing every checkout.
+    expect(JSON.parse(order.body).points_awarded).toBeGreaterThan(0);
+
+    // And the leaderboard, which evaluates the same predicate per row.
+    const board = await authed('GET', '/v1/rewards/leaderboard');
+    expect(board.statusCode).toBe(200);
+  });
+});

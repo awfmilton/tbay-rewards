@@ -603,7 +603,7 @@ export async function leaderboard(
               AND lower(coalesce(c.email_normalised, c.email, '')) LIKE '%@' || x.value)
         OR (x.kind = 'tag'          AND x.value = ANY (SELECT lower(t) FROM unnest(c.tags) AS t))
         OR (x.kind = 'role'         AND EXISTS (
-               SELECT 1 FROM jsonb_array_elements_text(coalesce(c.attributes->'roles', '[]'::jsonb)) AS r
+               SELECT 1 FROM jsonb_array_elements_text(contact_roles(c.attributes)) AS r
                 WHERE lower(r) = x.value))
          )
     )`;
@@ -612,12 +612,12 @@ export async function leaderboard(
     window === 'all'
       ? `SELECT b.contact_id, c.name, b.lifetime_earned::bigint AS points
            FROM points_balances b
-           JOIN contacts c ON c.id = b.contact_id
+           JOIN contacts c ON c.id = b.contact_id AND c.tenant_id = b.tenant_id
           WHERE b.tenant_id = $1 AND b.point_type = $2
             AND b.lifetime_earned > 0 AND ${notExcluded}`
       : `SELECT l.contact_id, c.name, SUM(l.delta_points)::bigint AS points
            FROM points_ledger l
-           JOIN contacts c ON c.id = l.contact_id
+           JOIN contacts c ON c.id = l.contact_id AND c.tenant_id = l.tenant_id
           WHERE l.tenant_id = $1
             AND l.point_type = $2
             AND l.delta_points > 0

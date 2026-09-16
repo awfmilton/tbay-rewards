@@ -75,6 +75,35 @@ export const collectSchema = z.object({
  * identity at an existing contact. Server-to-server callers use /v1/contacts
  * with the secret key when they need to set one.
  */
+/**
+ * Attribute keys a caller holding only the *public* site key may not write.
+ *
+ * `/v1/identify` and `/v1/newsletter/subscribe` need no secret — the site key
+ * is in every page's source, and the contact is matched by email alone. So
+ * anything the platform's own logic trusts has to be off limits there, or a
+ * visitor can rewrite it for somebody else. `roles` drives reward exclusions:
+ * clearing it puts an excluded staff account back on the payroll, and setting
+ * it on a stranger's address stops them earning.
+ *
+ * Reserved keys are dropped rather than rejected. A legitimate client sending
+ * a wide `attributes` blob should not have its whole identify call fail; it
+ * should simply not be able to set these. The secret-key `/v1/contacts`
+ * endpoint still writes them.
+ */
+export const RESERVED_ATTRIBUTE_KEYS = ['roles'] as const;
+
+export const publicAttributes = z
+  .record(z.unknown())
+  .transform((attributes) => {
+    const safe: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(attributes)) {
+      // hasOwn, not `includes` on a key that could be `__proto__`.
+      if (!RESERVED_ATTRIBUTE_KEYS.includes(key as never)) safe[key] = value;
+    }
+    return safe;
+  })
+  .optional();
+
 export const identifySchema = z.object({
   key: z.string().max(128).optional(),
   visitor: z.string().min(8).max(64).optional(),
@@ -83,7 +112,7 @@ export const identifySchema = z.object({
   phone: z.string().max(64).nullish(),
   locale: z.string().max(16).nullish(),
   country: z.string().max(2).nullish(),
-  attributes: z.record(z.unknown()).optional(),
+  attributes: publicAttributes,
   tags: z.array(z.string().max(64)).max(50).optional(),
 })
   // Strict on purpose: an unexpected field here is either a client bug or
@@ -98,7 +127,7 @@ export const subscribeSchema = z.object({
   list: z.string().max(64).optional(),
   source: z.string().max(128).nullish(),
   visitor: z.string().max(64).nullish(),
-  attributes: z.record(z.unknown()).optional(),
+  attributes: publicAttributes,
   /** Honeypot: a real browser never fills this. */
   website: z.string().max(0).optional(),
 });
