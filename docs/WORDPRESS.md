@@ -38,7 +38,8 @@ Attributes:
 [tbay_leaderboard limit="10"]
 ```
 
-There is also a **TBAY newsletter signup** block for the editor.
+There is also a **TBAY newsletter signup** block in the editor's inserter, with
+list, heading, description and button label configurable in the sidebar.
 
 ---
 
@@ -144,6 +145,18 @@ Redefine those and the whole component set follows. There is no `!important`
 anywhere, so ordinary theme CSS can override anything it needs to.
 
 ---
+
+## Wallets on phones
+
+A phone browser cannot talk to a wallet extension, so the rewards panel offers a
+deep link into the MetaMask browser instead of dead-ending on "install
+MetaMask".
+
+Setting `THIRDWEB_CLIENT_ID` on the platform additionally enables thirdweb
+in-app wallets, so a customer can sign in with Google and hold TBAY without ever
+installing anything. thirdweb v5 is ESM-only, so it is loaded with a dynamic
+import at the moment a wallet action happens — no build step, and nothing is
+downloaded for shoppers who never touch Web3.
 
 ## Privacy and consent
 
