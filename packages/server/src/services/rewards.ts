@@ -3,6 +3,7 @@ import { ApiError } from '../lib/errors.js';
 import { limitOf } from '../lib/paging.js';
 import { award, getBalance, type AwardResult, type Balance } from './points.js';
 import { isExcluded } from './exclusions.js';
+import { defaultPointType, resolvePointType } from './point-types.js';
 
 export interface RewardRule {
   id: string;
@@ -24,6 +25,14 @@ export interface RewardRule {
   requires_verification: boolean;
   /** Admin-editable ledger wording; falls back to the rule name. */
   log_template: string | null;
+  /**
+   * Which currency this rule pays in.
+   *
+   * One rule, one currency — which is what keeps the cap and cooldown queries
+   * below correct without a type predicate: they scope by `rule_key`, and a
+   * rule's entries are all denominated in the same thing.
+   */
+  point_type: string;
   config: Record<string, unknown>;
   enabled: boolean;
 }
@@ -44,7 +53,7 @@ const CAP_WINDOWS = [
  */
 export const DEFAULT_RULES: Array<Omit<RewardRule,
   'id' | 'tenant_id' | 'points_per_unit' | 'config' | 'enabled'
-  | 'weekly_cap' | 'monthly_cap' | 'max_per_award' | 'log_template'
+  | 'weekly_cap' | 'monthly_cap' | 'max_per_award' | 'log_template' | 'point_type'
 > & {
   points_per_unit?: number;
   config?: Record<string, unknown>;
@@ -209,14 +218,27 @@ export async function upsertRule(
   rule: Partial<RewardRule> & { key: string },
   runner: Queryable = db(),
 ): Promise<RewardRule> {
+  // Resolved rather than trusted: a rule paying an unknown currency would fail
+  // at award time, on a customer's order, instead of here in the admin screen.
+  //
+  // Only when one was actually named, though. An edit that does not mention a
+  // currency must leave the rule's alone — resolving an absent key returns the
+  // tenant default, which would quietly move a "status" rule onto "points"
+  // every time someone renamed it.
+  const pointType = rule.point_type
+    ? await resolvePointType(tenantId, rule.point_type, runner)
+    : null;
+  const fallbackType = pointType ?? (await defaultPointType(tenantId, runner));
+
   const row = await queryOne<RewardRule>(
     runner,
     `INSERT INTO reward_rules (
        tenant_id, key, name, event_key, mode, points, points_per_unit,
        cooldown_seconds, daily_cap, weekly_cap, monthly_cap, lifetime_cap,
        max_per_award, log_template, hold_seconds,
-       requires_verification, config, enabled
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17::jsonb, $18)
+       requires_verification, config, enabled, point_type
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17::jsonb, $18,
+               COALESCE($19, $20))
      ON CONFLICT (tenant_id, key) DO UPDATE SET
        name = COALESCE(EXCLUDED.name, reward_rules.name),
        event_key = COALESCE(EXCLUDED.event_key, reward_rules.event_key),
@@ -236,6 +258,7 @@ export async function upsertRule(
        requires_verification = COALESCE(EXCLUDED.requires_verification, reward_rules.requires_verification),
        config = COALESCE(EXCLUDED.config, reward_rules.config),
        enabled = COALESCE(EXCLUDED.enabled, reward_rules.enabled),
+       point_type = COALESCE($19, reward_rules.point_type),
        updated_at = now()
      RETURNING *`,
     [
@@ -257,6 +280,8 @@ export async function upsertRule(
       rule.requires_verification ?? false,
       JSON.stringify(rule.config ?? {}),
       rule.enabled ?? true,
+      pointType?.key ?? null,
+      fallbackType.key,
     ],
   );
   return row!;
@@ -361,7 +386,7 @@ export async function trigger(
   const run = async (client: Queryable): Promise<TriggerOutcome> => {
     const rule = await getRule(tenantId, input.ruleKey, client);
     if (!rule) return { awarded: false, reason: 'rule_missing', balance: await getBalance(tenantId, input.contactId, client) };
-    if (!rule.enabled) return { awarded: false, reason: 'rule_disabled', balance: await getBalance(tenantId, input.contactId, client) };
+    if (!rule.enabled) return { awarded: false, reason: 'rule_disabled', balance: await getBalance(tenantId, input.contactId, client, rule.point_type) };
 
     // Excluded before anything else is computed: staff and test accounts
     // should not appear in cooldown state, cap totals or the ledger at all.
@@ -371,7 +396,7 @@ export async function trigger(
         awarded: false,
         reason: 'excluded',
         detail: exclusion.reason,
-        balance: await getBalance(tenantId, input.contactId, client),
+        balance: await getBalance(tenantId, input.contactId, client, rule.point_type),
       };
     }
 
@@ -384,7 +409,7 @@ export async function trigger(
     }
 
     if (points <= 0) {
-      return { awarded: false, reason: 'zero_points', balance: await getBalance(tenantId, input.contactId, client) };
+      return { awarded: false, reason: 'zero_points', balance: await getBalance(tenantId, input.contactId, client, rule.point_type) };
     }
 
     // Serialise per (contact, rule) so cap checks and the insert are atomic.
@@ -404,7 +429,7 @@ export async function trigger(
         [tenantId, input.contactId, rule.key, String(rule.cooldown_seconds)],
       );
       if (recent) {
-        return { awarded: false, reason: 'cooldown', balance: await getBalance(tenantId, input.contactId, client) };
+        return { awarded: false, reason: 'cooldown', balance: await getBalance(tenantId, input.contactId, client, rule.point_type) };
       }
     }
 
@@ -428,7 +453,7 @@ export async function trigger(
         return {
           awarded: false,
           reason: window.reason,
-          balance: await getBalance(tenantId, input.contactId, client),
+          balance: await getBalance(tenantId, input.contactId, client, rule.point_type),
         };
       }
     }
@@ -441,7 +466,7 @@ export async function trigger(
         [tenantId, input.contactId, rule.key],
       );
       if (Number(lifetime?.total ?? 0) + points > rule.lifetime_cap) {
-        return { awarded: false, reason: 'lifetime_cap', balance: await getBalance(tenantId, input.contactId, client) };
+        return { awarded: false, reason: 'lifetime_cap', balance: await getBalance(tenantId, input.contactId, client, rule.point_type) };
       }
     }
 
@@ -456,6 +481,7 @@ export async function trigger(
         refId: input.refId,
         idempotencyKey: `rule:${rule.key}:${input.refId}`,
         holdSeconds: rule.hold_seconds,
+        pointType: rule.point_type,
         meta: input.meta,
       },
       client,
@@ -485,6 +511,7 @@ export async function trigger(
           contact: await contacts.getContact(tenantId, input.contactId, client),
           data: {
             points,
+            point_type: rule.point_type,
             rule_key: rule.key,
             reason: rule.name,
             balance: result.balance.balance,
@@ -523,6 +550,8 @@ export interface LeaderboardRow {
 
 export interface LeaderboardResult {
   window: LeaderboardWindow;
+  /** The currency this board ranks. */
+  point_type: string;
   rows: LeaderboardRow[];
   /** The asking member's position, even when they are outside the top N. */
   you: LeaderboardRow | null;
@@ -549,11 +578,17 @@ export async function leaderboard(
     window?: LeaderboardWindow;
     /** Include this contact's own row even if they are below the cut. */
     contactId?: string | null;
+    /** Which currency to rank; the retailer's default when unset. */
+    pointType?: string | null;
   } = {},
   runner: Queryable = db(),
 ): Promise<LeaderboardResult> {
   const limit = limitOf(options.limit, 10, 100);
   const window = options.window ?? 'all';
+
+  // One board per currency. Summing them together would rank a member's
+  // unspendable status credits against another's spendable points.
+  const pointType = await resolvePointType(tenantId, options.pointType, runner);
 
   // Excluded contacts never appear, and the exclusion is resolved in SQL so a
   // large board does not turn into one round trip per row.
@@ -578,19 +613,22 @@ export async function leaderboard(
       ? `SELECT b.contact_id, c.name, b.lifetime_earned::bigint AS points
            FROM points_balances b
            JOIN contacts c ON c.id = b.contact_id
-          WHERE b.tenant_id = $1 AND b.lifetime_earned > 0 AND ${notExcluded}`
+          WHERE b.tenant_id = $1 AND b.point_type = $2
+            AND b.lifetime_earned > 0 AND ${notExcluded}`
       : `SELECT l.contact_id, c.name, SUM(l.delta_points)::bigint AS points
            FROM points_ledger l
            JOIN contacts c ON c.id = l.contact_id
           WHERE l.tenant_id = $1
+            AND l.point_type = $2
             AND l.delta_points > 0
             AND l.status <> 'reversed'
-            AND l.created_at >= date_trunc($2, now())
+            AND l.created_at >= date_trunc($3, now())
             AND ${notExcluded}
           GROUP BY l.contact_id, c.name
          HAVING SUM(l.delta_points) > 0`;
 
-  const params: unknown[] = window === 'all' ? [tenantId] : [tenantId, window];
+  const params: unknown[] =
+    window === 'all' ? [tenantId, pointType.key] : [tenantId, pointType.key, window];
 
   const { rows } = await runner.query<LeaderboardRow>(
     `WITH board AS (${source})
@@ -620,7 +658,7 @@ export async function leaderboard(
       ));
   }
 
-  return { window, rows, you };
+  return { window, point_type: pointType.key, rows, you };
 }
 
 export function assertRuleKey(key: string): string {

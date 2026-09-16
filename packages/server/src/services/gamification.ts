@@ -2,6 +2,12 @@ import { db, queryOne, withTransaction, type Queryable } from '../db/pool.js';
 import { ApiError } from '../lib/errors.js';
 import { award, getBalance, reverse, spend, type Balance } from './points.js';
 import { trigger } from './rewards.js';
+import {
+  assertTransferable,
+  defaultPointType,
+  listPointTypes,
+  resolvePointType,
+} from './point-types.js';
 
 /**
  * The myCred feature set, rebuilt on the platform's own ledger: badges with
@@ -60,6 +66,8 @@ export interface Badge {
   criteria: BadgeCriteria;
   tiers: BadgeTier[];
   points_per_tier: number;
+  /** The currency its bonus pays in, and the one `lifetime_points` measures. */
+  point_type: string;
   manual_only: boolean;
   display_order: number;
   enabled: boolean;
@@ -239,7 +247,7 @@ export async function evaluateBadges(
     const earned: Array<{ badge: Badge; level: number; pointsAwarded: number }> = [];
 
     for (const badge of badges) {
-      const progress = await measureCriteria(client, tenantId, contactId, badge.criteria);
+      const progress = await measureCriteria(client, tenantId, contactId, badge.criteria, badge.point_type);
       const tiers = [...(badge.tiers ?? [])].sort((a, b) => a.level - b.level);
       let level = 0;
       for (const tier of tiers) {
@@ -279,6 +287,7 @@ export async function evaluateBadges(
               refType: 'badge',
               refId: badge.id,
               idempotencyKey: `badge:${badge.key}:${tierLevel}:${contactId}`,
+              pointType: badge.point_type,
               meta: { badge_key: badge.key, level: tierLevel },
             },
             client,
@@ -311,6 +320,7 @@ async function measureCriteria(
   tenantId: string,
   contactId: string,
   criteria: BadgeCriteria,
+  pointType: string,
 ): Promise<number> {
   switch (criteria?.type) {
     case 'compound': {
@@ -318,7 +328,7 @@ async function measureCriteria(
       if (requires.length === 0) return 0;
       let met = 0;
       for (const requirement of requires) {
-        const value = await measureCriteria(client, tenantId, contactId, requirement);
+        const value = await measureCriteria(client, tenantId, contactId, requirement, pointType);
         if (value >= requirement.threshold) met += 1;
         // An unmet requirement settles an `and` immediately; no point costing
         // the database another query for a badge that cannot be earned.
@@ -345,7 +355,9 @@ async function measureCriteria(
       return Number(row?.n ?? 0);
     }
     case 'lifetime_points': {
-      const balance = await getBalance(tenantId, contactId, client);
+      // The badge's own currency. A status badge must be reached by earning
+      // status, not by spending money for points.
+      const balance = await getBalance(tenantId, contactId, client, pointType);
       return balance.lifetime_earned;
     }
     case 'order_count': {
@@ -408,10 +420,16 @@ export async function upsertBadge(
     manualOnly?: boolean;
     displayOrder?: number;
     enabled?: boolean;
+    pointType?: string | null;
   },
   runner: Queryable = db(),
 ): Promise<Badge> {
   const key = assertGamificationKey(input.key, 'badge key');
+
+  // Only when named, so editing a badge's tiers does not silently move it off
+  // the status ladder and onto the default one.
+  const type = input.pointType ? await resolvePointType(tenantId, input.pointType, runner) : null;
+  const fallbackType = type ?? (await defaultPointType(tenantId, runner));
 
   if (input.tiers) {
     const levels = new Set<number>();
@@ -444,14 +462,15 @@ export async function upsertBadge(
     runner,
     `INSERT INTO badges (
        tenant_id, key, name, description, image_url, criteria, tiers,
-       points_per_tier, manual_only, display_order, enabled
+       points_per_tier, manual_only, display_order, enabled, point_type
      ) VALUES (
        $1, $2, $3, $4, $5,
        -- COALESCE here, not only in the UPDATE below: on a fresh insert there
        -- is no existing row to fall back to, and these columns are NOT NULL.
        COALESCE($6::jsonb, '{}'::jsonb),
        COALESCE($7::jsonb, '[]'::jsonb),
-       COALESCE($8, 0), COALESCE($9, false), COALESCE($10, 0), COALESCE($11, true)
+       COALESCE($8, 0), COALESCE($9, false), COALESCE($10, 0), COALESCE($11, true),
+       COALESCE($12, $13)
      )
      ON CONFLICT (tenant_id, key) DO UPDATE SET
        name = COALESCE(EXCLUDED.name, badges.name),
@@ -463,6 +482,7 @@ export async function upsertBadge(
        manual_only = COALESCE($9, badges.manual_only),
        display_order = COALESCE($10, badges.display_order),
        enabled = COALESCE($11, badges.enabled),
+       point_type = COALESCE($12, badges.point_type),
        updated_at = now()
      RETURNING *`,
     [
@@ -477,6 +497,8 @@ export async function upsertBadge(
       input.manualOnly ?? null,
       input.displayOrder ?? null,
       input.enabled ?? null,
+      type?.key ?? null,
+      fallbackType.key,
     ],
   );
   return row!;
@@ -560,10 +582,13 @@ export async function upsertRank(
     manualOnly?: boolean;
     displayOrder?: number;
     enabled?: boolean;
+    pointType?: string | null;
   },
   runner: Queryable = db(),
 ): Promise<Rank> {
   const key = assertGamificationKey(input.key, 'rank key');
+  const type = input.pointType ? await resolvePointType(tenantId, input.pointType, runner) : null;
+  const fallbackType = type ?? (await defaultPointType(tenantId, runner));
   if (
     input.maxPoints != null &&
     input.minPoints != null &&
@@ -576,11 +601,12 @@ export async function upsertRank(
     runner,
     `INSERT INTO ranks (
        tenant_id, key, name, description, image_url, min_points, max_points,
-       perks, manual_only, display_order, enabled
+       perks, manual_only, display_order, enabled, point_type
      ) VALUES (
        $1, $2, $3, $4, $5, COALESCE($6, 0), $7,
        COALESCE($8::jsonb, '{}'::jsonb),
-       COALESCE($9, false), COALESCE($10, 0), COALESCE($11, true)
+       COALESCE($9, false), COALESCE($10, 0), COALESCE($11, true),
+       COALESCE($12, $13)
      )
      ON CONFLICT (tenant_id, key) DO UPDATE SET
        name = COALESCE(EXCLUDED.name, ranks.name),
@@ -591,7 +617,8 @@ export async function upsertRank(
        perks = COALESCE($8::jsonb, ranks.perks),
        manual_only = COALESCE($9, ranks.manual_only),
        display_order = COALESCE($10, ranks.display_order),
-       enabled = COALESCE($11, ranks.enabled)
+       enabled = COALESCE($11, ranks.enabled),
+       point_type = COALESCE($12, ranks.point_type)
      RETURNING *`,
     [
       tenantId,
@@ -605,6 +632,8 @@ export async function upsertRank(
       input.manualOnly ?? null,
       input.displayOrder ?? null,
       input.enabled ?? null,
+      type?.key ?? null,
+      fallbackType.key,
     ],
   );
   return row!;
@@ -726,6 +755,8 @@ export interface Rank {
   min_points: number;
   max_points: number | null;
   perks: Record<string, unknown>;
+  /** The currency whose ladder this rank belongs to. */
+  point_type: string;
   display_order: number;
   enabled: boolean;
 }
@@ -749,13 +780,15 @@ export async function currentRank(
   tenantId: string,
   contactId: string,
   runner: Queryable = db(),
+  pointType?: string | null,
 ): Promise<Rank | null> {
+  const type = await resolvePointType(tenantId, pointType, runner);
   return queryOne<Rank>(
     runner,
     `SELECT r.* FROM ranks r
        JOIN points_balances b ON b.current_rank_id = r.id
-      WHERE b.tenant_id = $1 AND b.contact_id = $2`,
-    [tenantId, contactId],
+      WHERE b.tenant_id = $1 AND b.contact_id = $2 AND b.point_type = $3`,
+    [tenantId, contactId, type.key],
   );
 }
 
@@ -780,23 +813,23 @@ export async function assignRankManually(
     );
     if (!rank) throw ApiError.notFound(`No rank "${rankKey}"`);
 
-    await client.query(
-      'UPDATE contacts SET rank_locked = true, updated_at = now() WHERE tenant_id = $1 AND id = $2',
-      [tenantId, contactId],
-    );
     // Seed the balance row first. A member who has never earned anything has
     // no row, so the UPDATE below would touch nothing and the pin would
     // silently do nothing — which is exactly the case an admin hand-assigning
     // a tier is most likely to hit.
+    //
+    // The row seeded is the one for the rank's own currency: pinning a tier on
+    // the status ladder must not touch the spend ladder.
     await client.query(
-      `INSERT INTO points_balances (tenant_id, contact_id) VALUES ($1, $2)
-       ON CONFLICT (tenant_id, contact_id) DO NOTHING`,
-      [tenantId, contactId],
+      `INSERT INTO points_balances (tenant_id, contact_id, point_type) VALUES ($1, $2, $3)
+       ON CONFLICT (tenant_id, contact_id, point_type) DO NOTHING`,
+      [tenantId, contactId, rank.point_type],
     );
     await client.query(
-      `UPDATE points_balances SET current_rank_id = $3, updated_at = now()
-        WHERE tenant_id = $1 AND contact_id = $2`,
-      [tenantId, contactId, rank.id],
+      `UPDATE points_balances
+          SET current_rank_id = $3, rank_locked = true, updated_at = now()
+        WHERE tenant_id = $1 AND contact_id = $2 AND point_type = $4`,
+      [tenantId, contactId, rank.id, rank.point_type],
     );
     const award = await queryOne<{ id: string }>(
       client,
@@ -822,13 +855,16 @@ export async function unpinRank(
   tenantId: string,
   contactId: string,
   runner?: Queryable,
+  pointType?: string | null,
 ): Promise<{ rank: Rank | null; promoted: boolean }> {
   const run = async (client: Queryable) => {
+    const type = await resolvePointType(tenantId, pointType, client);
     await client.query(
-      'UPDATE contacts SET rank_locked = false, updated_at = now() WHERE tenant_id = $1 AND id = $2',
-      [tenantId, contactId],
+      `UPDATE points_balances SET rank_locked = false, updated_at = now()
+        WHERE tenant_id = $1 AND contact_id = $2 AND point_type = $3`,
+      [tenantId, contactId, type.key],
     );
-    return evaluateRank(tenantId, contactId, client);
+    return evaluateRank(tenantId, contactId, client, type.key);
   };
   return runner ? run(runner) : withTransaction(run);
 }
@@ -855,9 +891,17 @@ export async function reevaluateAll(
   let promoted = 0;
   let badgesAwarded = 0;
 
+  // Every currency's ladder, since a member holds one rank per currency. For a
+  // retailer with a single currency this is the one pass it always was.
+  const ladders = (await listPointTypes(tenantId, runner))
+    .filter((type) => type.enabled)
+    .map((type) => type.key);
+
   for (;;) {
+    // DISTINCT: a member with three currencies has three balance rows and is
+    // still one contact to evaluate.
     const { rows } = await runner.query<{ id: string }>(
-      `SELECT contact_id AS id FROM points_balances
+      `SELECT DISTINCT contact_id AS id FROM points_balances
         WHERE tenant_id = $1 AND contact_id > $2
         ORDER BY contact_id
         LIMIT $3`,
@@ -872,8 +916,10 @@ export async function reevaluateAll(
         badgesAwarded += earned.length;
       }
       if (doRanks) {
-        const result = await evaluateRank(tenantId, row.id, runner);
-        if (result.promoted) promoted += 1;
+        for (const ladder of ladders) {
+          const result = await evaluateRank(tenantId, row.id, runner, ladder);
+          if (result.promoted) promoted += 1;
+        }
       }
     }
 
@@ -888,46 +934,58 @@ export async function evaluateRank(
   tenantId: string,
   contactId: string,
   runner?: Queryable,
+  pointType?: string | null,
 ): Promise<{ rank: Rank | null; promoted: boolean }> {
   const run = async (client: Queryable) => {
+    const type = await resolvePointType(tenantId, pointType, client);
+
     // A hand-assigned rank is a decision, not a calculation. myCred's Manual
     // Mode exists because stores pin a VIP tier that no points total explains,
     // and an automatic re-evaluation quietly undoing that is the bug.
     const pinned = await queryOne<{ rank_locked: boolean }>(
       client,
-      'SELECT rank_locked FROM contacts WHERE tenant_id = $1 AND id = $2',
-      [tenantId, contactId],
+      `SELECT rank_locked FROM points_balances
+        WHERE tenant_id = $1 AND contact_id = $2 AND point_type = $3`,
+      [tenantId, contactId, type.key],
     );
     if (pinned?.rank_locked) {
-      const held = await currentRank(tenantId, contactId, client);
+      const held = await currentRank(tenantId, contactId, client, type.key);
       return { rank: held, promoted: false };
     }
 
-    const balance = await getBalance(tenantId, contactId, client);
+    const balance = await getBalance(tenantId, contactId, client, type.key);
 
     const rank = await queryOne<Rank>(
       client,
       `SELECT * FROM ranks
-        WHERE tenant_id = $1 AND enabled AND NOT manual_only
+        WHERE tenant_id = $1 AND point_type = $3 AND enabled AND NOT manual_only
           AND min_points <= $2
           AND (max_points IS NULL OR max_points >= $2)
         ORDER BY min_points DESC
         LIMIT 1`,
-      [tenantId, balance.lifetime_earned],
+      [tenantId, balance.lifetime_earned, type.key],
     );
     if (!rank) return { rank: null, promoted: false };
 
     const current = await queryOne<{ current_rank_id: string | null }>(
       client,
-      'SELECT current_rank_id FROM points_balances WHERE tenant_id = $1 AND contact_id = $2',
-      [tenantId, contactId],
+      `SELECT current_rank_id FROM points_balances
+        WHERE tenant_id = $1 AND contact_id = $2 AND point_type = $3`,
+      [tenantId, contactId, type.key],
     );
     if (current?.current_rank_id === rank.id) return { rank, promoted: false };
 
+    // The row may not exist: a rank whose floor is 0 is reachable by someone
+    // who has never earned anything.
+    await client.query(
+      `INSERT INTO points_balances (tenant_id, contact_id, point_type) VALUES ($1, $2, $3)
+       ON CONFLICT (tenant_id, contact_id, point_type) DO NOTHING`,
+      [tenantId, contactId, type.key],
+    );
     await client.query(
       `UPDATE points_balances SET current_rank_id = $3, updated_at = now()
-        WHERE tenant_id = $1 AND contact_id = $2`,
-      [tenantId, contactId, rank.id],
+        WHERE tenant_id = $1 AND contact_id = $2 AND point_type = $4`,
+      [tenantId, contactId, rank.id, type.key],
     );
 
     const award = await queryOne<{ id: string }>(
@@ -1096,7 +1154,13 @@ export async function transferLimitsFor(
  */
 export async function transferPoints(
   tenantId: string,
-  input: { fromContactId: string; toContactId: string; points: number; message?: string },
+  input: {
+    fromContactId: string;
+    toContactId: string;
+    points: number;
+    message?: string;
+    pointType?: string | null;
+  },
   runner?: Queryable,
 ): Promise<TransferResult> {
   if (input.fromContactId === input.toContactId) {
@@ -1114,6 +1178,10 @@ export async function transferPoints(
     );
     if (!recipient) throw ApiError.notFound('No such recipient');
 
+    // Refused before anything is locked or spent. A status currency that can
+    // be handed to another member is not status, it is a second wallet.
+    const type = await assertTransferable(tenantId, input.pointType, client);
+
     // Lock both balances up front, in contact_id order.
     //
     // `spend` locks the sender and `award` locks the recipient, so A sending to
@@ -1124,17 +1192,17 @@ export async function transferPoints(
     const pair = [input.fromContactId, input.toContactId].sort();
     await client.query(
       `SELECT contact_id FROM points_balances
-        WHERE tenant_id = $1 AND contact_id = ANY($2::uuid[])
+        WHERE tenant_id = $1 AND contact_id = ANY($2::uuid[]) AND point_type = $3
         ORDER BY contact_id
         FOR UPDATE`,
-      [tenantId, pair],
+      [tenantId, pair, type.key],
     );
 
     const limits = await transferLimitsFor(tenantId, client);
 
     if (input.points < limits.minimum) {
       throw ApiError.unprocessable(
-        `The smallest transfer is ${limits.minimum} points`,
+        `The smallest transfer is ${limits.minimum} ${type.plural}`,
         { minimum: limits.minimum },
       );
     }
@@ -1145,13 +1213,13 @@ export async function transferPoints(
       const sent = await queryOne<{ total: string }>(
         client,
         `SELECT COALESCE(SUM(points), 0) AS total FROM point_transfers
-          WHERE tenant_id = $1 AND from_contact_id = $2
+          WHERE tenant_id = $1 AND from_contact_id = $2 AND point_type = $4
             AND created_at >= date_trunc($3, now())`,
-        [tenantId, input.fromContactId, window.unit],
+        [tenantId, input.fromContactId, window.unit, type.key],
       );
       if (Number(sent?.total ?? 0) + input.points > cap) {
         throw ApiError.unprocessable(
-          `That is over your ${window.label} sending limit of ${cap} points`,
+          `That is over your ${window.label} sending limit of ${cap} ${type.plural}`,
           { limit: cap, window: window.unit, already_sent: Number(sent?.total ?? 0) },
         );
       }
@@ -1168,6 +1236,7 @@ export async function transferPoints(
         refType: 'transfer',
         refId: reference,
         idempotencyKey: `transfer-out:${reference}`,
+        pointType: type.key,
         meta: { to_contact_id: input.toContactId, message: input.message ?? '' },
       },
       client,
@@ -1182,6 +1251,7 @@ export async function transferPoints(
         refType: 'transfer',
         refId: reference,
         idempotencyKey: `transfer-in:${reference}`,
+        pointType: type.key,
         meta: { from_contact_id: input.fromContactId, message: input.message ?? '' },
       },
       client,
@@ -1190,8 +1260,9 @@ export async function transferPoints(
     const transfer = await queryOne<{ id: string }>(
       client,
       `INSERT INTO point_transfers (
-         tenant_id, from_contact_id, to_contact_id, points, message, debit_entry_id, credit_entry_id
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+         tenant_id, from_contact_id, to_contact_id, points, message,
+         debit_entry_id, credit_entry_id, point_type
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        RETURNING id`,
       [
         tenantId,
@@ -1201,6 +1272,7 @@ export async function transferPoints(
         (input.message ?? '').slice(0, 500),
         debit.entry.id,
         credit.entry.id,
+        type.key,
       ],
     );
 
@@ -1209,12 +1281,12 @@ export async function transferPoints(
       tenantId,
       input.toContactId,
       'points_received',
-      `You received ${input.points} points`,
+      `You received ${input.points} ${type.plural}`,
       input.message ?? '',
-      { from_contact_id: input.fromContactId },
+      { from_contact_id: input.fromContactId, point_type: type.key },
     );
 
-    await evaluateRank(tenantId, input.toContactId, client);
+    await evaluateRank(tenantId, input.toContactId, client, type.key);
 
     return { transfer_id: transfer!.id, from_balance: debit.balance, points: input.points };
   };
@@ -1240,6 +1312,8 @@ export async function createCoupon(
     /** Badge and rank handed out alongside the points. */
     grantBadgeKey?: string | null;
     grantRankKey?: string | null;
+    /** Which currency it pays out; the retailer's default when unset. */
+    pointType?: string | null;
   },
   runner: Queryable = db(),
 ): Promise<{ code: string; points: number }> {
@@ -1251,13 +1325,15 @@ export async function createCoupon(
     throw ApiError.badRequest('maxBalance cannot be below minBalance');
   }
 
+  const type = await resolvePointType(tenantId, input.pointType, runner);
+
   const row = await queryOne<{ code: string; points: number }>(
     runner,
     `INSERT INTO point_coupons (
        tenant_id, code, points, max_uses, per_contact_limit, expires_at,
-       min_balance, max_balance, grant_badge_key, grant_rank_key
+       min_balance, max_balance, grant_badge_key, grant_rank_key, point_type
      )
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
      ON CONFLICT (tenant_id, code) DO NOTHING
      RETURNING code, points`,
     [
@@ -1271,6 +1347,7 @@ export async function createCoupon(
       input.maxBalance ?? null,
       input.grantBadgeKey ?? null,
       input.grantRankKey ?? null,
+      type.key,
     ],
   );
   if (!row) throw ApiError.conflict('That coupon code already exists');
@@ -1303,6 +1380,7 @@ export async function redeemCoupon(
       max_balance: number | null;
       grant_badge_key: string | null;
       grant_rank_key: string | null;
+      point_type: string;
     }>(
       client,
       `SELECT * FROM point_coupons WHERE tenant_id = $1 AND code = $2 FOR UPDATE`,
@@ -1329,17 +1407,20 @@ export async function redeemCoupon(
     // — that the code exists — a successful redemption reveals anyway, and the
     // endpoint is rate limited per tenant.
     if (coupon.min_balance !== null || coupon.max_balance !== null) {
-      const current = await getBalance(tenantId, contactId, client);
+      // Measured in the currency the coupon pays, which is the only one the
+      // band can sensibly mean.
+      const type = await resolvePointType(tenantId, coupon.point_type, client);
+      const current = await getBalance(tenantId, contactId, client, type.key);
       if (coupon.min_balance !== null && current.balance < coupon.min_balance) {
         throw ApiError.unprocessable(
-          `That code needs a balance of at least ${coupon.min_balance} points`,
-          { min_balance: coupon.min_balance, balance: current.balance },
+          `That code needs a balance of at least ${coupon.min_balance} ${type.plural}`,
+          { min_balance: coupon.min_balance, balance: current.balance, point_type: type.key },
         );
       }
       if (coupon.max_balance !== null && current.balance > coupon.max_balance) {
         throw ApiError.unprocessable(
-          `That code is only for balances up to ${coupon.max_balance} points`,
-          { max_balance: coupon.max_balance, balance: current.balance },
+          `That code is only for balances up to ${coupon.max_balance} ${type.plural}`,
+          { max_balance: coupon.max_balance, balance: current.balance, point_type: type.key },
         );
       }
     }
@@ -1360,6 +1441,7 @@ export async function redeemCoupon(
         refType: 'coupon',
         refId: coupon.id,
         idempotencyKey: `coupon:${coupon.id}:${contactId}:${coupon.uses + 1}`,
+        pointType: coupon.point_type,
       },
       client,
     );
@@ -1372,7 +1454,7 @@ export async function redeemCoupon(
     if (coupon.grant_rank_key) {
       await assignRankManually(tenantId, contactId, coupon.grant_rank_key, client);
     } else {
-      await evaluateRank(tenantId, contactId, client);
+      await evaluateRank(tenantId, contactId, client, coupon.point_type);
     }
 
     return { points: coupon.points, balance: result.balance };
@@ -1391,8 +1473,10 @@ export async function unlockContent(
   contentRef: string,
   points: number,
   runner?: Queryable,
+  pointTypeKey?: string | null,
 ): Promise<{ unlocked: boolean; alreadyOwned: boolean; balance: Balance }> {
   const run = async (client: Queryable) => {
+    const type = await resolvePointType(tenantId, pointTypeKey, client);
     const existing = await queryOne<{ id: string }>(
       client,
       `SELECT id FROM content_unlocks
@@ -1401,7 +1485,11 @@ export async function unlockContent(
       [tenantId, contactId, contentRef],
     );
     if (existing) {
-      return { unlocked: true, alreadyOwned: true, balance: await getBalance(tenantId, contactId, client) };
+      return {
+        unlocked: true,
+        alreadyOwned: true,
+        balance: await getBalance(tenantId, contactId, client, type.key),
+      };
     }
 
     const debit = await spend(
@@ -1413,6 +1501,7 @@ export async function unlockContent(
         refType: 'content',
         refId: contentRef,
         idempotencyKey: `unlock:${contentRef}:${contactId}`,
+        pointType: type.key,
       },
       client,
     );

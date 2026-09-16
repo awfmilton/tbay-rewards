@@ -1,5 +1,6 @@
 import { db, queryOne, withTransaction, type Queryable } from '../db/pool.js';
 import { ApiError } from '../lib/errors.js';
+import { defaultPointType, listPointTypes, resolvePointType } from './point-types.js';
 import { limitOf, offsetOf } from '../lib/paging.js';
 
 /**
@@ -21,6 +22,7 @@ export interface LedgerEntry {
   status: 'pending' | 'cleared' | 'reversed';
   available_at: Date;
   meta: Record<string, unknown>;
+  point_type: string;
   created_at: Date;
 }
 
@@ -29,6 +31,8 @@ export interface Balance {
   pending: number;
   lifetime_earned: number;
   lifetime_spent: number;
+  /** Which currency this is. Defaults to the tenant's default type. */
+  point_type: string;
 }
 
 export interface AwardInput {
@@ -41,6 +45,8 @@ export interface AwardInput {
   idempotencyKey: string;
   /** Hold the points (e.g. until a refund window closes) before they spend. */
   holdSeconds?: number;
+  /** Which currency. Omit for the tenant's default. */
+  pointType?: string;
   meta?: Record<string, unknown>;
 }
 
@@ -51,20 +57,54 @@ export interface AwardResult {
   created: boolean;
 }
 
-const ZERO_BALANCE: Balance = { balance: 0, pending: 0, lifetime_earned: 0, lifetime_spent: 0 };
+const ZERO_BALANCE: Omit<Balance, 'point_type'> = {
+  balance: 0,
+  pending: 0,
+  lifetime_earned: 0,
+  lifetime_spent: 0,
+};
 
 export async function getBalance(
   tenantId: string,
   contactId: string,
   runner: Queryable = db(),
+  pointType?: string,
 ): Promise<Balance> {
+  const type = pointType ?? (await defaultPointType(tenantId, runner)).key;
   const row = await queryOne<Balance>(
     runner,
-    `SELECT balance, pending, lifetime_earned, lifetime_spent
+    `SELECT balance, pending, lifetime_earned, lifetime_spent, point_type
+       FROM points_balances
+      WHERE tenant_id = $1 AND contact_id = $2 AND point_type = $3`,
+    [tenantId, contactId, type],
+  );
+  return row ?? { ...ZERO_BALANCE, point_type: type };
+}
+
+/**
+ * Every currency this member holds.
+ *
+ * What a storefront showing more than one currency needs, and what a single
+ * `getBalance` call cannot answer without the caller knowing the type list.
+ */
+export async function getBalances(
+  tenantId: string,
+  contactId: string,
+  runner: Queryable = db(),
+): Promise<Balance[]> {
+  const types = await listPointTypes(tenantId, runner);
+  const { rows } = await runner.query<Balance>(
+    `SELECT balance, pending, lifetime_earned, lifetime_spent, point_type
        FROM points_balances WHERE tenant_id = $1 AND contact_id = $2`,
     [tenantId, contactId],
   );
-  return row ?? { ...ZERO_BALANCE };
+
+  const held = new Map(rows.map((row) => [row.point_type, row]));
+  // Every enabled currency appears, held or not: a storefront showing "status
+  // credits: —" is clearer than one where the row vanishes at zero.
+  return types
+    .filter((type) => type.enabled)
+    .map((type) => held.get(type.key) ?? { ...ZERO_BALANCE, point_type: type.key });
 }
 
 /** Credit points. Re-running with the same idempotency key is a no-op. */
@@ -80,13 +120,14 @@ export async function award(
   const run = async (client: Queryable): Promise<AwardResult> => {
     const hold = Math.max(0, input.holdSeconds ?? 0);
     const status = hold > 0 ? 'pending' : 'cleared';
+    const pointType = (await resolvePointType(tenantId, input.pointType, client)).key;
 
     const entry = await queryOne<LedgerEntry>(
       client,
       `INSERT INTO points_ledger (
          tenant_id, contact_id, delta_points, reason, rule_key, ref_type, ref_id,
-         idempotency_key, status, available_at, meta
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now() + ($10 || ' seconds')::interval, $11::jsonb)
+         idempotency_key, status, available_at, meta, point_type
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now() + ($10 || ' seconds')::interval, $11::jsonb, $12)
        ON CONFLICT (tenant_id, idempotency_key) DO NOTHING
        RETURNING *`,
       [
@@ -101,6 +142,7 @@ export async function award(
         status,
         String(hold),
         JSON.stringify(input.meta ?? {}),
+        pointType,
       ],
     );
 
@@ -112,17 +154,23 @@ export async function award(
       );
       return {
         entry: existing!,
-        balance: await getBalance(tenantId, input.contactId, client),
+        balance: await getBalance(tenantId, input.contactId, client, existing?.point_type),
         created: false,
       };
     }
 
-    const balance = await applyToBalance(client, tenantId, input.contactId, {
-      balance: status === 'cleared' ? input.points : 0,
-      pending: status === 'pending' ? input.points : 0,
-      earned: input.points,
-      spent: 0,
-    });
+    const balance = await applyToBalance(
+      client,
+      tenantId,
+      input.contactId,
+      {
+        balance: status === 'cleared' ? input.points : 0,
+        pending: status === 'pending' ? input.points : 0,
+        earned: input.points,
+        spent: 0,
+      },
+      pointType,
+    );
 
     // Let the storefront mirror the new balance (myCred, a header badge, a
     // notification) without polling.
@@ -130,6 +178,7 @@ export async function award(
     await enqueueWebhook(client, tenantId, 'points_awarded', {
       contact_id: input.contactId,
       points: input.points,
+      point_type: pointType,
       reason: input.reason,
       balance: balance.balance,
     });
@@ -147,6 +196,8 @@ export interface SpendInput {
   refType?: string | null;
   refId?: string | null;
   idempotencyKey: string;
+  /** Which currency. Omit for the tenant's default. */
+  pointType?: string;
   meta?: Record<string, unknown>;
 }
 
@@ -166,10 +217,13 @@ export async function spend(
   }
 
   const run = async (client: Queryable): Promise<AwardResult> => {
+    const pointType = (await resolvePointType(tenantId, input.pointType, client)).key;
+
     const locked = await queryOne<{ balance: number }>(
       client,
-      'SELECT balance FROM points_balances WHERE tenant_id = $1 AND contact_id = $2 FOR UPDATE',
-      [tenantId, input.contactId],
+      `SELECT balance FROM points_balances
+        WHERE tenant_id = $1 AND contact_id = $2 AND point_type = $3 FOR UPDATE`,
+      [tenantId, input.contactId, pointType],
     );
     const available = locked?.balance ?? 0;
 
@@ -190,7 +244,7 @@ export async function spend(
       }
       return {
         entry: existing,
-        balance: await getBalance(tenantId, input.contactId, client),
+        balance: await getBalance(tenantId, input.contactId, client, pointType),
         created: false,
       };
     }
@@ -206,8 +260,8 @@ export async function spend(
       client,
       `INSERT INTO points_ledger (
          tenant_id, contact_id, delta_points, reason, ref_type, ref_id,
-         idempotency_key, status, meta
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'cleared', $8::jsonb)
+         idempotency_key, status, meta, point_type
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'cleared', $8::jsonb, $9)
        RETURNING *`,
       [
         tenantId,
@@ -218,20 +272,23 @@ export async function spend(
         input.refId ?? null,
         input.idempotencyKey,
         JSON.stringify(input.meta ?? {}),
+        pointType,
       ],
     );
 
-    const balance = await applyToBalance(client, tenantId, input.contactId, {
-      balance: -input.points,
-      pending: 0,
-      earned: 0,
-      spent: input.points,
-    });
+    const balance = await applyToBalance(
+      client,
+      tenantId,
+      input.contactId,
+      { balance: -input.points, pending: 0, earned: 0, spent: input.points },
+      pointType,
+    );
 
     const { enqueueWebhook } = await import('./automations.js');
     await enqueueWebhook(client, tenantId, 'points_redeemed', {
       contact_id: input.contactId,
       points: input.points,
+      point_type: pointType,
       reason: input.reason,
       balance: balance.balance,
     });
@@ -285,8 +342,9 @@ export async function reverse(
     if (options.clampToBalance && delta < 0 && !wasPendingEntry) {
       const current = await queryOne<{ balance: number }>(
         client,
-        'SELECT balance FROM points_balances WHERE tenant_id = $1 AND contact_id = $2 FOR UPDATE',
-        [tenantId, original.contact_id],
+        `SELECT balance FROM points_balances
+          WHERE tenant_id = $1 AND contact_id = $2 AND point_type = $3 FOR UPDATE`,
+        [tenantId, original.contact_id, original.point_type],
       );
       const available = current?.balance ?? 0;
       if (available < -delta) {
@@ -298,14 +356,15 @@ export async function reverse(
     const compensation = await queryOne<LedgerEntry>(
       client,
       `INSERT INTO points_ledger (
-         tenant_id, contact_id, delta_points, reason, ref_type, ref_id,
+         tenant_id, contact_id, point_type, delta_points, reason, ref_type, ref_id,
          idempotency_key, status, meta
-       ) VALUES ($1, $2, $3, $4, 'ledger_entry', $5, $6, 'cleared', $7::jsonb)
+       ) VALUES ($1, $2, $3, $4, $5, 'ledger_entry', $6, $7, 'cleared', $8::jsonb)
        ON CONFLICT (tenant_id, idempotency_key) DO NOTHING
        RETURNING *`,
       [
         tenantId,
         original.contact_id,
+        original.point_type,
         delta,
         reason,
         original.id,
@@ -330,7 +389,7 @@ export async function reverse(
       pending: wasPendingEntry ? -original.delta_points : 0,
       earned: original.delta_points > 0 ? delta : 0,
       spent: original.delta_points < 0 ? original.delta_points : 0,
-    });
+    }, original.point_type);
 
     return compensation;
   };
@@ -345,6 +404,7 @@ export async function releaseMaturedPoints(runner: Queryable = db()): Promise<nu
       id: string;
       tenant_id: string;
       contact_id: string;
+      point_type: string;
       delta_points: number;
     }>(
       `UPDATE points_ledger SET status = 'cleared'
@@ -355,7 +415,7 @@ export async function releaseMaturedPoints(runner: Queryable = db()): Promise<nu
            LIMIT 500
            FOR UPDATE SKIP LOCKED
         )
-        RETURNING id, tenant_id, contact_id, delta_points`,
+        RETURNING id, tenant_id, contact_id, point_type, delta_points`,
     );
 
     for (const row of rows) {
@@ -364,7 +424,7 @@ export async function releaseMaturedPoints(runner: Queryable = db()): Promise<nu
         pending: -row.delta_points,
         earned: 0,
         spent: 0,
-      });
+      }, row.point_type);
     }
     return rows.length;
   });
@@ -375,6 +435,7 @@ async function applyToBalance(
   tenantId: string,
   contactId: string,
   delta: { balance: number; pending: number; earned: number; spent: number },
+  pointType: string,
 ): Promise<Balance> {
   // Two statements on purpose. An INSERT ... ON CONFLICT DO UPDATE evaluates
   // CHECK constraints against the *proposed* row before the conflict is
@@ -383,22 +444,22 @@ async function applyToBalance(
   // constraint only ever sees the real post-update balance — which is exactly
   // the invariant it exists to protect.
   await client.query(
-    `INSERT INTO points_balances (tenant_id, contact_id) VALUES ($1, $2)
-     ON CONFLICT (tenant_id, contact_id) DO NOTHING`,
-    [tenantId, contactId],
+    `INSERT INTO points_balances (tenant_id, contact_id, point_type) VALUES ($1, $2, $3)
+     ON CONFLICT (tenant_id, contact_id, point_type) DO NOTHING`,
+    [tenantId, contactId, pointType],
   );
 
   const row = await queryOne<Balance>(
     client,
     `UPDATE points_balances SET
-       balance         = balance + $3,
-       pending         = GREATEST(0, pending + $4),
-       lifetime_earned = GREATEST(0, lifetime_earned + $5),
-       lifetime_spent  = GREATEST(0, lifetime_spent + $6),
+       balance         = balance + $4,
+       pending         = GREATEST(0, pending + $5),
+       lifetime_earned = GREATEST(0, lifetime_earned + $6),
+       lifetime_spent  = GREATEST(0, lifetime_spent + $7),
        updated_at      = now()
-     WHERE tenant_id = $1 AND contact_id = $2
-     RETURNING balance, pending, lifetime_earned, lifetime_spent`,
-    [tenantId, contactId, delta.balance, delta.pending, delta.earned, delta.spent],
+     WHERE tenant_id = $1 AND contact_id = $2 AND point_type = $3
+     RETURNING balance, pending, lifetime_earned, lifetime_spent, point_type`,
+    [tenantId, contactId, pointType, delta.balance, delta.pending, delta.earned, delta.spent],
   );
   return row!;
 }
@@ -417,13 +478,16 @@ export async function listLedger(
   contactId: string,
   limit = 50,
   runner: Queryable = db(),
+  /** One currency, or every one of them when omitted. */
+  pointType?: string | null,
 ): Promise<LedgerEntry[]> {
   const { rows } = await runner.query<LedgerEntry>(
     `SELECT * FROM points_ledger
       WHERE tenant_id = $1 AND contact_id = $2
+        AND ($4::text IS NULL OR point_type = $4)
       ORDER BY created_at DESC
       LIMIT $3`,
-    [tenantId, contactId, Math.min(limit, 200)],
+    [tenantId, contactId, Math.min(limit, 200), pointType ?? null],
   );
   return rows;
 }
@@ -440,6 +504,8 @@ export interface LedgerQuery {
   to?: Date | null;
   /** Matches the reason text or the contact's email. */
   search?: string | null;
+  /** One currency, or every one of them when omitted. */
+  pointType?: string | null;
   limit?: number;
   offset?: number;
 }
@@ -484,6 +550,7 @@ export async function queryLedger(
   if (query.ruleKey) add('l.rule_key = $?', query.ruleKey);
   if (query.refType) add('l.ref_type = $?', query.refType);
   if (query.status) add('l.status = $?', query.status);
+  if (query.pointType) add('l.point_type = $?', query.pointType);
   if (query.direction === 'credit') where.push('l.delta_points > 0');
   if (query.direction === 'debit') where.push('l.delta_points < 0');
   if (query.from) add('l.created_at >= $?', query.from);
