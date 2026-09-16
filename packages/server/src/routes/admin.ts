@@ -9,6 +9,17 @@ import { queryLedger, type LedgerQuery } from '../services/points.js';
 import { listSuppressions, suppress, unsuppress } from '../services/deliverability.js';
 import { engagementReport } from '../services/email-tracking.js';
 import {
+  audienceSize,
+  buildSegment,
+  countMatching,
+  deleteSegment,
+  getSegment,
+  listSegments,
+  previewMatching,
+  upsertSegment,
+} from '../services/segments.js';
+import { describeFields } from '../services/segment-filters.js';
+import {
   DEFAULT_TEMPLATES,
   deleteTemplate,
   getTemplate,
@@ -153,6 +164,84 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     const tenant = tenantOf(request);
     return { removed: await deleteProductRule(tenant.id, request.params.id) };
   });
+
+  // ── Segments ───────────────────────────────────────────────────────────────
+
+  /** The field catalogue, so a UI can render a filter builder from it. */
+  app.get('/v1/segments/fields', async () => ({ fields: describeFields() }));
+
+  app.get('/v1/segments', async (request) => {
+    const tenant = tenantOf(request);
+    return { segments: await listSegments(tenant.id) };
+  });
+
+  app.get<{ Params: { key: string } }>('/v1/segments/:key', async (request) => {
+    const tenant = tenantOf(request);
+    const segment = await getSegment(tenant.id, request.params.key);
+    if (!segment) throw ApiError.notFound(`No segment "${request.params.key}"`);
+    return { segment };
+  });
+
+  app.put<{ Params: { key: string } }>('/v1/segments/:key', async (request) => {
+    const tenant = tenantOf(request);
+    const schema = z.object({
+      name: z.string().min(1).max(200).optional(),
+      description: z.string().max(2000).optional(),
+      // Shape-checked here, compiled in the service — the compiler is the only
+      // thing that knows which fields and operators are real.
+      definition: filterGroupSchema.optional(),
+      enabled: z.boolean().optional(),
+    });
+    const input = parse(schema, request.body);
+
+    const segment = await upsertSegment(tenant.id, {
+      key: request.params.key,
+      ...input,
+      definition: input.definition as never,
+    });
+    return { segment };
+  });
+
+  app.delete<{ Params: { key: string } }>('/v1/segments/:key', async (request) => {
+    const tenant = tenantOf(request);
+    return { removed: await deleteSegment(tenant.id, request.params.key) };
+  });
+
+  /**
+   * Count and sample a definition without saving it.
+   *
+   * An admin about to mail forty thousand people should see twenty of them
+   * first: a count alone does not catch "I meant *not* tagged vip".
+   */
+  app.post('/v1/segments/preview', async (request) => {
+    const tenant = tenantOf(request);
+    const input = parse(
+      z.object({ definition: filterGroupSchema, limit: z.number().int().min(1).max(100).optional() }),
+      request.body,
+    );
+    const definition = input.definition as never;
+    return {
+      count: await countMatching(tenant.id, definition),
+      sample: await previewMatching(tenant.id, definition, input.limit ?? 20),
+    };
+  });
+
+  app.post<{ Params: { key: string } }>('/v1/segments/:key/build', async (request) => {
+    const tenant = tenantOf(request);
+    return buildSegment(tenant.id, request.params.key);
+  });
+
+  app.get<{ Params: { key: string }; Querystring: { marketingOnly?: string } }>(
+    '/v1/segments/:key/audience',
+    async (request) => {
+      const tenant = tenantOf(request);
+      const marketingOnly = request.query.marketingOnly !== 'false';
+      return {
+        marketing_only: marketingOnly,
+        size: await audienceSize(tenant.id, request.params.key, marketingOnly),
+      };
+    },
+  );
 
   // ── Deliverability ─────────────────────────────────────────────────────────
 
@@ -447,3 +536,25 @@ function csvCell(value: string): string {
   const guarded = /^[=+\-@\t\r]/.test(text) ? `'${text}` : text;
   return /[",\r\n]/.test(guarded) ? `"${guarded.replace(/"/g, '""')}"` : guarded;
 }
+
+/**
+ * Shape of a filter group, recursively.
+ *
+ * Only the shape: which fields and operators are real is the compiler's
+ * business, and duplicating that list here would give two places to forget to
+ * update. Depth is bounded by the compiler too, but bounding it here as well
+ * stops a deeply nested body from costing anything to reject.
+ */
+const filterSchema = z.object({
+  field: z.string().max(64),
+  operator: z.string().max(32),
+  value: z.unknown().optional(),
+});
+
+const filterGroupSchema: z.ZodType<unknown> = z.lazy(() =>
+  z.object({
+    match: z.enum(['all', 'any']).default('all'),
+    filters: z.array(filterSchema).max(50).optional(),
+    groups: z.array(filterGroupSchema).max(20).optional(),
+  }),
+);
