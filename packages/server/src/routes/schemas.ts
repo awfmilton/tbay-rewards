@@ -154,9 +154,13 @@ export const shareSchema = contactHandleSchema.extend({
  * server agree on the destination. The authoritative address is always the one
  * the member proved they control; a mismatch is rejected rather than honoured.
  */
+/** A currency key, as declared in point_types. Absent means the default. */
+export const pointTypeField = z.string().regex(/^[a-z0-9_]{2,32}$/).optional();
+
 export const redeemSchema = contactHandleSchema.extend({
   points: z.number().int().positive(),
   walletAddress: z.string().length(42).optional(),
+  pointType: pointTypeField,
 });
 
 export const spendSchema = contactHandleSchema.extend({

@@ -21,6 +21,7 @@ const { db, closeDb } = await import('../src/db/pool.js');
 const { provisionTenant } = await import('../src/services/provision.js');
 const { clearTenantCache } = await import('../src/services/tenants.js');
 const { resetRateLimits } = await import('../src/lib/ratelimit.js');
+const { forgetPointTypes } = await import('../src/services/point-types.js');
 const { setChainClient, setClaimSigner } = await import('../src/lib/chain.js');
 const { buildApp } = await import('../src/app.js');
 
@@ -45,6 +46,7 @@ export async function truncateAll(): Promise<void> {
     TRUNCATE tenants, members, token_mint_windows RESTART IDENTITY CASCADE
   `);
   clearTenantCache();
+  forgetPointTypes();
   resetRateLimits();
   setChainClient(null);
   setClaimSigner(null);

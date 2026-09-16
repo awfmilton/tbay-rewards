@@ -3,7 +3,12 @@ import { z } from 'zod';
 import { requireSecretKey, tenantOf } from '../lib/auth.js';
 import { ApiError } from '../lib/errors.js';
 import { parse } from './collect.js';
-import { contactHandleSchema } from './schemas.js';
+import { contactHandleSchema, pointTypeField } from './schemas.js';
+import {
+  deletePointType,
+  listPointTypes,
+  upsertPointType,
+} from '../services/point-types.js';
 import { requireContact } from '../services/contacts.js';
 import { queryLedger, type LedgerQuery } from '../services/points.js';
 import { contactSummary, contactTimeline } from '../services/timeline.js';
@@ -473,7 +478,8 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
 
       const header = [
         'created_at', 'contact_id', 'contact_email', 'contact_name',
-        'delta_points', 'reason', 'rule_key', 'ref_type', 'ref_id', 'status',
+        'point_type', 'delta_points', 'reason', 'rule_key', 'ref_type', 'ref_id',
+        'status',
       ];
       const lines = [header.join(',')];
       for (const row of result.rows) {
@@ -483,6 +489,7 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
             row.contact_id,
             row.contact_email ?? '',
             row.contact_name ?? '',
+            row.point_type,
             String(row.delta_points),
             row.reason,
             row.rule_key ?? '',
@@ -533,6 +540,7 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
       manualOnly: z.boolean().optional(),
       displayOrder: z.number().int().min(0).max(10_000).optional(),
       enabled: z.boolean().optional(),
+      pointType: pointTypeField,
     });
     const input = parse(schema, request.body);
 
@@ -569,6 +577,42 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     },
   );
 
+  // ── Point types ────────────────────────────────────────────────────────────
+  //
+  // A retailer running one currency never touches these; the default is
+  // installed with the tenant and every other endpoint falls back to it.
+
+  app.get('/v1/point-types', async (request) => {
+    const tenant = tenantOf(request);
+    return { point_types: await listPointTypes(tenant.id) };
+  });
+
+  app.put<{ Params: { key: string } }>('/v1/point-types/:key', async (request) => {
+    const tenant = tenantOf(request);
+    const schema = z.object({
+      name: z.string().min(1).max(100).optional(),
+      /** What one and many are called in the storefront. */
+      singular: z.string().min(1).max(50).optional(),
+      plural: z.string().min(1).max(50).optional(),
+      isDefault: z.boolean().optional(),
+      /** May become store credit or TBAY. */
+      convertible: z.boolean().optional(),
+      /** May be sent to another member. */
+      transferable: z.boolean().optional(),
+      displayOrder: z.number().int().min(0).max(10_000).optional(),
+      enabled: z.boolean().optional(),
+    });
+    const input = parse(schema, request.body ?? {});
+    return {
+      point_type: await upsertPointType(tenant.id, { key: request.params.key, ...input }),
+    };
+  });
+
+  app.delete<{ Params: { key: string } }>('/v1/point-types/:key', async (request) => {
+    const tenant = tenantOf(request);
+    return { removed: await deletePointType(tenant.id, request.params.key) };
+  });
+
   // ── Ranks ──────────────────────────────────────────────────────────────────
 
   app.get('/v1/gamification/ranks/admin', async (request) => {
@@ -588,6 +632,7 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
       manualOnly: z.boolean().optional(),
       displayOrder: z.number().int().min(0).max(10_000).optional(),
       enabled: z.boolean().optional(),
+      pointType: pointTypeField,
     });
     const input = parse(schema, request.body);
     return { rank: await upsertRank(tenant.id, { key: request.params.key, ...input }) };
@@ -608,9 +653,12 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
 
   app.post('/v1/gamification/ranks/unassign', async (request) => {
     const tenant = tenantOf(request);
-    const input = parse(contactHandleSchema, request.body);
+    const input = parse(
+      contactHandleSchema.extend({ pointType: pointTypeField }),
+      request.body,
+    );
     const contact = await requireContact(tenant.id, input);
-    return unpinRank(tenant.id, contact.id);
+    return unpinRank(tenant.id, contact.id, undefined, input.pointType);
   });
 
   /**
@@ -664,6 +712,7 @@ function parseLedgerQuery(
   return {
     contactId: query.contactId ?? null,
     ruleKey: query.ruleKey ?? null,
+    pointType: query.pointType ?? null,
     refType: query.refType ?? null,
     status: status ?? null,
     direction: direction ?? null,

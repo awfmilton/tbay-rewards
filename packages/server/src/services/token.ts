@@ -10,7 +10,8 @@ import {
   treasurySender,
   weiToTokenString,
 } from '../lib/chain.js';
-import { getBalance, reverse, spend, type Balance } from './points.js';
+import { getBalance, getBalances, reverse, spend, type Balance } from './points.js';
+import { assertConvertible } from './point-types.js';
 import { randomCode } from '../lib/crypto.js';
 import type { Tenant } from './tenants.js';
 import type { Contact } from './contacts.js';
@@ -50,6 +51,8 @@ export interface RedeemInput {
   contact: Contact;
   points: number;
   walletAddress: string;
+  /** Which currency to spend; the retailer's default when unset. */
+  pointType?: string | null;
 }
 
 export interface RedeemResult {
@@ -106,6 +109,11 @@ export async function redeemPointsForTokens(
   if (!Number.isInteger(input.points) || input.points <= 0) {
     throw ApiError.badRequest('points must be a positive integer');
   }
+
+  // Checked before any supply is reserved or signed for. A currency marked
+  // non-convertible is the whole point of having more than one — status that
+  // can be turned into TBAY is just a second wallet.
+  const pointType = await assertConvertible(tenant.id, input.pointType, runner ?? db());
   if (input.points < cfg.rewards.minRedeemPoints) {
     throw ApiError.unprocessable(
       `Minimum redemption is ${cfg.rewards.minRedeemPoints} points`,
@@ -153,7 +161,12 @@ export async function redeemPointsForTokens(
         idempotencyKey: `redeem:${input.contact.id}:${input.points}:${wallet.toLowerCase()}:${Math.floor(
           Date.now() / 1000,
         )}`,
-        meta: { wallet_address: wallet, amount_wei: amountWei.toString() },
+        pointType: pointType.key,
+        meta: {
+          wallet_address: wallet,
+          amount_wei: amountWei.toString(),
+          point_type: pointType.key,
+        },
       },
       client,
     );
@@ -777,12 +790,16 @@ export async function redeemPointsForCredit(
   contactId: string,
   points: number,
   runner?: Queryable,
+  pointTypeKey?: string | null,
 ): Promise<{ code: string; amount_cents: number; currency: string; balance: Balance }> {
   const cfg = config();
 
   if (!Number.isInteger(points) || points <= 0) {
     throw ApiError.badRequest('points must be a positive integer');
   }
+
+  // Store credit is money, so the same rule as the token path applies.
+  const pointType = await assertConvertible(tenant.id, pointTypeKey, runner ?? db());
 
   const pointsPerToken = Math.max(
     1,
@@ -819,6 +836,7 @@ export async function redeemPointsForCredit(
         refType: 'store_credit',
         refId: `credit:${second}`,
         idempotencyKey: `credit:${contactId}:${points}:${second}`,
+        pointType: pointType.key,
       },
       client,
     );
@@ -906,6 +924,8 @@ export async function walletSummary(
   contact: Contact,
 ): Promise<{
   points: { balance: number; pending: number; lifetime_earned: number; lifetime_spent: number };
+  /** Every currency the retailer runs, so a wallet page can show them all. */
+  balances: Balance[];
   conversion: { points_per_token: number; credit_cents_per_token: number };
   quote_wei: string;
   quote_tokens: string;
@@ -913,6 +933,10 @@ export async function walletSummary(
   onchain_balance_wei: string | null;
   store_credit_cents: number;
 }> {
+  // `points` stays the default currency so existing callers and the plugin's
+  // wallet template keep reading what they always read; `balances` is the
+  // whole set for anyone who wants it.
+  const balances = await getBalances(tenant.id, contact.id);
   const points = await getBalance(tenant.id, contact.id);
   const amountWei = quote(tenant, points.balance);
 
@@ -935,6 +959,7 @@ export async function walletSummary(
 
   return {
     points,
+    balances,
     conversion: {
       points_per_token: pointsPerToken(tenant),
       credit_cents_per_token: creditCentsPerToken(tenant),

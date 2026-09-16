@@ -4,7 +4,7 @@ import { db } from '../db/pool.js';
 import { requireSecretKey, tenantOf } from '../lib/auth.js';
 import { ApiError } from '../lib/errors.js';
 import { parse } from './collect.js';
-import { contactHandleSchema } from './schemas.js';
+import { contactHandleSchema, pointTypeField } from './schemas.js';
 import { requireContact } from '../services/contacts.js';
 import {
   awardBadgeManually,
@@ -68,11 +68,14 @@ export async function gamificationRoutes(app: FastifyInstance): Promise<void> {
   /** Re-run badge and rank evaluation, e.g. after a bulk import. */
   app.post('/v1/gamification/evaluate', async (request) => {
     const tenant = tenantOf(request);
-    const input = parse(contactHandleSchema, request.body);
+    const input = parse(
+      contactHandleSchema.extend({ pointType: pointTypeField }),
+      request.body,
+    );
     const contact = await requireContact(tenant.id, input);
 
     const badges = await evaluateBadges(tenant.id, contact.id);
-    const rank = await evaluateRank(tenant.id, contact.id);
+    const rank = await evaluateRank(tenant.id, contact.id, undefined, input.pointType);
 
     return {
       badges_earned: badges.map((entry) => ({
@@ -81,7 +84,9 @@ export async function gamificationRoutes(app: FastifyInstance): Promise<void> {
         level: entry.level,
         points_awarded: entry.pointsAwarded,
       })),
-      rank: rank.rank ? { key: rank.rank.key, name: rank.rank.name } : null,
+      rank: rank.rank
+        ? { key: rank.rank.key, name: rank.rank.name, point_type: rank.rank.point_type }
+        : null,
       promoted: rank.promoted,
     };
   });
@@ -124,6 +129,7 @@ export async function gamificationRoutes(app: FastifyInstance): Promise<void> {
         toEmail: z.string().email().max(254).optional(),
         points: z.number().int().positive().max(1_000_000),
         message: z.string().max(500).optional(),
+        pointType: pointTypeField,
       }),
       request.body,
     );
@@ -142,6 +148,7 @@ export async function gamificationRoutes(app: FastifyInstance): Promise<void> {
       toContactId: recipient.id,
       points: input.points,
       message: input.message,
+      pointType: input.pointType,
     });
   });
 
@@ -162,6 +169,7 @@ export async function gamificationRoutes(app: FastifyInstance): Promise<void> {
         maxBalance: z.number().int().min(0).nullish(),
         grantBadgeKey: z.string().max(64).nullish(),
         grantRankKey: z.string().max(64).nullish(),
+        pointType: pointTypeField,
       }),
       request.body,
     );
@@ -186,11 +194,19 @@ export async function gamificationRoutes(app: FastifyInstance): Promise<void> {
       contactHandleSchema.extend({
         contentRef: z.string().min(1).max(191),
         points: z.number().int().positive().max(1_000_000),
+        pointType: pointTypeField,
       }),
       request.body,
     );
     const contact = await requireContact(tenant.id, input);
-    return unlockContent(tenant.id, contact.id, input.contentRef, input.points);
+    return unlockContent(
+      tenant.id,
+      contact.id,
+      input.contentRef,
+      input.points,
+      undefined,
+      input.pointType,
+    );
   });
 
   app.get<{ Querystring: { contactId?: string; email?: string; contentRef?: string } }>(

@@ -8,6 +8,7 @@ import {
   contactHandleSchema,
   createLinkSchema,
   orderSchema,
+  pointTypeField,
   redeemSchema,
   shareSchema,
   spendSchema,
@@ -18,7 +19,7 @@ import { getTenantById, updateTenantSettings } from '../services/tenants.js';
 import { assertAddress, weiToTokenString } from '../lib/chain.js';
 import { recordOrder, refundOrder, commissionSummary, listCommissions, markCommissionsPaid } from '../services/commissions.js';
 import { createLink, linkReport, listLinks } from '../services/links.js';
-import { award, getBalance, listLedger, spend } from '../services/points.js';
+import { award, getBalance, getBalances, listLedger, spend } from '../services/points.js';
 import { leaderboard, listRules, trigger, upsertRule, assertRuleKey } from '../services/rewards.js';
 import { createShare, listShares } from '../services/shares.js';
 import {
@@ -267,7 +268,10 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
     async (request) => {
       const tenant = tenantOf(request);
       const contact = await requireContact(tenant.id, request.query);
-      const balance = await getBalance(tenant.id, contact.id);
+      const [balance, balances] = await Promise.all([
+        getBalance(tenant.id, contact.id),
+        getBalances(tenant.id, contact.id),
+      ]);
       return {
         contact_id: contact.id,
         email: contact.email,
@@ -276,7 +280,9 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
         wallet_address: contact.wallet_address,
         is_writer: contact.is_writer,
         tags: contact.tags,
+        // `points` is the default currency, unchanged for existing callers.
         points: balance,
+        balances,
       };
     },
   );
@@ -484,6 +490,8 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
       logTemplate: z.string().max(300).nullish(),
       holdSeconds: z.number().int().min(0).optional(),
       enabled: z.boolean().optional(),
+      /** Which currency this rule pays in; the default when unset. */
+      pointType: pointTypeField,
     });
     const input = parse(schema, request.body);
     assertRuleKey(input.key);
@@ -491,6 +499,7 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
     const rule = await upsertRule(tenant.id, {
       key: input.key,
       name: input.name,
+      point_type: input.pointType,
       event_key: input.eventKey,
       mode: input.mode,
       points: input.points,
@@ -537,18 +546,23 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
       : { awarded: false, reason: outcome.reason, balance: outcome.balance };
   });
 
-  app.get<{ Querystring: { contactId?: string; email?: string; externalRef?: string } }>(
-    '/v1/rewards/balance',
-    async (request) => {
-      const tenant = tenantOf(request);
-      const contact = await requireContact(tenant.id, request.query);
-      return {
-        contact_id: contact.id,
-        ...(await walletSummary(tenant, contact)),
-        ledger: await listLedger(tenant.id, contact.id, 20),
-      };
-    },
-  );
+  app.get<{
+    Querystring: { contactId?: string; email?: string; externalRef?: string; pointType?: string };
+  }>('/v1/rewards/balance', async (request) => {
+    const tenant = tenantOf(request);
+    const contact = await requireContact(tenant.id, request.query);
+    return {
+      contact_id: contact.id,
+      ...(await walletSummary(tenant, contact)),
+      ledger: await listLedger(
+        tenant.id,
+        contact.id,
+        20,
+        undefined,
+        request.query.pointType ?? null,
+      ),
+    };
+  });
 
   /**
    * Credit or debit an exact number of points.
@@ -567,6 +581,7 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
       reason: z.string().min(1).max(255),
       idempotencyKey: z.string().min(4).max(191),
       meta: z.record(z.unknown()).optional(),
+      pointType: pointTypeField,
     });
     const input = parse(schema, request.body);
     const contact = await requireContact(tenant.id, input);
@@ -579,6 +594,7 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
             reason: input.reason,
             refType: 'adjustment',
             idempotencyKey: input.idempotencyKey,
+            pointType: input.pointType,
             meta: input.meta,
           })
         : await spend(tenant.id, {
@@ -587,28 +603,39 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
             reason: input.reason,
             refType: 'adjustment',
             idempotencyKey: input.idempotencyKey,
+            pointType: input.pointType,
             meta: input.meta,
           });
 
-    return { applied: result.created, points: input.points, balance: result.balance };
+    return {
+      applied: result.created,
+      points: input.points,
+      point_type: result.entry.point_type,
+      balance: result.balance,
+    };
   });
 
-  app.get<{ Querystring: { window?: string; limit?: string; contactId?: string } }>(
-    '/v1/rewards/leaderboard',
-    async (request) => {
-      const tenant = tenantOf(request);
-      const window = (['all', 'day', 'week', 'month', 'year'] as const).find(
-        (candidate) => candidate === request.query.window,
-      );
-      const board = await leaderboard(tenant.id, {
-        window: window ?? 'all',
-        limit: request.query.limit ? Number(request.query.limit) : undefined,
-        contactId: request.query.contactId ?? null,
-      });
-      // `leaders` kept for the existing storefront; `you` and `window` are new.
-      return { leaders: board.rows, you: board.you, window: board.window };
-    },
-  );
+  app.get<{
+    Querystring: { window?: string; limit?: string; contactId?: string; pointType?: string };
+  }>('/v1/rewards/leaderboard', async (request) => {
+    const tenant = tenantOf(request);
+    const window = (['all', 'day', 'week', 'month', 'year'] as const).find(
+      (candidate) => candidate === request.query.window,
+    );
+    const board = await leaderboard(tenant.id, {
+      window: window ?? 'all',
+      limit: request.query.limit ? Number(request.query.limit) : undefined,
+      contactId: request.query.contactId ?? null,
+      pointType: request.query.pointType ?? null,
+    });
+    // `leaders` kept for the existing storefront; the rest are new.
+    return {
+      leaders: board.rows,
+      you: board.you,
+      window: board.window,
+      point_type: board.point_type,
+    };
+  });
 
   // ── Social sharing ────────────────────────────────────────────────────────
 
@@ -652,11 +679,14 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
   app.post('/v1/credit/redeem', async (request) => {
     const tenant = tenantOf(request);
     const input = parse(
-      contactHandleSchema.extend({ points: z.number().int().positive().max(10_000_000) }),
+      contactHandleSchema.extend({
+        points: z.number().int().positive().max(10_000_000),
+        pointType: pointTypeField,
+      }),
       request.body,
     );
     const contact = await requireContact(tenant.id, input);
-    return redeemPointsForCredit(tenant, contact.id, input.points);
+    return redeemPointsForCredit(tenant, contact.id, input.points, undefined, input.pointType);
   });
 
   app.get<{ Querystring: { points?: string } }>('/v1/credit/quote', async (request) => {
@@ -686,6 +716,7 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
       contact,
       points: input.points,
       walletAddress: wallet,
+      pointType: input.pointType,
     });
 
     return {
