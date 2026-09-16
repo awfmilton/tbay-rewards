@@ -60,6 +60,17 @@ export function loadConfig() {
       /** Pointer samples per page view kept after server-side downsampling. */
       maxHeatmapPointsPerBatch: num('MAX_HEATMAP_POINTS_PER_BATCH', 500),
       maxEventsPerBatch: num('MAX_EVENTS_PER_BATCH', 100),
+      /**
+       * Fold heatmap and product counters in memory and flush them on a timer
+       * instead of writing each increment inside the request transaction.
+       *
+       * Trades up to one flush interval of analytics counters on a crash for
+       * roughly 50-100x fewer row versions under load, and takes the hot-row
+       * locks off the request path. It never applies to the ledger, balances,
+       * orders or claims — those stay exact and synchronous.
+       */
+      bufferCounters: bool('TBAY_BUFFER_COUNTERS', true),
+      counterFlushMs: num('TBAY_COUNTER_FLUSH_MS', 3000),
     },
 
     carts: {

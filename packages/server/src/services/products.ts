@@ -1,4 +1,5 @@
 import type { Queryable } from '../db/pool.js';
+import { bufferProduct, countersEnabled, flushCounters, shouldFlushNow } from './counters.js';
 
 export type ProductMetric = 'views' | 'clicks' | 'add_to_carts' | 'purchases';
 
@@ -55,6 +56,12 @@ export async function bumpProductStat(
   revenueCents = 0,
   at: Date = new Date(),
 ): Promise<void> {
+  if (countersEnabled()) {
+    bufferProduct(tenantId, productRef, metric, amount, revenueCents, at);
+    if (shouldFlushNow()) await flushCounters(runner);
+    return;
+  }
+
   const column = metric;
   await runner.query(
     `INSERT INTO product_stats (tenant_id, product_ref, stat_date, ${column}, revenue_cents)

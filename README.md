@@ -28,10 +28,16 @@ Built for [tbay.tk LLC](https://tbay.tk).
   templates, and a transactional flag so a receipt is not withheld for want of
   a marketing opt-in
 
-  *Not yet:* dynamic segments, audience broadcasts, open/click tracking,
-  bounce and complaint processing, campaign delays and branching. See
-  [docs/ROADMAP.md](docs/ROADMAP.md) — a feature review against Mautic 7.2
-  found these are what a store would reach for first.
+- Dynamic segments over 24 fields, with audience broadcasts that resume,
+  deduplicate per recipient and respect frequency caps
+- Email open and click tracking, bounce and complaint handling, and RFC 8058
+  one-click unsubscribe
+- Automations as resumable sequences: waits, branches evaluated against live
+  data, and cancellation when someone unsubscribes
+- A contact timeline merging orders, points, email, visits and everything else
+
+  *Not yet:* multiple point types, form-plugin earning hooks, buying points for
+  money. See [docs/ROADMAP.md](docs/ROADMAP.md).
 
 **Rewards and gamification (the myCred replacement)**
 - An append-only points ledger with idempotency keys and transactional balances

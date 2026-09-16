@@ -9,6 +9,8 @@ import { purgeExpiredChallenges } from '../services/wallets.js';
 import { buildAllSegments } from '../services/segments.js';
 import { runDueBroadcasts } from '../services/broadcasts.js';
 import { runDueAutomations } from '../services/automations.js';
+import { flushCounters, startCounterBuffer, stopCounterBuffer } from '../services/counters.js';
+import { config } from '../config.js';
 
 /**
  * Background jobs.
@@ -51,11 +53,27 @@ export const JOBS: Job[] = [
   // Every 30 seconds: a sequence that says "wait one hour" should resume close
   // to the hour, not up to ten minutes late.
   { name: 'automation_resume', intervalMs: 30_000, run: () => runDueAutomations() },
+  // A belt-and-braces flush. The buffer has its own timer; this catches the
+  // case where that timer was never started because buffering is off in this
+  // process but another one wrote into the maps.
+  { name: 'counter_flush', intervalMs: 10_000, run: () => flushCounters() },
 ];
 
 const timers: NodeJS.Timeout[] = [];
 
 export function startWorkers(logger: Logger): void {
+  // Counter buffering is started here rather than at import time so a CLI
+  // script or a test that pulls in these modules never accumulates state it
+  // will not flush. See services/counters.ts for why only analytics counters
+  // are ever buffered.
+  if (config().tracking.bufferCounters) {
+    startCounterBuffer(config().tracking.counterFlushMs);
+    logger.info(
+      { intervalMs: config().tracking.counterFlushMs },
+      'counter buffering on: heatmap and product counters are eventually consistent',
+    );
+  }
+
   for (const job of JOBS) {
     let running = false;
 
@@ -82,6 +100,9 @@ export function startWorkers(logger: Logger): void {
 export function stopWorkers(): void {
   for (const timer of timers) clearInterval(timer);
   timers.length = 0;
+  // Write out whatever is buffered before the process goes. A clean shutdown
+  // losing three seconds of counters would be an avoidable loss.
+  void stopCounterBuffer();
 }
 
 /** Run every job once. Used by the standalone worker entrypoint and by tests. */
