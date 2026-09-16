@@ -132,6 +132,21 @@
 			.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 	}
 
+	/**
+	 * Render a wei string as whole TBAY without going through a double.
+	 *
+	 * Dust is by definition smaller than one bridge unit, so `Number(wei)/1e18`
+	 * loses exactly the digits that matter and prints "0" for a real balance.
+	 * String arithmetic keeps all 18 decimals honest.
+	 */
+	function weiToTokens(wei) {
+		var digits = String(wei == null ? '0' : wei).replace(/[^0-9]/g, '') || '0';
+		while (digits.length < 19) digits = '0' + digits;
+		var whole = digits.slice(0, digits.length - 18).replace(/^0+(?=\d)/, '');
+		var frac = digits.slice(digits.length - 18).replace(/0+$/, '');
+		return frac ? whole + '.' + frac : whole;
+	}
+
 	// ── Newsletter ───────────────────────────────────────────────────────────
 
 	function initNewsletter(form) {
@@ -723,21 +738,29 @@
 			// Three distinct numbers: what they asked for, what arrives, and what
 			// stays behind. Printing the bridgeable amount on two rows made the
 			// rounding invisible, which is the one thing a preview must show.
-			var remainder = (Number(data.amountWei || 0) - Number(data.bridgeableWei || 0)) / 1e18;
+			// BigInt rather than Number: dust is measured in wei, where a double
+			// loses precision well before the last digit.
+			var remainder = '0';
+			try {
+				remainder = String(data.dustWei || '0');
+			} catch (e) { /* leave at zero */ }
 			var rows =
 				'<dl>' +
 				'<dt>' + escapeHtml(i18n.bridgeAsked) + '</dt>' +
 				'<dd>' + escapeHtml(amountInput ? amountInput.value : '') + ' TBAY</dd>' +
 				'<dt>' + escapeHtml(i18n.bridgeReceiveL1) + '</dt>' +
 				'<dd>' + escapeHtml(data.bridgeableTokens) + ' TBAY</dd>' +
-				(remainder > 0
+				(remainder !== '0'
 					? '<dt>' + escapeHtml(i18n.bridgeStays) + '</dt><dd>' +
-					  escapeHtml(remainder.toFixed(18).replace(/0+$/, '')) + ' TBAY</dd>'
+					  escapeHtml(weiToTokens(remainder)) + ' TBAY</dd>'
 					: '') +
 				'</dl>';
 
+			// Prefer the server's note: it knows the live bridge rate, so it can
+			// name the real precision floor instead of a hardcoded one.
 			output.innerHTML = rows +
-				'<p class="tbay-bridge__warning">' + escapeHtml(i18n.bridgeRounding) + '</p>';
+				'<p class="tbay-bridge__warning">' +
+				escapeHtml(data.dustNote || i18n.bridgeRounding) + '</p>';
 			output.hidden = false;
 		}
 
@@ -793,9 +816,14 @@
 	 * Call crosschainBurn from the holder's own wallet.
 	 *
 	 * The contract only allows a burn where `_from` is msg.sender (or a bridge
-	 * role), so this can never burn somebody else's balance. We pass the
-	 * platform-computed bridgeable amount, which is already rounded down to a
-	 * whole L1 unit.
+	 * role), so this can never burn somebody else's balance.
+	 *
+	 * We pass the *full* requested amount rather than the rounded-down
+	 * bridgeable part, because `crosschainBurn` is the dust wrapper: it burns
+	 * the whole L1 units and sweeps the sub-unit remainder to the treasury in
+	 * the same transaction, returning it to the company's L2 supply. Passing the
+	 * rounded amount would skip that path and strand an unspendable crumb in the
+	 * holder's wallet. The quote shows both numbers before this runs.
 	 */
 	function burnOnL2(wallet, quoteData, status) {
 		return Promise.all([loadEthers(), getProvider()]).then(function (parts) {
@@ -820,7 +848,7 @@
 							['function crosschainBurn(address from, uint256 amount)'],
 							signer
 						);
-						return contract.crosschainBurn(signerAddress, quoteData.bridgeableWei);
+						return contract.crosschainBurn(signerAddress, quoteData.amountWei);
 					});
 				})
 				.then(function (tx) {

@@ -14,7 +14,14 @@ import {
   withdrawalInstructions,
 } from '../src/services/bridge.js';
 import { setChainClient, tokensToWei, type ChainClient, type TokenTransfer } from '../src/lib/chain.js';
-import { splitBridgeAmount, addChainParams, chainInfo, txUrl } from '../src/lib/chains.js';
+import {
+  addChainParams,
+  bridgeScale,
+  chainInfo,
+  maxBackedL2Wei,
+  splitBridgeAmount,
+  txUrl,
+} from '../src/lib/chains.js';
 import { expireStaleClaims, redeemPointsForTokens, supplyStatus } from '../src/services/token.js';
 import { resetConfig } from '../src/config.js';
 
@@ -54,6 +61,46 @@ function burnEvent(from: string, value: bigint): TokenTransfer {
   return { from: getAddress(from), to: getAddress(BURN_ADDRESS), value, blockNumber: 10, confirmations: 5 };
 }
 
+describe('bridge rate', () => {
+  /**
+   * The 10^9 in the deployed contract is decimal conversion, not an exchange
+   * rate: 1 whole L1 token becomes exactly 1 whole L2 token. A two-tier design
+   * layers a rate on top, and the split has to follow it.
+   */
+  it('is 1:1 by default, matching the deployed contract', () => {
+    const split = splitBridgeAmount(tokensToWei(1));
+    expect(split.l1Amount).toBe(10n ** 9n); // one whole L1 token in base units
+    expect(split.dust).toBe(0n);
+    expect(bridgeScale(1n)).toBe(10n ** 9n);
+  });
+
+  it('scales the bridge unit with the rate', () => {
+    // At 10,000 L2 per L1, one L1 base unit is worth 10^13 wei.
+    expect(bridgeScale(10_000n)).toBe(10n ** 13n);
+
+    const split = splitBridgeAmount(tokensToWei(10_000), 10_000n);
+    expect(split.l1Amount).toBe(10n ** 9n); // still exactly one L1 token
+    expect(split.dust).toBe(0n);
+  });
+
+  it('raises the dust threshold as the rate rises', () => {
+    // 10^12 wei crosses at 1:1 but is below the unit at 10,000:1.
+    expect(splitBridgeAmount(10n ** 12n, 1n).l1Amount).toBeGreaterThan(0n);
+    expect(splitBridgeAmount(10n ** 12n, 10_000n).l1Amount).toBe(0n);
+  });
+
+  it('computes what an L1 reserve can back', () => {
+    // The whole L1 supply at 1:1 backs 1,000,000 L2 tokens…
+    expect(maxBackedL2Wei(1_000_000n, 1n)).toBe(1_000_000n * 10n ** 18n);
+    // …and at 10,000:1 it backs 10 billion, which is the two-tier target.
+    expect(maxBackedL2Wei(1_000_000n, 10_000n)).toBe(10_000_000_000n * 10n ** 18n);
+  });
+
+  it('rejects a nonsensical rate', () => {
+    expect(() => bridgeScale(0n)).toThrow();
+  });
+});
+
 describe('bridge arithmetic', () => {
   it('splits an L2 amount into bridgeable value and dust', () => {
     // L1 has 9 decimals, L2 has 18, so anything below 1e9 wei cannot cross.
@@ -77,7 +124,13 @@ describe('bridge arithmetic', () => {
 
     const dusty = withdrawalInstructions(tokensToWei(5) + 999n);
     expect(dusty.dustWei).toBe('999');
+    // Rendered at full precision: at six decimals a 999-wei remainder would
+    // read as "0 TBAY", which tells the customer nothing.
+    expect(dusty.dustNote).toContain('0.000000000000000999');
+    // The contract's dust wrapper returns the remainder to the treasury in the
+    // same transaction, so the quote must not imply it stays with the holder.
     expect(dusty.dustNote).toContain('treasury');
+    expect(dusty.dustNote).not.toContain('stays in your wallet');
   });
 
   it('refuses an amount too small to cross at all', () => {

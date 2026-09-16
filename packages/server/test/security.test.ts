@@ -466,18 +466,56 @@ describe('configuration preflight', () => {
     }
   });
 
-  it('rejects a cap larger than the L1 supply that has to back it', async () => {
+  it('rejects a cap larger than the L1 reserve can back', async () => {
     const { resetConfig } = await import('../src/config.js');
     const { preflight } = await import('../src/lib/preflight.js');
 
-    // 2,000,000 TBAY, against an L1 supply that is fixed at 1,000,000.
+    // 2,000,000 L2 TBAY at 1:1, against an L1 supply fixed at 1,000,000.
     process.env.TBAY_REWARD_SUPPLY_CAP_WEI = (2_000_000n * 10n ** 18n).toString();
     resetConfig();
 
     try {
-      expect(preflight().map((f) => f.code)).toContain('cap_exceeds_l1_supply');
+      expect(preflight().map((f) => f.code)).toContain('cap_exceeds_backing');
     } finally {
       delete process.env.TBAY_REWARD_SUPPLY_CAP_WEI;
+      resetConfig();
+    }
+  });
+
+  it('accepts the same cap once the bridge rate backs it', async () => {
+    const { resetConfig } = await import('../src/config.js');
+    const { preflight } = await import('../src/lib/preflight.js');
+
+    // 10 billion L2 is fine at 10,000:1 against the full million.
+    process.env.TBAY_REWARD_SUPPLY_CAP_WEI = (10_000_000_000n * 10n ** 18n).toString();
+    process.env.TBAY_BRIDGE_L2_PER_L1 = '10000';
+    process.env.TBAY_L1_RESERVE_TOKENS = '1000000';
+    resetConfig();
+
+    try {
+      const codes = preflight().filter((f) => f.level === 'error').map((f) => f.code);
+      expect(codes).not.toContain('cap_exceeds_backing');
+      // …but the deployed contract is still 1:1, and that is worth saying.
+      expect(preflight().map((f) => f.code)).toContain('bridge_rate_not_one');
+    } finally {
+      delete process.env.TBAY_REWARD_SUPPLY_CAP_WEI;
+      delete process.env.TBAY_BRIDGE_L2_PER_L1;
+      delete process.env.TBAY_L1_RESERVE_TOKENS;
+      resetConfig();
+    }
+  });
+
+  it('refuses a reserve larger than the L1 supply', async () => {
+    const { resetConfig } = await import('../src/config.js');
+    const { preflight } = await import('../src/lib/preflight.js');
+
+    process.env.TBAY_L1_RESERVE_TOKENS = '5000000';
+    resetConfig();
+
+    try {
+      expect(preflight().map((f) => f.code)).toContain('reserve_exceeds_l1_supply');
+    } finally {
+      delete process.env.TBAY_L1_RESERVE_TOKENS;
       resetConfig();
     }
   });

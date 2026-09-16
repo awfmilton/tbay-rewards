@@ -139,6 +139,22 @@ export function loadConfig() {
        * Era mainnet, where every reward token must be backed by an L1 reserve.
        */
       supplyMode: str('TBAY_SUPPLY_MODE', 'mint') as 'mint' | 'treasury',
+      /**
+       * Whole L2 TBAY per whole L1 TBAY.
+       *
+       * 1 matches the deployed contract, whose bridge math is strictly 1:1. A
+       * two-tier design (e.g. 10,000) needs the L2 contract changed to match —
+       * raising this alone would have the platform quote conversions the chain
+       * will not honour, so preflight checks the two agree.
+       */
+      bridgeL2PerL1: num('TBAY_BRIDGE_L2_PER_L1', 1),
+      /**
+       * Whole L1 TBAY held in reserve to back bridged withdrawals.
+       *
+       * Used to derive how much L2 supply can ever be honoured:
+       *   max backed L2  =  reserve * bridgeL2PerL1
+       */
+      l1ReserveTokens: num('TBAY_L1_RESERVE_TOKENS', 0),
       /** Treasury wallet holding the pre-funded reward allocation. */
       treasuryAddress: process.env.TBAY_TREASURY_ADDRESS ?? '',
       /** Key that sends treasury transfers. Only needed when supplyMode=treasury. */
