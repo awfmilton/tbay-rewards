@@ -263,3 +263,151 @@ X-TBAY-Signature: sha256=<hmac(secret, "<timestamp>.<body>")>
 Verify the HMAC **and** reject timestamps older than a few minutes — the
 timestamp is inside the signed material precisely so a captured delivery cannot
 be replayed later.
+
+---
+
+## Admin endpoints
+
+Added after a parity review against myCred and Mautic found several tables
+reachable only by writing SQL. All of these take the tenant's **secret** key,
+never the public site key.
+
+### Email templates
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/v1/email/templates` | Every template, built-in and overridden |
+| `GET` | `/v1/email/templates/:key` | One template's current content |
+| `PUT` | `/v1/email/templates/:key` | Override it |
+| `DELETE` | `/v1/email/templates/:key` | Revert to the built-in |
+
+`PUT` takes `{ subject, html, text?, transactional? }`.
+
+`transactional` decides whether the message needs marketing consent. A receipt
+for something the person just did — the points their order earned — is
+transactional; anything they did not ask for is not, and stays consent-gated.
+It defaults to `false`, so opting a template out of consent is always a
+deliberate act. Where the line sits legally is the retailer's call, which is
+why this is a switch rather than a hardcoded list.
+
+### Who does not earn
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/v1/rewards/exclusions` | List |
+| `POST` | `/v1/rewards/exclusions` | `{ kind, value, note? }` |
+| `DELETE` | `/v1/rewards/exclusions/:id` | Remove |
+
+`kind` is one of `contact`, `email`, `email_domain`, `role` or `tag`. Values are
+lower-cased on write, so matching never depends on how it was typed. `role`
+matches WordPress roles the plugin syncs into `attributes.roles`.
+
+Exclusion suppresses **earning only**. An excluded contact is still tracked,
+still receives email, and keeps whatever balance they already had — voiding
+history retroactively would be worse than never awarding.
+
+### Per-product point overrides
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/v1/rewards/product-rules?ruleKey=` | List |
+| `POST` | `/v1/rewards/product-rules` | Create or update |
+| `DELETE` | `/v1/rewards/product-rules/:id` | Remove |
+
+```jsonc
+{
+  "ruleKey": "purchase",        // defaults to purchase
+  "matchKind": "product",       // or "category"
+  "matchValue": "gift-card",
+  "mode": "exclude",            // or "multiplier" / "fixed"
+  "multiplier": 2,              // mode: multiplier — scales the line's value
+  "points": 5                   // mode: fixed — points per unit sold
+}
+```
+
+A product rule beats a category rule, and `exclude` beats everything. Lines
+with no match earn the rule's base rate, so a tenant that configures nothing
+behaves exactly as before.
+
+Send `categoryRefs` on order items for category rules to have anything to match.
+
+### Badges and ranks
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/v1/gamification/badges/admin` | Every badge, including disabled |
+| `PUT` | `/v1/gamification/badges/:key` | Create or update |
+| `DELETE` | `/v1/gamification/badges/:key` | Remove |
+| `POST` | `/v1/gamification/badges/:key/revoke` | Take one back |
+| `GET` | `/v1/gamification/ranks/admin` | Every rank |
+| `PUT` | `/v1/gamification/ranks/:key` | Create or update |
+| `DELETE` | `/v1/gamification/ranks/:key` | Remove |
+| `POST` | `/v1/gamification/ranks/assign` | Pin a member to a rank |
+| `POST` | `/v1/gamification/ranks/unassign` | Release the pin and recompute |
+| `POST` | `/v1/gamification/reevaluate` | Recompute everyone |
+
+Badge criteria may be a single measure or a compound:
+
+```jsonc
+{
+  "type": "compound",
+  "compare": "and",             // or "or"
+  "requires": [
+    { "type": "lifetime_points", "threshold": 500 },
+    { "type": "order_count", "threshold": 3 }
+  ]
+}
+```
+
+`and` measures 1 when every requirement is met, so a single tier at threshold 1
+is the myCred behaviour. `or` measures *how many* are met, so tiers can award
+"any one of these" at 1 and "all three" at 3.
+
+Revoking a badge leaves the points alone by default — they were earned under
+the rules as they stood. Pass `reclaimPoints: true` to reverse them, clamped so
+a member who already spent them lands at zero rather than negative.
+
+A pinned rank sets `rank_locked`, and no automatic evaluation moves that member
+until it is released. Run `reevaluate` after editing thresholds or importing
+balances; it is batched and safe to repeat.
+
+### Ledger search and export
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/v1/rewards/ledger` | Search across contacts |
+| `GET` | `/v1/rewards/ledger.csv` | The same query as CSV |
+
+Query parameters: `contactId`, `ruleKey`, `refType`, `status`, `direction`
+(`credit`/`debit`), `from`, `to` (ISO dates), `search` (reason, name or email),
+`limit`, `offset`. An unparseable date is a `400` rather than a silent empty
+result.
+
+The CSV is capped at 50,000 rows and refuses rather than truncating, because a
+short export that looks complete is worse than a refusal. Cells beginning `=`,
+`+`, `-` or `@` are prefixed with an apostrophe so a spreadsheet treats them as
+text — the reason field carries content from the public internet.
+
+The ledger stays append-only. There is deliberately no edit or delete, unlike
+myCred's admin log: a mistake is corrected with a reversal, which leaves both
+entries visible.
+
+### Leaderboard
+
+`GET /v1/rewards/leaderboard?window=month&limit=10&contactId=…`
+
+`window` is `all` (default), `day`, `week`, `month` or `year`. Passing
+`contactId` returns `you` with that member's rank even when they are below the
+cut. Excluded contacts never appear.
+
+### Reward rule fields
+
+`PUT /v1/rewards/rules` now also accepts `weeklyCap`, `monthlyCap`,
+`maxPerAward` and `logTemplate`. Cap windows are evaluated in the **tenant's**
+timezone, not the server's. `logTemplate` substitutes `%amount%`, `%rule%`,
+`%ref%`, `%ref_type%` and `%value%`.
+
+### Transfer limits
+
+`PUT /v1/settings` accepts `transferMinimum`, `transferDailyLimit`,
+`transferWeeklyLimit` and `transferMonthlyLimit`. Unset means unlimited.
