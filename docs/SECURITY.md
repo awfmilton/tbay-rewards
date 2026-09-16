@@ -145,9 +145,44 @@ wallet address.
    mint allowance every other store's customers redeem against. Setting it to
    `0` removes that protection, which is correct only when a single retailer
    runs on the deployment.
-9. **Keep tenant timezones to IANA names.** The platform validates them at
+9. **Issue narrow keys.** The first key a tenant has must be an owner key —
+   there is nobody to issue the second otherwise — but a reporting script, a
+   storefront integration and a support contractor should each hold the
+   narrowest role that does their job. `key:issue --role readonly` or
+   `POST /v1/keys` with a role.
+10. **Keep tenant timezones to IANA names.** The platform validates them at
    tenant creation; a zone written straight into the database is checked at
    award time and falls back to UTC, which silently shifts every daily cap.
+
+---
+
+## Who may do what
+
+A secret key carries a **role**, and one hook enforces it for every route —
+`preHandler` on the root instance, after each plugin's `onRequest`
+authentication and before any handler runs. A check written per route is one
+somebody forgets on the route they add next month, and nobody notices until the
+support contractor deletes a customer.
+
+Anything the rule list does not name falls to the default: a read needs
+`readonly`, a write needs `manager`. A route added later is protected before
+anybody remembers it exists.
+
+| Role | May |
+|---|---|
+| `owner` | Everything, including operators, keys and settings |
+| `manager` | Every operational change: points, rules, badges, broadcasts, erasure, merge |
+| `support` | Read everything; adjust a balance, award a badge, set a field or preference |
+| `readonly` | Read |
+
+A key takes the narrower of its own role and its operator's, and a key with
+neither reads as `owner` — so nothing about this upgrade takes an existing
+integration offline. A disabled operator's keys stop authenticating.
+
+Every mutating request is recorded to an append-only audit log: who, what, the
+outcome status, who it was about, and a short allow-list of request fields.
+Refusals are recorded as well as changes. A failed audit write never fails the
+request.
 
 ---
 

@@ -1,5 +1,6 @@
 import { db, queryOne, type Queryable } from '../db/pool.js';
 import { unsubscribeRequestUrl } from './newsletter.js';
+import { mayReceive, preferencesUrl } from './preferences.js';
 import { config } from '../config.js';
 import { ApiError } from '../lib/errors.js';
 import { getTemplate, queueEmail, renderTemplate, senderFor } from './email.js';
@@ -331,9 +332,25 @@ async function sendEmailAction(
   // want of a marketing opt-in. See `upsertTemplate` for where the line sits.
   if (!template.transactional && !ctx.contact.marketing_consent) return;
 
+  // A paused contact, or one who turned this topic off, is skipped here rather
+  // than at the trigger — a sequence that waits three days should re-check
+  // before each step instead of acting on what was true when it started.
+  //
+  // Transactional mail passes straight through, for the same reason as the
+  // consent check above it.
+  const wanted = await mayReceive(
+    tenant.id,
+    ctx.contact.id,
+    template.topic_key ?? null,
+    undefined,
+    template.transactional,
+  );
+  if (!wanted.allowed) return;
+
   // Built once and used twice: in the body and in the List-Unsubscribe header,
   // so the mail client's own button and the link in the message agree.
   const unsubscribeUrl = unsubscribeRequestUrl(tenant.id, ctx.contact.email);
+  const preferenceUrl = preferencesUrl(tenant.id, ctx.contact.email);
 
   const rendered = renderTemplate(template, {
     tenant_name: tenant.name,
@@ -341,6 +358,7 @@ async function sendEmailAction(
     email: ctx.contact.email,
     rewards_url: (tenant.settings?.siteUrl as string) ?? config().publicUrl,
     unsubscribe_url: unsubscribeUrl,
+    preferences_url: preferenceUrl,
     ...ctx.data,
   });
 

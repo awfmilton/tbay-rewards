@@ -1,5 +1,6 @@
 import { db, queryOne, withTransaction, type Queryable } from '../db/pool.js';
 import { unsubscribeRequestUrl } from './newsletter.js';
+import { mayReceive, preferencesUrl } from './preferences.js';
 import { config } from '../config.js';
 import { ApiError } from '../lib/errors.js';
 import { limitOf } from '../lib/paging.js';
@@ -48,6 +49,8 @@ export interface Broadcast {
   error: string | null;
   created_at: Date;
   updated_at: Date;
+  /** Which topic this belongs to, so a recipient's choice can be honoured. */
+  topic_key: string | null;
 }
 
 export async function upsertBroadcast(
@@ -301,7 +304,18 @@ export async function sendBroadcastBatch(
       continue;
     }
 
+    // Checked here, not when the audience was built. A large send runs over
+    // minutes or hours, and somebody who pauses partway through should not
+    // receive the rest of it.
+    const wanted = await mayReceive(tenantId, contact.id, broadcast.topic_key ?? null, runner);
+    if (!wanted.allowed) {
+      await recordRecipient(runner, broadcast.id, contact.id, null, 'skipped', wanted.reason);
+      skipped += 1;
+      continue;
+    }
+
     const unsubscribeUrl = unsubscribeRequestUrl(tenantId, contact.email);
+    const preferenceUrl = preferencesUrl(tenantId, contact.email);
 
     const rendered = renderTemplate(
       broadcast.subject ? { ...template, subject: broadcast.subject } : template,
@@ -311,6 +325,7 @@ export async function sendBroadcastBatch(
         email: contact.email,
         rewards_url: (tenant.settings?.siteUrl as string) ?? base,
         unsubscribe_url: unsubscribeUrl,
+        preferences_url: preferenceUrl,
       },
     );
 

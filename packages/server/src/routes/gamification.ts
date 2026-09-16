@@ -36,7 +36,10 @@ import { constantTimeEqual, sha256 } from '../lib/crypto.js';
 
 /** Gamification and bridge endpoints. Secret-key authenticated throughout. */
 export async function gamificationRoutes(app: FastifyInstance): Promise<void> {
-  app.addHook('preHandler', async (request) => {
+  // `onRequest`, not `preHandler`: authentication should reject before the
+  // body is read, and the role guard in lib/authorise.ts runs at preHandler —
+  // which is the phase after this one, so by then the key has been resolved.
+  app.addHook('onRequest', async (request) => {
     await requireSecretKey(request);
   });
 

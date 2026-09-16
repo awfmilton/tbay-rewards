@@ -80,12 +80,20 @@ try {
       } else {
         const keyId = `tbs_${randomToken(8)}`;
         const secretValue = randomToken(24);
+        // A role, when one is asked for. Omitted, the key is an owner key —
+        // which is what every key was before roles existed, and what a first
+        // key has to be or the tenant has nobody who can issue the second.
+        const role = flag('role', '');
+        if (role && !['owner', 'manager', 'support', 'readonly'].includes(role)) {
+          throw new Error('--role must be owner, manager, support or readonly');
+        }
         await db().query(
-          `INSERT INTO tenant_keys (tenant_id, kind, key_id, secret_hash, label)
-           VALUES ($1, 'secret', $2, $3, $4)`,
-          [tenant.id, keyId, hashToken(secretValue), flag('label', 'cli')],
+          `INSERT INTO tenant_keys (tenant_id, kind, key_id, secret_hash, label, role)
+           VALUES ($1, 'secret', $2, $3, $4, $5)`,
+          [tenant.id, keyId, hashToken(secretValue), flag('label', 'cli'), role || null],
         );
         console.log(`secret key  ${keyId}.${secretValue}   (shown once)`);
+        if (role) console.log(`role        ${role}`);
       }
       break;
     }
@@ -152,6 +160,7 @@ try {
   tenant:create --slug <slug> --name <name> [--currency USD] [--domain example.com ...] [--site-url https://…]
   tenant:list
   key:issue --slug <slug> [--kind public|secret] [--label <label>]
+            [--role owner|manager|support|readonly]
   key:revoke --key <key_id>
   settings:set --slug <slug> [--payout-wallet 0x…] [--site-url https://…]
                [--points-per-token 100] [--credit-bonus-bps 0]

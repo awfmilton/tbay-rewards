@@ -1,7 +1,8 @@
 import { db, queryOne, type Queryable } from '../db/pool.js';
 import { ApiError } from '../lib/errors.js';
 import { limitOf, offsetOf } from '../lib/paging.js';
-import { compileGroup, type FilterGroup } from './segment-filters.js';
+import { listFields } from './contact-fields.js';
+import { compileGroup, type CustomFields, type FilterGroup } from './segment-filters.js';
 import { assertGamificationKey } from './gamification.js';
 
 /**
@@ -59,7 +60,14 @@ export async function upsertSegment(
     // Compile now so a broken definition is rejected at save time rather than
     // at send time, when an admin is watching a broadcast fail instead of a
     // form.
-    compileGroup(input.definition, await timezoneOf(tenantId, runner));
+    compileGroup(
+      input.definition,
+      await timezoneOf(tenantId, runner),
+      0,
+      0,
+      undefined,
+      await customFieldsFor(tenantId, runner),
+    );
   }
 
   const row = await queryOne<Segment>(
@@ -126,6 +134,12 @@ interface CompiledQuery {
   params: unknown[];
 }
 
+/** The retailer's own fields, as the compiler wants them: key to kind. */
+async function customFieldsFor(tenantId: string, runner: Queryable): Promise<CustomFields> {
+  const fields = await listFields(tenantId, runner);
+  return new Map(fields.map((field) => [field.key, field.kind]));
+}
+
 async function compileFor(
   tenantId: string,
   definition: FilterGroup,
@@ -133,7 +147,14 @@ async function compileFor(
 ): Promise<CompiledQuery> {
   const timezone = await timezoneOf(tenantId, runner);
   // $1 is the tenant, so filter parameters start at index 1.
-  const compiled = compileGroup(definition, timezone, 1);
+  const compiled = compileGroup(
+    definition,
+    timezone,
+    1,
+    0,
+    undefined,
+    await customFieldsFor(tenantId, runner),
+  );
   return {
     where: `c.tenant_id = $1 AND (${compiled.sql})`,
     params: [tenantId, ...compiled.params],

@@ -408,6 +408,292 @@ echoes `point_type`.
 
 ---
 
+## Operators, roles and the audit log (secret)
+
+Every secret key could do everything, which is fine for one person running one
+store. It stops being fine the moment a second person has the key — that is
+when "who adjusted this balance" becomes unanswerable, and when a support
+contractor needs to look things up without also being able to erase a customer
+or issue themselves a key.
+
+**No login layer was added.** The platform is API-first with WordPress as its
+front end; a session system nobody asked for would be the wrong feature. What
+was added is a key attributable to a named person and limited to a role, plus a
+record of what was done.
+
+| Route | Purpose |
+|---|---|
+| `GET` / `PUT /v1/operators` | Named people and their roles |
+| `DELETE /v1/operators/:email` | Remove one (their keys survive, unattributed) |
+| `GET` / `POST /v1/keys` | List and issue keys |
+| `DELETE /v1/keys/:keyId` | Revoke one |
+| `GET /v1/audit` | What was done, by whom |
+
+### Roles
+
+A ladder, not a matrix — a store has four people, not four hundred, and
+"support can do everything readonly can" is what an owner actually means.
+
+| Role | May |
+|---|---|
+| `owner` | Everything, including operators, keys and settings |
+| `manager` | Every operational change: points, rules, badges, broadcasts, erasure, merge |
+| `support` | Read everything; adjust a balance, award a badge, set a field or preference |
+| `readonly` | Read |
+
+Enforced by **one hook**, not a guard per route. A check written at each call
+site is one somebody forgets on the route they add next month, and nobody
+notices until the support contractor deletes a customer. Anything not named in
+the rule list falls to the default — a read needs `readonly`, a write needs
+`manager` — so a new route is protected before anybody remembers it exists.
+
+A key takes the **narrower** of its own role and its operator's. A key with
+neither reads as `owner`, so every key issued before this existed keeps doing
+exactly what it did.
+
+A **disabled operator's keys stop working**. Disabling somebody while the
+credential they carry still works is the appearance of removing access rather
+than removing it.
+
+Removing an operator does **not** revoke their keys — it strips the
+attribution. Revoking somebody's access and silently revoking an integration
+key they happened to issue are different decisions, and doing the second while
+meaning the first takes a storefront down.
+
+### The audit log
+
+Append-only, like the points ledger and for the same reason: a log somebody can
+rewrite answers no question worth asking. There is no edit or delete path.
+
+Recorded: who (operator and key), what (method and path), the outcome status,
+who it was about, and a **short allow-list** of request fields — the amount and
+the reason, not the customer's address again. An audit log that copies every
+field becomes a second store of the personal data the first one is careful
+about.
+
+Refusals are recorded too; a 403 is the entry somebody most wants to find.
+Reads are not — a log of every GET buries the twelve entries that matter.
+
+A failed audit write never fails the request. Losing a line is bad; losing the
+customer's order because the log table was full is worse.
+
+Filters: `operatorId`, `target` (a contact), `action` (a **prefix**, so
+`POST /v1/rewards` covers the area), `from`, `to`.
+
+---
+
+## Merging duplicates (secret)
+
+Somebody checks out as a guest with one address and signs up with another; an
+import brings the same customer in twice. Until now the choice was to leave
+both — their points split across two balances, neither showing the truth — or
+delete one and lose whatever history it held.
+
+| Route | Purpose |
+|---|---|
+| `GET /v1/contacts/duplicates` | Records that look like the same person |
+| `GET /v1/contacts/merge/preview` | What a merge would do, without doing it |
+| `POST /v1/contacts/merge` | `{ "keep": "<uuid>", "merge": "<uuid>" }` |
+
+The survivor **keeps its own id**, so every link a retailer has already saved —
+a WordPress user meta, a webhook payload, a printed card — still resolves.
+
+What happens:
+
+- **Points are added, not picked.** Two balance rows for one person are two
+  halves of one balance, and the ledger behind both moves to the survivor, so
+  the totals have to sum or the balance stops matching its own history. Per
+  currency.
+- **Rows that could collide are reconciled, not blindly updated.** A badge
+  earned to level 3 on one record and level 1 on the other becomes level 3 —
+  taking the survivor's blindly would demote somebody for having been merged.
+  The same for streaks. A subscription, topic preference or custom field the
+  survivor already has is kept; a blind `UPDATE` would trip the unique
+  constraint and fail for exactly the customer who was active on both.
+- **Contact details fill gaps.** Whoever the operator chose to keep is the one
+  whose details they meant to keep, so the loser only supplies what the
+  survivor lacks. Marketing consent is the exception and the direction is
+  deliberate: either record having given it is enough, but a *withdrawal* is
+  never overridden by the other's yes, and the **earlier** consent date wins —
+  those dates prove how long a permission has been held. A pause on either side
+  survives at its later date.
+
+Refused: merging a contact into itself, across tenants, or with an erased
+record — the last would carry what the erased one still holds onto a live
+record, which is the erasure undone by another route.
+
+Duplicate detection is deliberately narrow: a shared wallet (its holder signed
+a challenge to bind it) and a shared platform `member_id`. Not a shared name or
+phone — that is a household, and a merge is irreversible. Not `external_ref` or
+`email` either: both are uniquely indexed per tenant, so neither can duplicate.
+
+---
+
+## The retailer's own contact fields (secret)
+
+Segments filter over a fixed catalogue of platform fields. A flag store wants
+"province" and "preferred fabric"; a rewards programme wants "membership tier".
+
+| Route | Purpose |
+|---|---|
+| `GET /v1/contacts/fields` | The retailer's field definitions |
+| `PUT /v1/contacts/fields/:key` | Create or update one |
+| `DELETE /v1/contacts/fields/:key` | Remove one, and every value under it |
+| `GET` / `PUT /v1/contacts/field-values` | One contact's values |
+| `GET /v1/segments/fields` | Platform and custom fields together |
+
+A key is 2–40 characters of `a-z`, `0-9` or underscore. `kind` is `text`,
+`number`, `date`, `boolean` or `select`; a `select` needs `options`.
+
+```json
+PUT /v1/contacts/fields/fabric
+{ "label": "Preferred fabric", "kind": "select", "options": ["Nylon", "Polyester"] }
+```
+
+Values are **typed columns, not jsonb**, and the reason is where the error
+lands. With jsonb the value is text and a segment filtering "tier > 3" casts at
+read time, so one contact whose tier is "gold" raises in the middle of an
+audience build — a 500 from a screen that did nothing wrong, hours after the
+bad value was written. Typed columns move that failure to the write, where it
+is a 400 naming the field.
+
+Consequences worth knowing:
+
+- Numbers compare as numbers. Over text, "10" sorts below "9".
+- A `select` value is matched case-insensitively and stored in the option's own
+  spelling, so "Nylon", "nylon" and "NYLON" are one segment rather than three.
+- A field's type **cannot change once values are stored under it**. There is no
+  correct automatic answer — "gold" is not a number — so the request is refused
+  rather than silently leaving every value in a column the new type never
+  reads.
+- An unknown key on a write is a 400, not a silent no-op. A typo'd key that
+  quietly does nothing is an integration that looks like it works.
+
+### Segmenting on them
+
+Custom fields are addressed **`cf_<key>`** in a filter, so a retailer defining a
+field called `email` gets `cf_email` and the platform's `email` still means the
+address.
+
+The compiler's rule — no value from a definition ever reaches the SQL string —
+holds here too. A custom field's *name* is retailer data, so it is **bound as a
+parameter**; only the kind, looked up in a fixed table, picks the column.
+
+---
+
+## Preferences and topics (secret)
+
+Unsubscribe is binary, and most people who click it do not want silence. They
+want less, or the one thing they signed up for and not the other three. A store
+that defines no topics keeps today's behaviour exactly: the page then offers a
+pause and an exit, which is still more than a bare unsubscribe link.
+
+| Route | Purpose |
+|---|---|
+| `GET /v1/email/topics` | The retailer's topics |
+| `PUT /v1/email/topics/:key` | Create or update one |
+| `DELETE /v1/email/topics/:key` | Remove one, and the choices about it |
+| `GET` / `PUT /v1/email/preferences` | One contact's preferences |
+| `GET /v1/email/preferences/report` | What people chose instead of leaving |
+
+A topic key is 2–40 characters of `a-z`, `0-9` or underscore. `defaultOn`
+decides what somebody who has never expressed a view receives — on by default,
+because a topic nobody has opted into yet should still send.
+
+`email_templates.topic_key` and `broadcasts.topic_key` say which topic a
+message belongs to. A message with no topic goes to everyone who has consented,
+which is every message a retailer sends until they define one.
+
+### The page
+
+`GET /n/prefs/:token` renders; `POST` applies. The token is signed over exactly
+the (tenant, address) pair, the same construction the unsubscribe link uses and
+for the same reason — the tenant id is printed in every marketing email, so
+anything taking it from a query string could be walked over a list of
+addresses. It does not expire: somebody digging out a two-year-old message to
+turn one thing off is exactly who the page is for.
+
+GET renders, POST acts, deliberately. Corporate link scanners fetch every URL
+in every message, so a page that changed anything on GET would rewrite the
+preferences of precisely the recipients whose employer scans their mail.
+
+The link sits beside Unsubscribe in every marketing email's footer, first.
+
+### Pausing
+
+A pause is not an unsubscribe: consent is untouched and it lifts by itself.
+Capped at a year. Checked **at send time**, not when an audience was built — a
+large broadcast runs over minutes or hours and somebody who pauses partway
+through should not receive the rest of it.
+
+### What ignores all of this
+
+Transactional mail. A receipt, a confirmation, a token claim is the answer to
+something the customer did, and withholding it because they paused the
+newsletter would be withholding a receipt for want of a marketing opt-in.
+
+---
+
+## Privacy (secret)
+
+| Route | Purpose |
+|---|---|
+| `GET /v1/privacy/export` | Everything held about one person |
+| `POST /v1/privacy/erase` | Erase a person, keeping the retailer's books |
+| `GET /v1/privacy/erasures` | Proof that erasures were carried out |
+| `GET` / `PUT /v1/privacy/retention` | How long each category of data is kept |
+
+### Erasure
+
+```json
+POST /v1/privacy/erase
+{ "email": "someone@example.com", "reason": "request", "requestedBy": "ticket-4471" }
+```
+
+The contact row **survives, stripped**. Deleting it would cascade through
+`points_ledger` and take the retailer's own financial record with it, which is
+not what anybody is asking for and in most places is itself unlawful.
+
+What goes: name, address, phone, wallet, external reference, attributes, tags,
+and every row that is personal data and nothing else (events, sessions,
+touchpoints, carts, notifications, wallet challenges, shares, email events,
+automation runs, segment and broadcast membership). Email bodies are blanked
+while delivery metadata survives — a suppression list whose reasons have been
+deleted is a list nobody can audit.
+
+What stays: orders, the points ledger, commissions, store credits and token
+claims. Those are the retailer's accounts.
+
+`forfeitPoints` defaults to **true**. An anonymised row with a spendable
+balance is a liability nobody can ever reconcile: the person it belonged to is
+gone, so nobody can claim it and nobody can write it off. The forfeit is a
+ledger entry reading "Balance forfeited on erasure", so the history explains
+itself. Pass `false` when the retailer is settling the balance separately —
+and settle it *first*.
+
+An erased address cannot be re-added. `/v1/contacts` and the public
+`/v1/identify` both return **422** for it, matched against a per-tenant salted
+hash so the address itself is not kept. The same person at another retailer on
+the same platform is unaffected.
+
+### Retention
+
+```json
+PUT /v1/privacy/retention
+{ "eventDays": 365, "sessionDays": 365, "emailBodyDays": 90, "notificationDays": 180 }
+```
+
+`null` on any field means keep indefinitely, which is what every tenant has
+until they say otherwise. Windows are 1–3650 days. A background job sweeps
+hourly, bounded per pass: a retailer turning on a 30-day policy after two years
+of collection catches up over a day rather than holding locks on the largest
+table in the schema for minutes.
+
+Heatmap and product aggregates are never swept — they are counts and carry no
+identifier. Neither are orders, points or commissions.
+
+---
+
 ## Point types (secret)
 
 More than one currency per retailer. A retailer who never creates a second one

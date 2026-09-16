@@ -30,6 +30,8 @@ class TBAY_Rewards_Manage {
 		'marketing'    => 'Segments & sends',
 		'email'        => 'Email',
 		'currencies'   => 'Currencies',
+		'privacy'      => 'Privacy',
+		'access'       => 'Access & audit',
 	);
 
 	public function __construct( private TBAY_Rewards_API $api ) {
@@ -115,6 +117,12 @@ class TBAY_Rewards_Manage {
 			case 'currencies':
 				$this->screen_currencies();
 				break;
+			case 'privacy':
+				$this->screen_privacy();
+				break;
+			case 'access':
+				$this->screen_access();
+				break;
 			default:
 				$this->screen_customers();
 		}
@@ -193,7 +201,20 @@ class TBAY_Rewards_Manage {
 			'send_broadcast'   => $this->do_send_broadcast(),
 			'cancel_broadcast' => $this->do_cancel_broadcast(),
 			'save_template'    => $this->do_save_template(),
+			'save_topic'       => $this->do_save_topic(),
+			'delete_topic'     => $this->do_delete_topic(),
 			'save_point_type'  => $this->do_save_point_type(),
+			'save_field'       => $this->do_save_field(),
+			'delete_field'     => $this->do_delete_field(),
+			'save_field_values' => $this->do_save_field_values(),
+			'merge_contacts'   => $this->do_merge_contacts(),
+			'save_operator'    => $this->do_save_operator(),
+			'delete_operator'  => $this->do_delete_operator(),
+			'issue_key'        => $this->do_issue_key(),
+			'revoke_key'       => $this->do_revoke_key(),
+			'erase_contact'    => $this->do_erase_contact(),
+			'export_contact'   => $this->do_export_contact(),
+			'save_retention'   => $this->do_save_retention(),
 			'delete_point_type' => $this->do_delete_point_type(),
 			'suppress_email'   => $this->do_suppress_email(),
 			'unsuppress_email' => $this->do_unsuppress_email(),
@@ -248,7 +269,77 @@ class TBAY_Rewards_Manage {
 
 		$this->render_summary_cards( $summary );
 		$this->render_adjust_form( (string) ( $contact['id'] ?? '' ), $contact );
+		$this->render_field_values(
+			(string) ( $contact['id'] ?? '' ),
+			is_array( $data['fields'] ?? null ) ? $data['fields'] : array(),
+			is_array( $data['field_values'] ?? null ) ? $data['field_values'] : array()
+		);
+		$this->render_merge_form( (string) ( $contact['id'] ?? '' ) );
+		$this->render_privacy_actions( (string) ( $contact['id'] ?? '' ), $contact );
 		$this->render_timeline( $timeline );
+	}
+
+	/**
+	 * Answering a subject access request, and carrying out an erasure.
+	 *
+	 * Both belong on the customer screen rather than a settings page: they are
+	 * things somebody does about one named person, usually while that person is
+	 * on the phone.
+	 *
+	 * @param array<string,mixed> $contact The contact record.
+	 */
+	private function render_privacy_actions( string $contact_id, array $contact ): void {
+		if ( '' === $contact_id ) {
+			return;
+		}
+
+		if ( ! empty( $contact['erased_at'] ) ) {
+			printf(
+				'<div class="notice notice-info inline"><p>%s</p></div>',
+				esc_html(
+					sprintf(
+						/* translators: %s: date the contact was erased. */
+						__( 'This person was erased on %s. Their order and points history is kept; everything identifying them is gone.', 'tbay-rewards' ),
+						mysql2date( get_option( 'date_format' ), (string) $contact['erased_at'] )
+					)
+				)
+			);
+			return;
+		}
+		?>
+		<h3><?php esc_html_e( 'Privacy', 'tbay-rewards' ); ?></h3>
+		<p class="description">
+			<?php
+			esc_html_e(
+				'Erasing keeps the order and points history the store needs for its own accounts, and removes everything that identifies the person. It cannot be undone, and they cannot be added back afterwards.',
+				'tbay-rewards'
+			);
+			?>
+		</p>
+		<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="tbay-row-form">
+			<?php wp_nonce_field( 'tbay_manage' ); ?>
+			<input type="hidden" name="action" value="tbay_manage" />
+			<input type="hidden" name="tbay_action" value="export_contact" />
+			<input type="hidden" name="tbay_screen" value="customers" />
+			<input type="hidden" name="contact_id" value="<?php echo esc_attr( $contact_id ); ?>" />
+			<?php submit_button( __( 'Download everything held', 'tbay-rewards' ), 'secondary', '', false ); ?>
+		</form>
+		<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="tbay-row-form"
+			onsubmit="return confirm(<?php echo esc_attr( wp_json_encode( __( 'Erase this person permanently? Their history stays for your accounts, but they cannot be added back.', 'tbay-rewards' ) ) ); ?>);">
+			<?php wp_nonce_field( 'tbay_manage' ); ?>
+			<input type="hidden" name="action" value="tbay_manage" />
+			<input type="hidden" name="tbay_action" value="erase_contact" />
+			<input type="hidden" name="tbay_screen" value="customers" />
+			<input type="hidden" name="contact_id" value="<?php echo esc_attr( $contact_id ); ?>" />
+			<input type="text" name="requested_by" class="regular-text"
+				placeholder="<?php esc_attr_e( 'Ticket or reference (optional)', 'tbay-rewards' ); ?>" />
+			<label>
+				<input type="checkbox" name="keep_points" value="1" />
+				<?php esc_html_e( 'Keep their points balance (you are settling it separately)', 'tbay-rewards' ); ?>
+			</label>
+			<?php submit_button( __( 'Erase this person', 'tbay-rewards' ), 'delete', '', false ); ?>
+		</form>
+		<?php
 	}
 
 	private function render_search_form( string $screen, string $value, string $label ): void {
@@ -1249,6 +1340,7 @@ class TBAY_Rewards_Manage {
 			<?php esc_html_e( 'Allowing an address again does not restore marketing consent — only the customer can give that back.', 'tbay-rewards' ); ?>
 		</p>
 		<?php
+		$this->render_topics();
 	}
 
 	private function render_template_editor( string $key ): void {
@@ -1480,6 +1572,998 @@ class TBAY_Rewards_Manage {
 		}
 		$result = $this->api->request( 'DELETE', '/v1/point-types/' . rawurlencode( $key ) );
 		return is_wp_error( $result ) ? $result : __( 'Currency removed.', 'tbay-rewards' );
+	}
+
+
+	// ── Privacy ──────────────────────────────────────────────────────────────
+
+	private function do_erase_contact(): string|WP_Error {
+		$contact_id = $this->post( 'contact_id' );
+		if ( '' === $contact_id ) {
+			return new WP_Error( 'tbay_bad_input', __( 'Which person?', 'tbay-rewards' ) );
+		}
+
+		$result = $this->api->post(
+			'/v1/privacy/erase',
+			array(
+				'contactId'   => $contact_id,
+				'reason'      => 'request',
+				'requestedBy' => $this->post( 'requested_by' ) ?: wp_get_current_user()->user_login,
+				// The checkbox reads "keep their balance", so its absence is
+				// the forfeit. Named the other way round in the API because
+				// there the default is what happens, not what is ticked.
+				'forfeitPoints' => ! isset( $_POST['keep_points'] ),
+			)
+		);
+		if ( is_wp_error( $result ) ) {
+			return $result;
+		}
+
+		return sprintf(
+			/* translators: %s: number of points forfeited. */
+			__( 'Erased. %s points were forfeited.', 'tbay-rewards' ),
+			number_format_i18n( (int) ( $result['points_forfeited'] ?? 0 ) )
+		);
+	}
+
+	/**
+	 * Send the whole record to the browser as a file.
+	 *
+	 * Streamed straight out rather than stored anywhere: a subject access
+	 * export is the most concentrated personal data the store will ever
+	 * produce, and leaving copies of it in uploads/ is its own breach.
+	 */
+	private function do_export_contact(): string|WP_Error {
+		$contact_id = $this->post( 'contact_id' );
+		if ( '' === $contact_id ) {
+			return new WP_Error( 'tbay_bad_input', __( 'Which person?', 'tbay-rewards' ) );
+		}
+
+		$data = $this->api->request( 'GET', '/v1/privacy/export', array(), array( 'contactId' => $contact_id ) );
+		if ( is_wp_error( $data ) ) {
+			return $data;
+		}
+
+		nocache_headers();
+		header( 'Content-Type: application/json; charset=utf-8' );
+		header(
+			'Content-Disposition: attachment; filename="contact-' . sanitize_file_name( $contact_id ) . '.json"'
+		);
+		echo wp_json_encode( $data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES );
+		exit;
+	}
+
+	private function do_save_retention(): string|WP_Error {
+		// An empty field means "keep it forever", which is null rather than
+		// zero — a zero-day window would delete everything on the next sweep.
+		$window = function ( string $key ): ?int {
+			$raw = $this->post( $key );
+			if ( '' === trim( $raw ) ) {
+				return null;
+			}
+			$value = (int) $raw;
+			return $value > 0 ? $value : null;
+		};
+
+		$result = $this->api->request(
+			'PUT',
+			'/v1/privacy/retention',
+			array(
+				'eventDays'        => $window( 'event_days' ),
+				'sessionDays'      => $window( 'session_days' ),
+				'emailBodyDays'    => $window( 'email_body_days' ),
+				'notificationDays' => $window( 'notification_days' ),
+			)
+		);
+		return is_wp_error( $result ) ? $result : __( 'Retention saved.', 'tbay-rewards' );
+	}
+
+
+	// ── Privacy screen ───────────────────────────────────────────────────────
+
+	/**
+	 * Retention windows, and the record that erasures happened.
+	 *
+	 * Erasing one person is done from their own page, where the operator can
+	 * see who they are erasing. This screen is the standing policy and the
+	 * evidence — the two things somebody asks for at audit rather than at the
+	 * counter.
+	 */
+	private function screen_privacy(): void {
+		$this->render_field_definitions();
+
+		$policy = $this->api->request( 'GET', '/v1/privacy/retention' );
+		$policy = is_wp_error( $policy ) ? array() : ( $policy['retention'] ?? array() );
+
+		$log = $this->api->request( 'GET', '/v1/privacy/erasures', array(), array( 'limit' => 50 ) );
+		$log = is_wp_error( $log ) ? array() : ( $log['erasures'] ?? array() );
+
+		$windows = array(
+			'event_days'        => __( 'Page views and events', 'tbay-rewards' ),
+			'session_days'      => __( 'Visits', 'tbay-rewards' ),
+			'email_body_days'   => __( 'Email bodies', 'tbay-rewards' ),
+			'notification_days' => __( 'In-store notifications', 'tbay-rewards' ),
+		);
+		?>
+		<h2><?php esc_html_e( 'How long data is kept', 'tbay-rewards' ); ?></h2>
+		<p class="description">
+			<?php
+			esc_html_e(
+				'Leave a field empty to keep that data indefinitely, which is what happens today. Orders, points and commissions are never swept: they are your own records. Clearing an email body keeps whether it was delivered, opened and clicked.',
+				'tbay-rewards'
+			);
+			?>
+		</p>
+		<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
+			<?php wp_nonce_field( 'tbay_manage' ); ?>
+			<input type="hidden" name="action" value="tbay_manage" />
+			<input type="hidden" name="tbay_action" value="save_retention" />
+			<input type="hidden" name="tbay_screen" value="privacy" />
+			<table class="form-table">
+				<?php foreach ( $windows as $key => $label ) : ?>
+					<tr>
+						<th scope="row">
+							<label for="tbay-<?php echo esc_attr( $key ); ?>"><?php echo esc_html( $label ); ?></label>
+						</th>
+						<td>
+							<input type="number" min="1" max="3650" class="small-text"
+								id="tbay-<?php echo esc_attr( $key ); ?>"
+								name="<?php echo esc_attr( $key ); ?>"
+								value="<?php echo esc_attr( (string) ( $policy[ $key ] ?? '' ) ); ?>" />
+							<?php esc_html_e( 'days', 'tbay-rewards' ); ?>
+						</td>
+					</tr>
+				<?php endforeach; ?>
+			</table>
+			<?php submit_button( __( 'Save retention', 'tbay-rewards' ) ); ?>
+		</form>
+
+		<h2><?php esc_html_e( 'Erasures carried out', 'tbay-rewards' ); ?></h2>
+		<p class="description">
+			<?php
+			esc_html_e(
+				'Proof that a request was honoured. It holds no personal data — an erasure that recorded who it erased would defeat itself.',
+				'tbay-rewards'
+			);
+			?>
+		</p>
+		<?php if ( empty( $log ) ) : ?>
+			<p><?php esc_html_e( 'Nobody has been erased yet.', 'tbay-rewards' ); ?></p>
+		<?php else : ?>
+			<table class="widefat striped">
+				<thead>
+					<tr>
+						<th><?php esc_html_e( 'When', 'tbay-rewards' ); ?></th>
+						<th><?php esc_html_e( 'Why', 'tbay-rewards' ); ?></th>
+						<th><?php esc_html_e( 'Reference', 'tbay-rewards' ); ?></th>
+						<th><?php esc_html_e( 'Points forfeited', 'tbay-rewards' ); ?></th>
+					</tr>
+				</thead>
+				<tbody>
+				<?php foreach ( $log as $entry ) : ?>
+					<tr>
+						<td><?php echo esc_html( mysql2date( get_option( 'date_format' ) . ' H:i', (string) ( $entry['erased_at'] ?? '' ) ) ); ?></td>
+						<td><?php echo esc_html( (string) ( $entry['reason'] ?? '' ) ); ?></td>
+						<td><?php echo esc_html( (string) ( $entry['requested_by'] ?? '—' ) ); ?></td>
+						<td><?php echo esc_html( number_format_i18n( (int) ( $entry['points_forfeited'] ?? 0 ) ) ); ?></td>
+					</tr>
+				<?php endforeach; ?>
+				</tbody>
+			</table>
+		<?php endif; ?>
+		<?php
+	}
+
+
+	// ── Email topics ─────────────────────────────────────────────────────────
+
+	/**
+	 * What a recipient can choose between on the preference page.
+	 *
+	 * A store that defines none keeps exactly today's behaviour: the page then
+	 * offers only "pause" and "leave", which is still more than the binary
+	 * choice an unsubscribe link gives.
+	 */
+	private function render_topics(): void {
+		$result = $this->api->request( 'GET', '/v1/email/topics' );
+		$topics = is_wp_error( $result ) ? array() : ( $result['topics'] ?? array() );
+
+		$report = $this->api->request( 'GET', '/v1/email/preferences/report', array(), array( 'days' => 30 ) );
+		$changes = is_wp_error( $report ) ? array() : ( $report['changes'] ?? array() );
+		$counts = array();
+		foreach ( $changes as $row ) {
+			$counts[ (string) ( $row['action'] ?? '' ) ] = (int) ( $row['n'] ?? 0 );
+		}
+		?>
+		<h2><?php esc_html_e( 'What customers can choose', 'tbay-rewards' ); ?></h2>
+		<p class="description">
+			<?php
+			esc_html_e(
+				'Topics appear on the preference page your emails link to. Somebody who would have unsubscribed can turn off one thing instead — which is the whole point of having the page.',
+				'tbay-rewards'
+			);
+			?>
+		</p>
+
+		<?php if ( ! empty( $counts ) ) : ?>
+			<p>
+				<?php
+				printf(
+					/* translators: 1: number of topic changes, 2: pauses, 3: unsubscribes. */
+					esc_html__( 'Last 30 days: %1$s changed a topic, %2$s paused, %3$s left.', 'tbay-rewards' ),
+					esc_html( number_format_i18n( $counts['topics'] ?? 0 ) ),
+					esc_html( number_format_i18n( $counts['paused'] ?? 0 ) ),
+					esc_html( number_format_i18n( $counts['unsubscribed'] ?? 0 ) )
+				);
+				?>
+			</p>
+		<?php endif; ?>
+
+		<table class="widefat striped">
+			<thead>
+				<tr>
+					<th><?php esc_html_e( 'Topic', 'tbay-rewards' ); ?></th>
+					<th><?php esc_html_e( 'On by default', 'tbay-rewards' ); ?></th>
+					<th></th>
+				</tr>
+			</thead>
+			<tbody>
+			<?php foreach ( $topics as $topic ) : ?>
+				<tr>
+					<td>
+						<strong><?php echo esc_html( (string) ( $topic['name'] ?? '' ) ); ?></strong><br />
+						<code><?php echo esc_html( (string) ( $topic['key'] ?? '' ) ); ?></code>
+						<?php if ( ! empty( $topic['description'] ) ) : ?>
+							<p class="description"><?php echo esc_html( (string) $topic['description'] ); ?></p>
+						<?php endif; ?>
+					</td>
+					<td><?php echo ( $topic['default_on'] ?? false ) ? esc_html__( 'Yes', 'tbay-rewards' ) : '—'; ?></td>
+					<td>
+						<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="tbay-row-form"
+							onsubmit="return confirm(<?php echo esc_attr( wp_json_encode( __( 'Remove this topic? Everyone who chose about it loses that choice.', 'tbay-rewards' ) ) ); ?>);">
+							<?php wp_nonce_field( 'tbay_manage' ); ?>
+							<input type="hidden" name="action" value="tbay_manage" />
+							<input type="hidden" name="tbay_action" value="delete_topic" />
+							<input type="hidden" name="tbay_screen" value="email" />
+							<input type="hidden" name="key" value="<?php echo esc_attr( (string) ( $topic['key'] ?? '' ) ); ?>" />
+							<?php submit_button( __( 'Remove', 'tbay-rewards' ), 'small', '', false ); ?>
+						</form>
+					</td>
+				</tr>
+			<?php endforeach; ?>
+			</tbody>
+		</table>
+
+		<h3><?php esc_html_e( 'Add a topic', 'tbay-rewards' ); ?></h3>
+		<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
+			<?php wp_nonce_field( 'tbay_manage' ); ?>
+			<input type="hidden" name="action" value="tbay_manage" />
+			<input type="hidden" name="tbay_action" value="save_topic" />
+			<input type="hidden" name="tbay_screen" value="email" />
+			<table class="form-table">
+				<tr>
+					<th scope="row"><label for="tbay-topic-key"><?php esc_html_e( 'Key', 'tbay-rewards' ); ?></label></th>
+					<td>
+						<input type="text" id="tbay-topic-key" name="key" class="regular-text"
+							pattern="[a-z0-9_]{2,40}" required />
+						<p class="description"><?php esc_html_e( 'Used on templates and broadcasts to say which topic they belong to.', 'tbay-rewards' ); ?></p>
+					</td>
+				</tr>
+				<tr>
+					<th scope="row"><label for="tbay-topic-name"><?php esc_html_e( 'Name', 'tbay-rewards' ); ?></label></th>
+					<td><input type="text" id="tbay-topic-name" name="name" class="regular-text" /></td>
+				</tr>
+				<tr>
+					<th scope="row"><label for="tbay-topic-desc"><?php esc_html_e( 'Description', 'tbay-rewards' ); ?></label></th>
+					<td>
+						<input type="text" id="tbay-topic-desc" name="description" class="large-text" />
+						<p class="description"><?php esc_html_e( 'Shown under the name on the preference page.', 'tbay-rewards' ); ?></p>
+					</td>
+				</tr>
+				<tr>
+					<th scope="row"><?php esc_html_e( 'Default', 'tbay-rewards' ); ?></th>
+					<td>
+						<label>
+							<input type="checkbox" name="default_on" value="1" checked />
+							<?php esc_html_e( 'Send to people who have not expressed a view', 'tbay-rewards' ); ?>
+						</label>
+					</td>
+				</tr>
+			</table>
+			<?php submit_button( __( 'Add topic', 'tbay-rewards' ) ); ?>
+		</form>
+		<?php
+	}
+
+	private function do_save_topic(): string|WP_Error {
+		$key = $this->post( 'key' );
+		if ( ! preg_match( '/^[a-z0-9_]{2,40}$/', $key ) ) {
+			return new WP_Error(
+				'tbay_bad_input',
+				__( 'A topic key is 2-40 characters of a-z, 0-9 or underscore.', 'tbay-rewards' )
+			);
+		}
+
+		$payload = array( 'defaultOn' => isset( $_POST['default_on'] ) );
+		foreach ( array( 'name', 'description' ) as $field ) {
+			$value = $this->post( $field );
+			if ( '' !== $value ) {
+				$payload[ $field ] = $value;
+			}
+		}
+
+		$result = $this->api->request( 'PUT', '/v1/email/topics/' . rawurlencode( $key ), $payload );
+		return is_wp_error( $result ) ? $result : __( 'Topic saved.', 'tbay-rewards' );
+	}
+
+	private function do_delete_topic(): string|WP_Error {
+		$key = $this->post( 'key' );
+		if ( '' === $key ) {
+			return new WP_Error( 'tbay_bad_input', __( 'Which topic?', 'tbay-rewards' ) );
+		}
+		$result = $this->api->request( 'DELETE', '/v1/email/topics/' . rawurlencode( $key ) );
+		return is_wp_error( $result ) ? $result : __( 'Topic removed.', 'tbay-rewards' );
+	}
+
+
+	// ── The retailer's own contact fields ────────────────────────────────────
+
+	/**
+	 * Values for one customer, rendered as the right control per type.
+	 *
+	 * A date field gets a date picker and a list field gets a dropdown, which
+	 * is the point of declaring the type: a free-text box is how "ON", "on" and
+	 * "Ontario" become three segments.
+	 *
+	 * @param array<int,array<string,mixed>> $fields Field definitions.
+	 * @param array<string,mixed>            $values Current values by key.
+	 */
+	private function render_field_values( string $contact_id, array $fields, array $values ): void {
+		if ( '' === $contact_id || empty( $fields ) ) {
+			return;
+		}
+		?>
+		<h3><?php esc_html_e( 'Your own fields', 'tbay-rewards' ); ?></h3>
+		<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
+			<?php wp_nonce_field( 'tbay_manage' ); ?>
+			<input type="hidden" name="action" value="tbay_manage" />
+			<input type="hidden" name="tbay_action" value="save_field_values" />
+			<input type="hidden" name="tbay_screen" value="customers" />
+			<input type="hidden" name="contact_id" value="<?php echo esc_attr( $contact_id ); ?>" />
+			<table class="form-table">
+				<?php foreach ( $fields as $field ) : ?>
+					<?php
+					$key   = (string) ( $field['key'] ?? '' );
+					$kind  = (string) ( $field['kind'] ?? 'text' );
+					$value = $values[ $key ] ?? null;
+					$id    = 'tbay-cf-' . sanitize_key( $key );
+					?>
+					<tr>
+						<th scope="row">
+							<label for="<?php echo esc_attr( $id ); ?>">
+								<?php echo esc_html( (string) ( $field['label'] ?? $key ) ); ?>
+							</label>
+						</th>
+						<td>
+							<?php if ( 'select' === $kind ) : ?>
+								<select id="<?php echo esc_attr( $id ); ?>" name="cf[<?php echo esc_attr( $key ); ?>]">
+									<option value=""><?php esc_html_e( '— not set —', 'tbay-rewards' ); ?></option>
+									<?php foreach ( (array) ( $field['options'] ?? array() ) as $option ) : ?>
+										<option value="<?php echo esc_attr( (string) $option ); ?>"
+											<?php selected( (string) $value, (string) $option ); ?>>
+											<?php echo esc_html( (string) $option ); ?>
+										</option>
+									<?php endforeach; ?>
+								</select>
+							<?php elseif ( 'boolean' === $kind ) : ?>
+								<select id="<?php echo esc_attr( $id ); ?>" name="cf[<?php echo esc_attr( $key ); ?>]">
+									<option value=""><?php esc_html_e( '— not answered —', 'tbay-rewards' ); ?></option>
+									<option value="yes" <?php selected( true, true === $value ); ?>><?php esc_html_e( 'Yes', 'tbay-rewards' ); ?></option>
+									<option value="no" <?php selected( true, false === $value ); ?>><?php esc_html_e( 'No', 'tbay-rewards' ); ?></option>
+								</select>
+							<?php elseif ( 'date' === $kind ) : ?>
+								<input type="date" id="<?php echo esc_attr( $id ); ?>"
+									name="cf[<?php echo esc_attr( $key ); ?>]"
+									value="<?php echo esc_attr( $value ? substr( (string) $value, 0, 10 ) : '' ); ?>" />
+							<?php elseif ( 'number' === $kind ) : ?>
+								<input type="number" step="any" id="<?php echo esc_attr( $id ); ?>"
+									name="cf[<?php echo esc_attr( $key ); ?>]"
+									value="<?php echo esc_attr( null === $value ? '' : (string) $value ); ?>" />
+							<?php else : ?>
+								<input type="text" class="regular-text" id="<?php echo esc_attr( $id ); ?>"
+									name="cf[<?php echo esc_attr( $key ); ?>]"
+									value="<?php echo esc_attr( null === $value ? '' : (string) $value ); ?>" />
+							<?php endif; ?>
+							<?php if ( ! empty( $field['description'] ) ) : ?>
+								<p class="description"><?php echo esc_html( (string) $field['description'] ); ?></p>
+							<?php endif; ?>
+						</td>
+					</tr>
+				<?php endforeach; ?>
+			</table>
+			<?php submit_button( __( 'Save fields', 'tbay-rewards' ), 'secondary' ); ?>
+		</form>
+		<?php
+	}
+
+	/**
+	 * Define the fields themselves. Shown on the Privacy screen, because that
+	 * is where "what this store holds about people" already lives.
+	 */
+	private function render_field_definitions(): void {
+		$result = $this->api->request( 'GET', '/v1/contacts/fields' );
+		$fields = is_wp_error( $result ) ? array() : ( $result['fields'] ?? array() );
+		?>
+		<h2><?php esc_html_e( 'Your own fields', 'tbay-rewards' ); ?></h2>
+		<p class="description">
+			<?php
+			esc_html_e(
+				'Fields this store keeps about its customers, beside the ones the platform keeps. They appear on every customer page and can be segmented on. A type cannot be changed once values are stored under it.',
+				'tbay-rewards'
+			);
+			?>
+		</p>
+		<table class="widefat striped">
+			<thead>
+				<tr>
+					<th><?php esc_html_e( 'Field', 'tbay-rewards' ); ?></th>
+					<th><?php esc_html_e( 'Type', 'tbay-rewards' ); ?></th>
+					<th><?php esc_html_e( 'Segment as', 'tbay-rewards' ); ?></th>
+					<th></th>
+				</tr>
+			</thead>
+			<tbody>
+			<?php foreach ( $fields as $field ) : ?>
+				<?php $key = (string) ( $field['key'] ?? '' ); ?>
+				<tr>
+					<td>
+						<strong><?php echo esc_html( (string) ( $field['label'] ?? $key ) ); ?></strong><br />
+						<code><?php echo esc_html( $key ); ?></code>
+					</td>
+					<td>
+						<?php echo esc_html( (string) ( $field['kind'] ?? '' ) ); ?>
+						<?php if ( ! empty( $field['options'] ) ) : ?>
+							<p class="description"><?php echo esc_html( implode( ', ', (array) $field['options'] ) ); ?></p>
+						<?php endif; ?>
+					</td>
+					<td><code>cf_<?php echo esc_html( $key ); ?></code></td>
+					<td>
+						<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="tbay-row-form"
+							onsubmit="return confirm(<?php echo esc_attr( wp_json_encode( __( 'Remove this field? Every value stored under it goes too.', 'tbay-rewards' ) ) ); ?>);">
+							<?php wp_nonce_field( 'tbay_manage' ); ?>
+							<input type="hidden" name="action" value="tbay_manage" />
+							<input type="hidden" name="tbay_action" value="delete_field" />
+							<input type="hidden" name="tbay_screen" value="privacy" />
+							<input type="hidden" name="key" value="<?php echo esc_attr( $key ); ?>" />
+							<?php submit_button( __( 'Remove', 'tbay-rewards' ), 'small', '', false ); ?>
+						</form>
+					</td>
+				</tr>
+			<?php endforeach; ?>
+			</tbody>
+		</table>
+
+		<h3><?php esc_html_e( 'Add a field', 'tbay-rewards' ); ?></h3>
+		<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
+			<?php wp_nonce_field( 'tbay_manage' ); ?>
+			<input type="hidden" name="action" value="tbay_manage" />
+			<input type="hidden" name="tbay_action" value="save_field" />
+			<input type="hidden" name="tbay_screen" value="privacy" />
+			<table class="form-table">
+				<tr>
+					<th scope="row"><label for="tbay-field-key"><?php esc_html_e( 'Key', 'tbay-rewards' ); ?></label></th>
+					<td>
+						<input type="text" id="tbay-field-key" name="key" class="regular-text"
+							pattern="[a-z0-9_]{2,40}" required />
+					</td>
+				</tr>
+				<tr>
+					<th scope="row"><label for="tbay-field-label"><?php esc_html_e( 'Label', 'tbay-rewards' ); ?></label></th>
+					<td><input type="text" id="tbay-field-label" name="label" class="regular-text" /></td>
+				</tr>
+				<tr>
+					<th scope="row"><label for="tbay-field-kind"><?php esc_html_e( 'Type', 'tbay-rewards' ); ?></label></th>
+					<td>
+						<select id="tbay-field-kind" name="kind">
+							<option value="text"><?php esc_html_e( 'Text', 'tbay-rewards' ); ?></option>
+							<option value="number"><?php esc_html_e( 'Number', 'tbay-rewards' ); ?></option>
+							<option value="date"><?php esc_html_e( 'Date', 'tbay-rewards' ); ?></option>
+							<option value="boolean"><?php esc_html_e( 'Yes or no', 'tbay-rewards' ); ?></option>
+							<option value="select"><?php esc_html_e( 'One of a list', 'tbay-rewards' ); ?></option>
+						</select>
+					</td>
+				</tr>
+				<tr>
+					<th scope="row"><label for="tbay-field-options"><?php esc_html_e( 'Choices', 'tbay-rewards' ); ?></label></th>
+					<td>
+						<input type="text" id="tbay-field-options" name="options" class="large-text" />
+						<p class="description"><?php esc_html_e( 'For a list field: the choices, separated by commas.', 'tbay-rewards' ); ?></p>
+					</td>
+				</tr>
+			</table>
+			<?php submit_button( __( 'Add field', 'tbay-rewards' ) ); ?>
+		</form>
+		<?php
+	}
+
+	private function do_save_field(): string|WP_Error {
+		$key = $this->post( 'key' );
+		if ( ! preg_match( '/^[a-z0-9_]{2,40}$/', $key ) ) {
+			return new WP_Error(
+				'tbay_bad_input',
+				__( 'A field key is 2-40 characters of a-z, 0-9 or underscore.', 'tbay-rewards' )
+			);
+		}
+
+		$payload = array( 'kind' => $this->post( 'kind', 'text' ) );
+		$label = $this->post( 'label' );
+		if ( '' !== $label ) {
+			$payload['label'] = $label;
+		}
+
+		$options = array_values(
+			array_filter( array_map( 'trim', explode( ',', $this->post( 'options' ) ) ) )
+		);
+		if ( ! empty( $options ) ) {
+			$payload['options'] = $options;
+		}
+
+		$result = $this->api->request( 'PUT', '/v1/contacts/fields/' . rawurlencode( $key ), $payload );
+		return is_wp_error( $result ) ? $result : __( 'Field saved.', 'tbay-rewards' );
+	}
+
+	private function do_delete_field(): string|WP_Error {
+		$key = $this->post( 'key' );
+		if ( '' === $key ) {
+			return new WP_Error( 'tbay_bad_input', __( 'Which field?', 'tbay-rewards' ) );
+		}
+		$result = $this->api->request( 'DELETE', '/v1/contacts/fields/' . rawurlencode( $key ) );
+		return is_wp_error( $result ) ? $result : __( 'Field removed.', 'tbay-rewards' );
+	}
+
+	private function do_save_field_values(): string|WP_Error {
+		$contact_id = $this->post( 'contact_id' );
+		if ( '' === $contact_id ) {
+			return new WP_Error( 'tbay_bad_input', __( 'Which customer?', 'tbay-rewards' ) );
+		}
+
+		// phpcs:ignore WordPress.Security.NonceVerification.Missing -- checked in handle_post.
+		$raw = isset( $_POST['cf'] ) && is_array( $_POST['cf'] ) ? wp_unslash( $_POST['cf'] ) : array();
+
+		$values = array();
+		foreach ( $raw as $key => $value ) {
+			if ( ! is_string( $key ) || ! preg_match( '/^[a-z0-9_]{2,40}$/', $key ) ) {
+				continue;
+			}
+			$text = is_scalar( $value ) ? trim( (string) $value ) : '';
+			// An empty control clears the value rather than storing "".
+			$values[ sanitize_text_field( $key ) ] = '' === $text ? null : sanitize_text_field( $text );
+		}
+
+		$result = $this->api->request(
+			'PUT',
+			'/v1/contacts/field-values',
+			array( 'contactId' => $contact_id, 'values' => (object) $values )
+		);
+		return is_wp_error( $result ) ? $result : __( 'Fields saved.', 'tbay-rewards' );
+	}
+
+
+	// ── Merging duplicates ───────────────────────────────────────────────────
+
+	/**
+	 * Fold another record into the one on screen.
+	 *
+	 * On the customer page rather than a list, because the person doing it has
+	 * to be looking at the record that survives. A merge is irreversible and it
+	 * moves points, so "which one am I keeping" should never be a guess.
+	 */
+	private function render_merge_form( string $contact_id ): void {
+		if ( '' === $contact_id ) {
+			return;
+		}
+
+		$found = $this->api->request( 'GET', '/v1/contacts/duplicates', array(), array( 'limit' => 25 ) );
+		$found = is_wp_error( $found ) ? array() : ( $found['duplicates'] ?? array() );
+
+		// Only the groups this customer is actually in.
+		$others = array();
+		foreach ( $found as $group ) {
+			$ids = (array) ( $group['contact_ids'] ?? array() );
+			if ( ! in_array( $contact_id, $ids, true ) ) {
+				continue;
+			}
+			foreach ( $ids as $id ) {
+				if ( $id !== $contact_id ) {
+					$others[ (string) $id ] = (string) ( $group['reason'] ?? '' );
+				}
+			}
+		}
+		?>
+		<h3><?php esc_html_e( 'Merge a duplicate', 'tbay-rewards' ); ?></h3>
+		<p class="description">
+			<?php
+			esc_html_e(
+				'The record you are looking at is the one that survives, and it keeps its ID. Points from both are added together, history moves across, and the other record is deleted. This cannot be undone.',
+				'tbay-rewards'
+			);
+			?>
+		</p>
+
+		<?php if ( ! empty( $others ) ) : ?>
+			<p>
+				<strong><?php esc_html_e( 'Possible duplicates found:', 'tbay-rewards' ); ?></strong>
+				<?php foreach ( $others as $id => $reason ) : ?>
+					<br /><code><?php echo esc_html( $id ); ?></code>
+					<span class="description">(<?php echo esc_html( $reason ); ?>)</span>
+				<?php endforeach; ?>
+			</p>
+		<?php endif; ?>
+
+		<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="tbay-row-form"
+			onsubmit="return confirm(<?php echo esc_attr( wp_json_encode( __( 'Merge permanently? The other record is deleted and its points are added to this one.', 'tbay-rewards' ) ) ); ?>);">
+			<?php wp_nonce_field( 'tbay_manage' ); ?>
+			<input type="hidden" name="action" value="tbay_manage" />
+			<input type="hidden" name="tbay_action" value="merge_contacts" />
+			<input type="hidden" name="tbay_screen" value="customers" />
+			<input type="hidden" name="keep" value="<?php echo esc_attr( $contact_id ); ?>" />
+			<label class="screen-reader-text" for="tbay-merge-id">
+				<?php esc_html_e( 'Contact ID to merge in', 'tbay-rewards' ); ?>
+			</label>
+			<input type="text" id="tbay-merge-id" name="merge" class="regular-text"
+				placeholder="<?php esc_attr_e( 'Contact ID of the duplicate', 'tbay-rewards' ); ?>" />
+			<?php submit_button( __( 'Merge into this record', 'tbay-rewards' ), 'secondary', '', false ); ?>
+		</form>
+		<?php
+	}
+
+	private function do_merge_contacts(): string|WP_Error {
+		$keep  = $this->post( 'keep' );
+		$merge = $this->post( 'merge' );
+		if ( '' === $keep || '' === $merge ) {
+			return new WP_Error( 'tbay_bad_input', __( 'Both records are needed.', 'tbay-rewards' ) );
+		}
+
+		$result = $this->api->post(
+			'/v1/contacts/merge',
+			array( 'keep' => $keep, 'merge' => $merge )
+		);
+		if ( is_wp_error( $result ) ) {
+			return $result;
+		}
+
+		$points = array_sum( array_map( 'intval', (array) ( $result['points_moved'] ?? array() ) ) );
+		return sprintf(
+			/* translators: %s: number of points moved. */
+			__( 'Merged. %s points were carried across.', 'tbay-rewards' ),
+			number_format_i18n( $points )
+		);
+	}
+
+
+	// ── Access and audit ─────────────────────────────────────────────────────
+
+	/**
+	 * Who can do what, and what they did.
+	 *
+	 * Everything here needs an owner key. A store where one person holds one
+	 * key never opens this screen; a store where three people share one wants
+	 * it the first time somebody asks who adjusted a balance.
+	 */
+	private function screen_access(): void {
+		$operators = $this->api->request( 'GET', '/v1/operators' );
+		if ( is_wp_error( $operators ) ) {
+			printf(
+				'<div class="notice notice-warning"><p>%s</p></div>',
+				esc_html__( 'This needs an owner key. The key in your settings is narrower than that.', 'tbay-rewards' )
+			);
+			return;
+		}
+		$operators = $operators['operators'] ?? array();
+
+		$keys = $this->api->request( 'GET', '/v1/keys' );
+		$keys = is_wp_error( $keys ) ? array() : ( $keys['keys'] ?? array() );
+
+		$audit = $this->api->request( 'GET', '/v1/audit', array(), array( 'limit' => 50 ) );
+		$audit = is_wp_error( $audit ) ? array() : ( $audit['entries'] ?? array() );
+
+		$roles = array(
+			'owner'    => __( 'Owner — everything, including keys and people', 'tbay-rewards' ),
+			'manager'  => __( 'Manager — every operational change', 'tbay-rewards' ),
+			'support'  => __( 'Support — read anything, adjust a balance', 'tbay-rewards' ),
+			'readonly' => __( 'Read only', 'tbay-rewards' ),
+		);
+		?>
+		<h2><?php esc_html_e( 'People', 'tbay-rewards' ); ?></h2>
+		<table class="widefat striped">
+			<thead><tr>
+				<th><?php esc_html_e( 'Person', 'tbay-rewards' ); ?></th>
+				<th><?php esc_html_e( 'Role', 'tbay-rewards' ); ?></th>
+				<th><?php esc_html_e( 'Active', 'tbay-rewards' ); ?></th>
+				<th></th>
+			</tr></thead>
+			<tbody>
+			<?php foreach ( $operators as $operator ) : ?>
+				<?php $email = (string) ( $operator['email'] ?? '' ); ?>
+				<tr>
+					<td>
+						<strong><?php echo esc_html( (string) ( $operator['name'] ?? $email ) ); ?></strong><br />
+						<code><?php echo esc_html( $email ); ?></code>
+					</td>
+					<td>
+						<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="tbay-row-form">
+							<?php wp_nonce_field( 'tbay_manage' ); ?>
+							<input type="hidden" name="action" value="tbay_manage" />
+							<input type="hidden" name="tbay_action" value="save_operator" />
+							<input type="hidden" name="tbay_screen" value="access" />
+							<input type="hidden" name="email" value="<?php echo esc_attr( $email ); ?>" />
+							<select name="role">
+								<?php foreach ( array_keys( $roles ) as $role ) : ?>
+									<option value="<?php echo esc_attr( $role ); ?>"
+										<?php selected( (string) ( $operator['role'] ?? '' ), $role ); ?>>
+										<?php echo esc_html( $role ); ?>
+									</option>
+								<?php endforeach; ?>
+							</select>
+							<label>
+								<input type="checkbox" name="active" value="1"
+									<?php checked( empty( $operator['disabled_at'] ) ); ?> />
+								<?php esc_html_e( 'Active', 'tbay-rewards' ); ?>
+							</label>
+							<?php submit_button( __( 'Save', 'tbay-rewards' ), 'small', '', false ); ?>
+						</form>
+					</td>
+					<td><?php echo empty( $operator['disabled_at'] ) ? esc_html__( 'Yes', 'tbay-rewards' ) : esc_html__( 'No', 'tbay-rewards' ); ?></td>
+					<td>
+						<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="tbay-row-form"
+							onsubmit="return confirm(<?php echo esc_attr( wp_json_encode( __( 'Remove this person? Their keys keep working — revoke those separately if you mean to.', 'tbay-rewards' ) ) ); ?>);">
+							<?php wp_nonce_field( 'tbay_manage' ); ?>
+							<input type="hidden" name="action" value="tbay_manage" />
+							<input type="hidden" name="tbay_action" value="delete_operator" />
+							<input type="hidden" name="tbay_screen" value="access" />
+							<input type="hidden" name="email" value="<?php echo esc_attr( $email ); ?>" />
+							<?php submit_button( __( 'Remove', 'tbay-rewards' ), 'small', '', false ); ?>
+						</form>
+					</td>
+				</tr>
+			<?php endforeach; ?>
+			</tbody>
+		</table>
+
+		<h3><?php esc_html_e( 'Add a person', 'tbay-rewards' ); ?></h3>
+		<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
+			<?php wp_nonce_field( 'tbay_manage' ); ?>
+			<input type="hidden" name="action" value="tbay_manage" />
+			<input type="hidden" name="tbay_action" value="save_operator" />
+			<input type="hidden" name="tbay_screen" value="access" />
+			<input type="hidden" name="active" value="1" />
+			<table class="form-table">
+				<tr>
+					<th scope="row"><label for="tbay-op-email"><?php esc_html_e( 'Email', 'tbay-rewards' ); ?></label></th>
+					<td><input type="email" id="tbay-op-email" name="email" class="regular-text" required /></td>
+				</tr>
+				<tr>
+					<th scope="row"><label for="tbay-op-name"><?php esc_html_e( 'Name', 'tbay-rewards' ); ?></label></th>
+					<td><input type="text" id="tbay-op-name" name="name" class="regular-text" /></td>
+				</tr>
+				<tr>
+					<th scope="row"><label for="tbay-op-role"><?php esc_html_e( 'Role', 'tbay-rewards' ); ?></label></th>
+					<td>
+						<select id="tbay-op-role" name="role">
+							<?php foreach ( $roles as $role => $label ) : ?>
+								<option value="<?php echo esc_attr( $role ); ?>" <?php selected( 'support', $role ); ?>>
+									<?php echo esc_html( $label ); ?>
+								</option>
+							<?php endforeach; ?>
+						</select>
+					</td>
+				</tr>
+			</table>
+			<?php submit_button( __( 'Add person', 'tbay-rewards' ) ); ?>
+		</form>
+
+		<h2><?php esc_html_e( 'Keys', 'tbay-rewards' ); ?></h2>
+		<?php $issued = $this->query( 'tbay_key' ); ?>
+		<?php if ( '' !== $issued ) : ?>
+			<div class="notice notice-success">
+				<p><strong><?php esc_html_e( 'Copy this now — it is stored as a hash and cannot be shown again.', 'tbay-rewards' ); ?></strong></p>
+				<p><code><?php echo esc_html( $issued ); ?></code></p>
+			</div>
+		<?php endif; ?>
+		<table class="widefat striped">
+			<thead><tr>
+				<th><?php esc_html_e( 'Key', 'tbay-rewards' ); ?></th>
+				<th><?php esc_html_e( 'Role', 'tbay-rewards' ); ?></th>
+				<th><?php esc_html_e( 'Last used', 'tbay-rewards' ); ?></th>
+				<th></th>
+			</tr></thead>
+			<tbody>
+			<?php foreach ( $keys as $key ) : ?>
+				<?php if ( 'secret' !== ( $key['kind'] ?? '' ) || ! empty( $key['revoked_at'] ) ) : ?>
+					<?php continue; ?>
+				<?php endif; ?>
+				<tr>
+					<td>
+						<code><?php echo esc_html( (string) ( $key['key_id'] ?? '' ) ); ?></code><br />
+						<span class="description">
+							<?php echo esc_html( (string) ( $key['operator_email'] ?? $key['label'] ?? '' ) ); ?>
+						</span>
+					</td>
+					<td><?php echo esc_html( (string) ( $key['role'] ?? 'owner' ) ); ?></td>
+					<td>
+						<?php
+						echo empty( $key['last_used_at'] )
+							? esc_html__( 'Never', 'tbay-rewards' )
+							: esc_html( mysql2date( get_option( 'date_format' ), (string) $key['last_used_at'] ) );
+						?>
+					</td>
+					<td>
+						<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="tbay-row-form"
+							onsubmit="return confirm(<?php echo esc_attr( wp_json_encode( __( 'Revoke this key? Anything using it stops working immediately.', 'tbay-rewards' ) ) ); ?>);">
+							<?php wp_nonce_field( 'tbay_manage' ); ?>
+							<input type="hidden" name="action" value="tbay_manage" />
+							<input type="hidden" name="tbay_action" value="revoke_key" />
+							<input type="hidden" name="tbay_screen" value="access" />
+							<input type="hidden" name="key_id" value="<?php echo esc_attr( (string) ( $key['key_id'] ?? '' ) ); ?>" />
+							<?php submit_button( __( 'Revoke', 'tbay-rewards' ), 'small', '', false ); ?>
+						</form>
+					</td>
+				</tr>
+			<?php endforeach; ?>
+			</tbody>
+		</table>
+
+		<h3><?php esc_html_e( 'Issue a key', 'tbay-rewards' ); ?></h3>
+		<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
+			<?php wp_nonce_field( 'tbay_manage' ); ?>
+			<input type="hidden" name="action" value="tbay_manage" />
+			<input type="hidden" name="tbay_action" value="issue_key" />
+			<input type="hidden" name="tbay_screen" value="access" />
+			<table class="form-table">
+				<tr>
+					<th scope="row"><label for="tbay-key-label"><?php esc_html_e( 'What it is for', 'tbay-rewards' ); ?></label></th>
+					<td><input type="text" id="tbay-key-label" name="label" class="regular-text" /></td>
+				</tr>
+				<tr>
+					<th scope="row"><label for="tbay-key-operator"><?php esc_html_e( 'Person', 'tbay-rewards' ); ?></label></th>
+					<td>
+						<select id="tbay-key-operator" name="operator_email">
+							<option value=""><?php esc_html_e( '— nobody in particular —', 'tbay-rewards' ); ?></option>
+							<?php foreach ( $operators as $operator ) : ?>
+								<option value="<?php echo esc_attr( (string) ( $operator['email'] ?? '' ) ); ?>">
+									<?php echo esc_html( (string) ( $operator['email'] ?? '' ) ); ?>
+								</option>
+							<?php endforeach; ?>
+						</select>
+					</td>
+				</tr>
+				<tr>
+					<th scope="row"><label for="tbay-key-role"><?php esc_html_e( 'Role', 'tbay-rewards' ); ?></label></th>
+					<td>
+						<select id="tbay-key-role" name="role">
+							<option value=""><?php esc_html_e( '— whatever the person has —', 'tbay-rewards' ); ?></option>
+							<?php foreach ( $roles as $role => $label ) : ?>
+								<option value="<?php echo esc_attr( $role ); ?>"><?php echo esc_html( $label ); ?></option>
+							<?php endforeach; ?>
+						</select>
+						<p class="description"><?php esc_html_e( 'The narrower of the two applies.', 'tbay-rewards' ); ?></p>
+					</td>
+				</tr>
+			</table>
+			<?php submit_button( __( 'Issue key', 'tbay-rewards' ) ); ?>
+		</form>
+
+		<h2><?php esc_html_e( 'What was done', 'tbay-rewards' ); ?></h2>
+		<p class="description">
+			<?php esc_html_e( 'Changes only — reads are not recorded. Refusals appear here too.', 'tbay-rewards' ); ?>
+		</p>
+		<table class="widefat striped">
+			<thead><tr>
+				<th><?php esc_html_e( 'When', 'tbay-rewards' ); ?></th>
+				<th><?php esc_html_e( 'Who', 'tbay-rewards' ); ?></th>
+				<th><?php esc_html_e( 'What', 'tbay-rewards' ); ?></th>
+				<th><?php esc_html_e( 'Result', 'tbay-rewards' ); ?></th>
+			</tr></thead>
+			<tbody>
+			<?php foreach ( $audit as $entry ) : ?>
+				<tr>
+					<td><?php echo esc_html( mysql2date( get_option( 'date_format' ) . ' H:i', (string) ( $entry['created_at'] ?? '' ) ) ); ?></td>
+					<td>
+						<?php echo esc_html( (string) ( $entry['operator_email'] ?? $entry['actor_label'] ?? '—' ) ); ?><br />
+						<span class="description"><?php echo esc_html( (string) ( $entry['role'] ?? '' ) ); ?></span>
+					</td>
+					<td>
+						<code><?php echo esc_html( (string) ( $entry['action'] ?? '' ) ); ?></code>
+						<?php if ( ! empty( $entry['detail'] ) ) : ?>
+							<p class="description"><?php echo esc_html( wp_json_encode( $entry['detail'] ) ); ?></p>
+						<?php endif; ?>
+					</td>
+					<td><?php echo esc_html( (string) ( $entry['status'] ?? '' ) ); ?></td>
+				</tr>
+			<?php endforeach; ?>
+			</tbody>
+		</table>
+		<?php
+	}
+
+	private function do_save_operator(): string|WP_Error {
+		$email = $this->post( 'email' );
+		if ( ! is_email( $email ) ) {
+			return new WP_Error( 'tbay_bad_input', __( 'That is not an email address.', 'tbay-rewards' ) );
+		}
+
+		$payload = array(
+			'email'    => $email,
+			'disabled' => ! isset( $_POST['active'] ),
+		);
+		foreach ( array( 'name', 'role' ) as $field ) {
+			$value = $this->post( $field );
+			if ( '' !== $value ) {
+				$payload[ $field ] = $value;
+			}
+		}
+
+		$result = $this->api->request( 'PUT', '/v1/operators', $payload );
+		return is_wp_error( $result ) ? $result : __( 'Saved.', 'tbay-rewards' );
+	}
+
+	private function do_delete_operator(): string|WP_Error {
+		$email = $this->post( 'email' );
+		if ( '' === $email ) {
+			return new WP_Error( 'tbay_bad_input', __( 'Which person?', 'tbay-rewards' ) );
+		}
+		$result = $this->api->request( 'DELETE', '/v1/operators/' . rawurlencode( $email ) );
+		return is_wp_error( $result ) ? $result : __( 'Removed. Their keys still work — revoke those separately.', 'tbay-rewards' );
+	}
+
+	/**
+	 * Issue a key and show it once.
+	 *
+	 * Carried back in the redirect rather than stored: the platform keeps only
+	 * a hash, so there is nothing to show a second time, and writing it into an
+	 * option would put the one copy somewhere it was never meant to be.
+	 */
+	private function do_issue_key(): string|WP_Error {
+		// Only what was filled in: an empty role means "whatever the person
+		// has", and sending '' would be a role the API does not know.
+		$payload = array();
+		$fields  = array(
+			'label'          => 'label',
+			'operator_email' => 'operatorEmail',
+			'role'           => 'role',
+		);
+		foreach ( $fields as $form_field => $api_field ) {
+			$value = $this->post( $form_field );
+			if ( '' !== $value ) {
+				$payload[ $api_field ] = $value;
+			}
+		}
+
+		$result = $this->api->post( '/v1/keys', $payload );
+		if ( is_wp_error( $result ) ) {
+			return $result;
+		}
+
+		wp_safe_redirect(
+			add_query_arg(
+				array(
+					'page'     => 'tbay-manage-access',
+					'tbay_msg' => rawurlencode( __( 'Key issued.', 'tbay-rewards' ) ),
+					'tbay_key' => rawurlencode( (string) ( $result['secret'] ?? '' ) ),
+				),
+				admin_url( 'admin.php' )
+			)
+		);
+		exit;
+	}
+
+	private function do_revoke_key(): string|WP_Error {
+		$key_id = $this->post( 'key_id' );
+		if ( '' === $key_id ) {
+			return new WP_Error( 'tbay_bad_input', __( 'Which key?', 'tbay-rewards' ) );
+		}
+		$result = $this->api->request( 'DELETE', '/v1/keys/' . rawurlencode( $key_id ) );
+		return is_wp_error( $result ) ? $result : __( 'Key revoked.', 'tbay-rewards' );
 	}
 
 }

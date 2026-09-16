@@ -15,7 +15,14 @@ import {
 import { getCartByRecoveryToken } from '../services/carts.js';
 import { messageByToken, recordEngagement } from '../services/email-tracking.js';
 import { fire } from '../services/automations.js';
-import { getContact } from '../services/contacts.js';
+import { findContactByEmail, getContact } from '../services/contacts.js';
+import {
+  getPreferences,
+  recordUnsubscribe,
+  setPreferences,
+  verifyPreferencesToken,
+  type Preferences,
+} from '../services/preferences.js';
 import { suppress } from '../services/deliverability.js';
 
 /**
@@ -220,6 +227,104 @@ export async function redirectRoutes(app: FastifyInstance): Promise<void> {
     },
   });
 
+
+  /**
+   * The preference centre.
+   *
+   * Unsubscribe is binary, and most people who click it do not want silence —
+   * they want less, or they want one of the four things a store sends. Offered
+   * only the binary choice they take it, and the list loses somebody who would
+   * have stayed on a monthly digest.
+   *
+   * Signed exactly like the unsubscribe link, and split the same way: GET
+   * renders, POST acts. Corporate link scanners fetch every URL in every
+   * message, so a page that changed anything on GET would rewrite the
+   * preferences of precisely the recipients whose employer scans their mail.
+   */
+  app.get<{ Params: { token: string } }>('/n/prefs/:token', async (request, reply) => {
+    const verified = verifyPreferencesToken(request.params.token);
+    if (!verified) {
+      return reply
+        .type('text/html')
+        .code(400)
+        .send(
+          page(
+            'Link not valid',
+            'That link is not one we recognise. If you received email you did not ask for, reply to it and we will remove you.',
+          ),
+        );
+    }
+
+    const contact = await findContactByEmail(verified.tenantId, verified.email);
+    if (!contact) {
+      // The same answer either way: the page must not become a way to test
+      // which addresses a store holds.
+      return reply
+        .type('text/html')
+        .send(page('Nothing to change', 'We do not have any email preferences on file for you.'));
+    }
+
+    const prefs = await getPreferences(verified.tenantId, contact.id);
+    const tenant = await getTenantById(verified.tenantId);
+    return reply
+      .type('text/html')
+      .send(preferencesPage(prefs, tenant?.name ?? '', request.params.token));
+  });
+
+  app.post<{
+    Params: { token: string };
+    Body: Record<string, string | string[] | undefined>;
+  }>('/n/prefs/:token', async (request, reply) => {
+    const verified = verifyPreferencesToken(request.params.token);
+    if (!verified) {
+      return reply.type('text/html').code(400).send(page('Link not valid', 'That link is not one we recognise.'));
+    }
+
+    const contact = await findContactByEmail(verified.tenantId, verified.email);
+    if (!contact) {
+      return reply.type('text/html').send(page('Nothing to change', 'We do not have any email preferences on file for you.'));
+    }
+
+    const body = request.body ?? {};
+
+    // Leaving entirely is still one click from here. Somebody who came to turn
+    // one thing off and decided otherwise should not have to hunt for it.
+    if (body.unsubscribe) {
+      await recordUnsubscribe(verified.tenantId, contact.id);
+      await unsubscribeByEmail(verified.tenantId, verified.email).catch(() => false);
+      await suppress(
+        verified.tenantId,
+        verified.email,
+        'manual',
+        'Unsubscribed from the preference centre',
+      ).catch(() => null);
+      return reply
+        .type('text/html')
+        .send(page('Unsubscribed', 'You will not receive any further marketing email from us.'));
+    }
+
+    // Every checkbox that was shown, whether or not it came back: an unticked
+    // box sends nothing, so reading only what arrived would make turning a
+    // topic off impossible.
+    const current = await getPreferences(verified.tenantId, contact.id);
+    const topics: Record<string, boolean> = {};
+    for (const topic of current.topics) {
+      if (!topic.selectable) continue;
+      topics[topic.key] = body[`topic_${topic.key}`] !== undefined;
+    }
+
+    const pauseRaw = typeof body.pause_days === 'string' ? Number(body.pause_days) : 0;
+    const pauseDays = Number.isFinite(pauseRaw) ? pauseRaw : 0;
+
+    await setPreferences(verified.tenantId, contact.id, { topics, pauseDays });
+
+    const saved = await getPreferences(verified.tenantId, contact.id);
+    const tenant = await getTenantById(verified.tenantId);
+    return reply
+      .type('text/html')
+      .send(preferencesPage(saved, tenant?.name ?? '', request.params.token, true));
+  });
+
   /**
    * The old unsigned endpoint, kept only to answer links already in inboxes.
    *
@@ -336,6 +441,122 @@ function confirmPage(title: string, bodyHtml: string, action: string): string {
     `border:0;border-radius:8px;background:#1d1d1f;color:#fff;cursor:pointer">` +
     `Yes, unsubscribe me</button></form>`;
   return base.replace('<p></p>', form);
+}
+
+
+/**
+ * The preference page itself.
+ *
+ * Plain server-rendered HTML with no script: it opens from an email, often on
+ * a phone, sometimes in a webmail preview pane, and a page that needs
+ * JavaScript to render a checkbox is a page that shows some of those people
+ * nothing.
+ *
+ * "Leave entirely" is present and last. Burying it would be the dark pattern
+ * this page exists to avoid — the argument for a preference centre is that
+ * people choose to stay, not that they cannot find the exit.
+ */
+function preferencesPage(
+  prefs: Preferences,
+  storeName: string,
+  token: string,
+  saved = false,
+): string {
+  const action = `${config().publicUrl}/n/prefs/${encodeURIComponent(token)}`;
+  const selectable = prefs.topics.filter((topic) => topic.selectable);
+
+  const pausedNotice = prefs.paused_until
+    ? `<p class="note">Your email is paused until ${escapeHtml(
+        prefs.paused_until.toISOString().slice(0, 10),
+      )}. Choosing "Send as usual" below starts it again.</p>`
+    : '';
+
+  const savedNotice = saved ? '<p class="saved">Saved.</p>' : '';
+
+  const topicFields =
+    selectable.length === 0
+      ? ''
+      : `<fieldset><legend>What to send</legend>${selectable
+          .map(
+            (topic) =>
+              `<label class="row"><input type="checkbox" name="topic_${escapeHtml(topic.key)}"` +
+              `${topic.subscribed ? ' checked' : ''}>` +
+              `<span><strong>${escapeHtml(topic.name)}</strong>` +
+              (topic.description ? `<em>${escapeHtml(topic.description)}</em>` : '') +
+              `</span></label>`,
+          )
+          .join('')}</fieldset>`;
+
+  const pauseOptions = [
+    [0, 'Send as usual'],
+    [30, 'Pause for a month'],
+    [90, 'Pause for three months'],
+  ] as const;
+
+  const pauseFields = `<fieldset><legend>How often</legend>${pauseOptions
+    .map(
+      ([days, label], index) =>
+        `<label class="row"><input type="radio" name="pause_days" value="${days}"` +
+        `${(days === 0 && !prefs.paused_until) || (days !== 0 && prefs.paused_until && index === 1) ? ' checked' : ''}>` +
+        `<span>${escapeHtml(label)}</span></label>`,
+    )
+    .join('')}</fieldset>`;
+
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Email preferences</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { margin:0; min-height:100vh; display:grid; place-items:center;
+         font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+         background:#f5f5f7; color:#1d1d1f; padding:24px; }
+  main { background:#fff; border-radius:14px; padding:32px; max-width:480px; width:100%;
+         box-shadow:0 1px 3px rgba(0,0,0,.08); }
+  h1 { margin:0 0 4px; font-size:22px; }
+  .addr { margin:0 0 20px; font-size:14px; color:#6e6e73; word-break:break-all; }
+  .note, .saved { font-size:14px; border-radius:8px; padding:10px 12px; margin:0 0 18px; }
+  .note { background:#fff4e5; color:#7a4a00; }
+  .saved { background:#e8f5e9; color:#1b5e20; }
+  fieldset { border:0; padding:0; margin:0 0 22px; }
+  legend { font-size:13px; text-transform:uppercase; letter-spacing:.04em;
+           color:#6e6e73; padding:0 0 10px; }
+  .row { display:flex; gap:12px; align-items:flex-start; padding:10px 0;
+         border-top:1px solid #ececef; font-size:15px; cursor:pointer; }
+  .row input { margin-top:3px; flex:none; width:18px; height:18px; }
+  .row em { display:block; font-style:normal; font-size:13px; color:#6e6e73; margin-top:2px; }
+  button { font:inherit; font-weight:600; padding:12px 24px; border:0; border-radius:8px;
+           background:#1d1d1f; color:#fff; cursor:pointer; width:100%; }
+  .leave { margin:22px 0 0; padding-top:18px; border-top:1px solid #ececef; text-align:center; }
+  .leave button { background:none; color:#6e6e73; text-decoration:underline;
+                  font-weight:400; padding:0; width:auto; }
+  @media (prefers-color-scheme: dark) {
+    body { background:#000; color:#f5f5f7; }
+    main { background:#1c1c1e; box-shadow:none; }
+    .row { border-color:#2c2c2e; }
+    .leave { border-color:#2c2c2e; }
+    .addr, .row em, legend, .leave button { color:#aeaeb2; }
+    button { background:#f5f5f7; color:#1d1d1f; }
+    .leave button { background:none; color:#aeaeb2; }
+    .note { background:#3a2c14; color:#ffd8a8; }
+    .saved { background:#17311a; color:#a8e6ad; }
+  }
+</style></head>
+<body><main>
+  <h1>Email preferences</h1>
+  <p class="addr">${escapeHtml(storeName)}${storeName ? ' &middot; ' : ''}${escapeHtml(prefs.email)}</p>
+  ${savedNotice}${pausedNotice}
+  <form method="post" action="${escapeHtml(action)}">
+    ${topicFields}
+    ${pauseFields}
+    <button type="submit">Save preferences</button>
+  </form>
+  <form method="post" action="${escapeHtml(action)}" class="leave">
+    <input type="hidden" name="unsubscribe" value="1">
+    <button type="submit">Or stop all marketing email</button>
+  </form>
+</main></body></html>`;
 }
 
 /** 1x1 transparent GIF, the smallest thing that renders in every mail client. */

@@ -35,6 +35,16 @@ Built for [tbay.tk LLC](https://tbay.tk).
 - Automations as resumable sequences: waits, branches evaluated against live
   data, and cancellation when someone unsubscribes
 - A contact timeline merging orders, points, email, visits and everything else
+- Erasure that keeps the retailer's books, a one-click subject access export,
+  and retention windows that stop behavioural data accumulating forever
+- A preference centre with per-topic choice and a pause that lifts by itself,
+  so the only thing to click is not "never again"
+- Retailer-defined contact fields — typed, validated on write, and segmentable
+  alongside everything the platform knows
+- Contact merge that adds the two balances rather than picking one, and keeps
+  the surviving record's id so existing links still resolve
+- Named operators, four roles enforced in one place, and an append-only audit
+  log that records refusals as well as changes
 
   *Not yet:* buying points for money. See [docs/ROADMAP.md](docs/ROADMAP.md).
 

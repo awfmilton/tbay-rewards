@@ -45,7 +45,10 @@ import { z } from 'zod';
  * read customer data and move points — never expose these credentials to a browser.
  */
 export async function apiRoutes(app: FastifyInstance): Promise<void> {
-  app.addHook('preHandler', async (request) => {
+  // `onRequest`, not `preHandler`: authentication should reject before the
+  // body is read, and the role guard in lib/authorise.ts runs at preHandler —
+  // which is the phase after this one, so by then the key has been resolved.
+  app.addHook('onRequest', async (request) => {
     await requireSecretKey(request);
   });
 

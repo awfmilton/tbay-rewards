@@ -39,6 +39,27 @@ Attributes:
 [tbay_leaderboard limit="10" point_type="status"]
 ```
 
+Two admin screens were added alongside the rest: **Currencies**, and
+**Privacy** — retention windows and the record of erasures carried out.
+Erasing one person is done from their own customer page, where whoever is
+doing it can see who they are erasing.
+
+**Merging a duplicate** is done from the customer page of the record that
+survives, so "which one am I keeping" is never a guess. Possible duplicates are
+listed there when the platform has found any.
+
+**Your own fields** are defined on the Privacy screen and edited on each
+customer's page, with the control matching the type — a date picker for a date,
+a dropdown for a list. That is the point of declaring the type: a free-text box
+is how "ON", "on" and "Ontario" become three segments.
+
+**Email topics** live at the bottom of the Email screen. They are what a
+recipient chooses between on the preference page every marketing email links
+to; a store that defines none keeps exactly today's behaviour. The same panel
+shows how many people, in the last month, changed a topic or paused rather
+than leaving — which is the number that says whether the page is earning its
+keep.
+
 A retailer running more than one currency puts one board up per currency:
 `point_type` names it, and omitting it gives the default. The member dashboard
 shows every currency on its own, so there is nothing to configure there.

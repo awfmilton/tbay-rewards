@@ -14,6 +14,9 @@ export interface Tenant {
   settings: TenantSettings;
 }
 
+/** A tenant, plus who presented the key, when one was presented. */
+export type AuthenticatedTenant = Tenant & { keyContext?: SecretKeyContext };
+
 export interface TenantSettings {
   /** Page-key patterns like "/product/:slug" so heatmaps group templated pages. */
   pageKeyPatterns?: string[];
@@ -83,17 +86,34 @@ export async function resolvePublicKey(keyId: string): Promise<Tenant | null> {
  * Resolve a secret key presented as `<key_id>.<secret>`. The secret half is
  * compared against a stored HMAC, never a plaintext column.
  */
-export async function resolveSecretKey(presented: string): Promise<Tenant | null> {
+export async function resolveSecretKey(presented: string): Promise<AuthenticatedTenant | null> {
   const dot = presented.indexOf('.');
   if (dot <= 0) return null;
   const keyId = presented.slice(0, dot);
   const secret = presented.slice(dot + 1);
 
-  const row = await queryOne<Tenant & { secret_hash: string }>(
+  const row = await queryOne<
+    Tenant & {
+      secret_hash: string;
+      key_role: string | null;
+      operator_id: string | null;
+      operator_role: string | null;
+      operator_email: string | null;
+      operator_disabled: Date | null;
+      key_label: string | null;
+    }
+  >(
     db(),
-    `SELECT t.*, k.secret_hash
+    `SELECT t.*, k.secret_hash,
+            k.role      AS key_role,
+            k.label     AS key_label,
+            k.operator_id,
+            o.role      AS operator_role,
+            o.email     AS operator_email,
+            o.disabled_at AS operator_disabled
        FROM tenant_keys k
        JOIN tenants t ON t.id = k.tenant_id
+       LEFT JOIN operators o ON o.id = k.operator_id AND o.tenant_id = k.tenant_id
       WHERE k.key_id = $1
         AND k.kind = 'secret'
         AND k.revoked_at IS NULL
@@ -104,13 +124,46 @@ export async function resolveSecretKey(presented: string): Promise<Tenant | null
   // there is no reason to make the comparison time depend on the secret.
   if (!row || !constantTimeEqual(row.secret_hash, hashToken(secret))) return null;
 
+  // A disabled operator's keys stop working. Disabling somebody and leaving
+  // the credential they carry around still valid is the appearance of removing
+  // access rather than removing it.
+  if (row.operator_id && row.operator_disabled) return null;
+
   // Fire-and-forget: last-used is observability, not correctness.
   void db()
     .query('UPDATE tenant_keys SET last_used_at = now() WHERE key_id = $1', [keyId])
     .catch(() => {});
 
-  const { secret_hash: _ignored, ...tenant } = row;
-  return tenant as Tenant;
+  const {
+    secret_hash: _ignored,
+    key_role,
+    key_label,
+    operator_id,
+    operator_role,
+    operator_email,
+    operator_disabled: _alsoIgnored,
+    ...tenant
+  } = row;
+
+  return {
+    ...(tenant as Tenant),
+    // The narrower of the two wins, and absence of both reads as `owner`:
+    // every key issued before roles existed keeps doing exactly what it did.
+    keyContext: {
+      keyId,
+      role: (key_role ?? operator_role ?? 'owner') as SecretKeyContext['role'],
+      operatorId: operator_id,
+      label: operator_email ?? key_label ?? '',
+    },
+  };
+}
+
+/** Who a secret key is, beyond which tenant it belongs to. */
+export interface SecretKeyContext {
+  keyId: string;
+  role: 'owner' | 'manager' | 'support' | 'readonly';
+  operatorId: string | null;
+  label: string;
 }
 
 export interface CreatedTenant {

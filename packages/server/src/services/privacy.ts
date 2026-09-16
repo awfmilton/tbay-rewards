@@ -1,0 +1,539 @@
+import { db, queryOne, withTransaction, type Queryable } from '../db/pool.js';
+import { ApiError } from '../lib/errors.js';
+import { hashPii } from '../lib/crypto.js';
+import { getTenantById, type Tenant } from './tenants.js';
+
+/**
+ * Erasure, subject access, and not keeping what nobody needs.
+ *
+ * A retailer running this platform is a data controller. Two obligations it
+ * could not meet before: erase a person on request, and stop holding
+ * behavioural data long after it is any use to anyone.
+ */
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Erasure
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface EraseOptions {
+  /** 'request' (they asked), 'retention' (a policy), 'admin' (the retailer). */
+  reason?: 'request' | 'retention' | 'admin';
+  /** Free text for the log — a ticket reference, an operator name. */
+  requestedBy?: string | null;
+  /**
+   * Zero any remaining points balance.
+   *
+   * On by default, and the default is the honest one. An anonymised row with a
+   * spendable balance is a liability nobody can ever reconcile: the person it
+   * belonged to is gone, so no one can claim it and no one can write it off.
+   * Booking the forfeit as a ledger entry keeps the retailer's totals correct
+   * and leaves the reason visible in the history.
+   *
+   * A retailer that has agreed to pay a balance out should do that *first*,
+   * then erase.
+   */
+  forfeitPoints?: boolean;
+}
+
+export interface EraseResult {
+  contact_id: string;
+  points_forfeited: number;
+  rows_deleted: Record<string, number>;
+}
+
+/**
+ * Tables whose rows are personal data and nothing else.
+ *
+ * Deleted outright on erasure. Everything absent from this list is either a
+ * financial record the retailer must keep (points_ledger, orders, commissions,
+ * store_credits, token_claims), an aggregate that carries no identifier
+ * (heatmap_cells, product_stats), or a suppression the person is better off
+ * keeping (email_suppressions — see below).
+ */
+const PERSONAL_TABLES = [
+  'contact_field_values',
+  'events',
+  'sessions',
+  'touchpoints',
+  'carts',
+  'notifications',
+  'wallet_challenges',
+  'share_events',
+  'email_events',
+  'automation_runs',
+] as const;
+
+/**
+ * The same, for tables scoped by their parent rather than by tenant_id.
+ *
+ * `segment_members` and `broadcast_recipients` belong to a segment or a
+ * broadcast, which belongs to the tenant. Deleting by (tenant_id, contact_id)
+ * would simply error — which is how a column list that was never checked
+ * against the schema announces itself.
+ */
+const PERSONAL_CHILD_TABLES = [
+  {
+    table: 'segment_members',
+    sql: `DELETE FROM segment_members m
+           USING segments s
+           WHERE s.id = m.segment_id AND s.tenant_id = $1 AND m.contact_id = $2`,
+  },
+  {
+    table: 'broadcast_recipients',
+    sql: `DELETE FROM broadcast_recipients r
+           USING broadcasts b
+           WHERE b.id = r.broadcast_id AND b.tenant_id = $1 AND r.contact_id = $2`,
+  },
+] as const;
+
+/**
+ * Erase a person, keeping the retailer's books.
+ *
+ * The contact row survives, stripped. Deleting it would cascade through
+ * points_ledger and take the retailer's own financial record with it, which is
+ * not what anybody is asking for and in most jurisdictions is itself unlawful.
+ * What actually identifies a person — name, address, phone, wallet, external
+ * reference, attributes, tags — is removed, and the row is marked so nothing
+ * writes an identifier back onto it.
+ */
+export async function eraseContact(
+  tenantId: string,
+  contactId: string,
+  options: EraseOptions = {},
+  runner?: Queryable,
+): Promise<EraseResult> {
+  const tenant = await getTenantById(tenantId);
+  if (!tenant) throw ApiError.notFound('No such tenant');
+
+  const run = async (client: Queryable): Promise<EraseResult> => {
+    const contact = await queryOne<{
+      id: string;
+      email: string | null;
+      email_normalised: string | null;
+      erased_at: Date | null;
+    }>(
+      client,
+      `SELECT id, email, email_normalised, erased_at FROM contacts
+        WHERE tenant_id = $1 AND id = $2 FOR UPDATE`,
+      [tenantId, contactId],
+    );
+    if (!contact) throw ApiError.notFound('No such contact');
+    if (contact.erased_at) {
+      throw ApiError.conflict('That contact has already been erased', {
+        erased_at: contact.erased_at,
+      });
+    }
+
+    const address = (contact.email_normalised ?? contact.email ?? '').toLowerCase();
+    const emailHash = address === '' ? '' : hashPii(address, tenant.pii_salt);
+
+    // Forfeit first: it writes a ledger entry, and the ledger entry needs the
+    // contact row to still look normal when the balance check runs.
+    let forfeited = 0;
+    if (options.forfeitPoints !== false) {
+      forfeited = await forfeitAllBalances(client, tenantId, contactId);
+    }
+
+    const rowsDeleted: Record<string, number> = {};
+    for (const table of PERSONAL_TABLES) {
+      // The table list is a module constant, never caller input — see the
+      // segment filter compiler for the same rule stated at length.
+      const { rowCount } = await client.query(
+        `DELETE FROM ${table} WHERE tenant_id = $1 AND contact_id = $2`,
+        [tenantId, contactId],
+      );
+      if ((rowCount ?? 0) > 0) rowsDeleted[table] = rowCount ?? 0;
+    }
+
+    for (const child of PERSONAL_CHILD_TABLES) {
+      const { rowCount } = await client.query(child.sql, [tenantId, contactId]);
+      if ((rowCount ?? 0) > 0) rowsDeleted[child.table] = rowCount ?? 0;
+    }
+
+    // Visitors are kept but unlinked: the rows carry hashed IPs and user agents
+    // and drive nothing but counts, while deleting them would leave the
+    // sessions that referenced them dangling.
+    await client.query(
+      'UPDATE visitors SET contact_id = NULL WHERE tenant_id = $1 AND contact_id = $2',
+      [tenantId, contactId],
+    );
+
+    // The rendered body of a sent email quotes the recipient by name. The
+    // delivery record stays — a suppression list whose reasons have been
+    // deleted is a list nobody can audit — but the body goes.
+    await client.query(
+      `UPDATE email_messages
+          SET html = '', text = NULL, subject = '[erased]',
+              to_email = '', unsubscribe_url = NULL
+        WHERE tenant_id = $1 AND contact_id = $2`,
+      [tenantId, contactId],
+    );
+
+    // Subscriptions become an unsubscribed tombstone rather than disappearing:
+    // "unsubscribed" is itself a wish the person expressed, and dropping it
+    // means a later import silently resubscribes them.
+    await client.query(
+      `UPDATE subscriptions SET status = 'unsubscribed', unsubscribed_at = COALESCE(unsubscribed_at, now())
+        WHERE tenant_id = $1 AND contact_id = $2`,
+      [tenantId, contactId],
+    );
+
+    await client.query(
+      `UPDATE contacts SET
+         email             = NULL,
+         email_normalised  = NULL,
+         name              = NULL,
+         phone             = NULL,
+         external_ref      = NULL,
+         wallet_address    = NULL,
+         wallet_verified_at = NULL,
+         locale            = NULL,
+         country           = NULL,
+         attributes        = '{}'::jsonb,
+         tags              = '{}',
+         marketing_consent = false,
+         consent_source    = NULL,
+         is_writer         = false,
+         erased_at         = now(),
+         erased_email_hash = NULLIF($3, ''),
+         updated_at        = now()
+       WHERE tenant_id = $1 AND id = $2`,
+      [tenantId, contactId, emailHash],
+    );
+
+    await client.query(
+      `INSERT INTO erasure_log (
+         tenant_id, contact_id, email_hash, reason, requested_by, points_forfeited, rows_deleted
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+      [
+        tenantId,
+        contactId,
+        emailHash,
+        options.reason ?? 'request',
+        options.requestedBy ?? null,
+        forfeited,
+        JSON.stringify(rowsDeleted),
+      ],
+    );
+
+    return { contact_id: contactId, points_forfeited: forfeited, rows_deleted: rowsDeleted };
+  };
+
+  return runner ? run(runner) : withTransaction(run);
+}
+
+/**
+ * Spend every currency down to zero, recording why.
+ *
+ * Through the ledger rather than by writing the balance directly, so the
+ * history explains the change and the balance stays derivable from it.
+ */
+async function forfeitAllBalances(
+  client: Queryable,
+  tenantId: string,
+  contactId: string,
+): Promise<number> {
+  const { rows } = await client.query<{ point_type: string; balance: number; pending: number }>(
+    `SELECT point_type, balance, pending FROM points_balances
+      WHERE tenant_id = $1 AND contact_id = $2 AND (balance > 0 OR pending > 0)
+      ORDER BY point_type
+      FOR UPDATE`,
+    [tenantId, contactId],
+  );
+
+  const { spend } = await import('./points.js');
+  let total = 0;
+
+  for (const row of rows) {
+    // Pending awards are cancelled outright: they never reached the spendable
+    // balance, so there is nothing to spend, and leaving them would have the
+    // release worker credit an erased contact an hour later.
+    if (row.pending > 0) {
+      await client.query(
+        `UPDATE points_ledger SET status = 'reversed'
+          WHERE tenant_id = $1 AND contact_id = $2 AND point_type = $3 AND status = 'pending'`,
+        [tenantId, contactId, row.point_type],
+      );
+      await client.query(
+        `UPDATE points_balances SET pending = 0, updated_at = now()
+          WHERE tenant_id = $1 AND contact_id = $2 AND point_type = $3`,
+        [tenantId, contactId, row.point_type],
+      );
+    }
+
+    if (row.balance > 0) {
+      await spend(
+        tenantId,
+        {
+          contactId,
+          points: row.balance,
+          reason: 'Balance forfeited on erasure',
+          refType: 'erasure',
+          idempotencyKey: `erase:${contactId}:${row.point_type}`,
+          pointType: row.point_type,
+        },
+        client,
+      );
+      total += row.balance;
+    }
+  }
+
+  return total;
+}
+
+/** Has this address been erased at this retailer? */
+export async function isErased(
+  tenant: Tenant,
+  email: string,
+  runner: Queryable = db(),
+): Promise<boolean> {
+  const address = email.trim().toLowerCase();
+  if (address === '') return false;
+
+  const row = await queryOne<{ id: string }>(
+    runner,
+    `SELECT id FROM contacts
+      WHERE tenant_id = $1 AND erased_email_hash = $2 LIMIT 1`,
+    [tenant.id, hashPii(address, tenant.pii_salt)],
+  );
+  return row !== null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Subject access
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Everything the platform holds about one person.
+ *
+ * Answers a subject access request without an operator writing SQL, which is
+ * how these get answered late or wrongly. The shape is deliberately the raw
+ * rows rather than a summary: a person asking what is held is entitled to what
+ * is held, not to our description of it.
+ */
+export async function exportContact(
+  tenantId: string,
+  contactId: string,
+  runner: Queryable = db(),
+): Promise<Record<string, unknown>> {
+  const contact = await queryOne<Record<string, unknown>>(
+    runner,
+    'SELECT * FROM contacts WHERE tenant_id = $1 AND id = $2',
+    [tenantId, contactId],
+  );
+  if (!contact) throw ApiError.notFound('No such contact');
+
+  // Bounded per table. An export is a document somebody reads, and a contact
+  // with 40,000 events produces a file nobody opens — the count tells them
+  // what is held, the rows show them what it looks like.
+  const LIMIT = 1_000;
+  const sections: Record<string, string> = {
+    orders: 'SELECT * FROM orders WHERE tenant_id = $1 AND contact_id = $2 ORDER BY placed_at DESC NULLS LAST',
+    points_ledger:
+      'SELECT * FROM points_ledger WHERE tenant_id = $1 AND contact_id = $2 ORDER BY created_at DESC',
+    points_balances: 'SELECT * FROM points_balances WHERE tenant_id = $1 AND contact_id = $2',
+    subscriptions: 'SELECT * FROM subscriptions WHERE tenant_id = $1 AND contact_id = $2',
+    email_messages:
+      'SELECT id, template_key, subject, status, sent_at, opened_at, first_clicked_at, bounce_type FROM email_messages WHERE tenant_id = $1 AND contact_id = $2 ORDER BY created_at DESC',
+    sessions:
+      'SELECT id, started_at, entry_path, referrer_host, device_class, source, medium, campaign FROM sessions WHERE tenant_id = $1 AND contact_id = $2 ORDER BY started_at DESC',
+    events:
+      'SELECT id, type, path, url, product_ref, value_cents, occurred_at FROM events WHERE tenant_id = $1 AND contact_id = $2 ORDER BY occurred_at DESC',
+    badge_awards: 'SELECT * FROM badge_awards WHERE tenant_id = $1 AND contact_id = $2',
+    rank_awards: 'SELECT * FROM rank_awards WHERE tenant_id = $1 AND contact_id = $2',
+    store_credits: 'SELECT * FROM store_credits WHERE tenant_id = $1 AND contact_id = $2',
+    token_claims: 'SELECT * FROM token_claims WHERE tenant_id = $1 AND contact_id = $2',
+    notifications: 'SELECT * FROM notifications WHERE tenant_id = $1 AND contact_id = $2',
+  };
+
+  const { getFieldValues } = await import('./contact-fields.js');
+  const data: Record<string, unknown> = {
+    contact,
+    // The retailer's own fields are as personal as the platform's. Leaving
+    // them out of a subject access response would answer the question wrongly.
+    custom_fields: await getFieldValues(tenantId, contactId, runner),
+  };
+  const counts: Record<string, number> = {};
+
+  for (const [key, sql] of Object.entries(sections)) {
+    const { rows } = await runner.query(`${sql} LIMIT ${LIMIT + 1}`, [tenantId, contactId]);
+    counts[key] = rows.length;
+    data[key] = rows.slice(0, LIMIT);
+    if (rows.length > LIMIT) {
+      counts[key] = -1; // "more than the limit" — a precise count is its own scan.
+    }
+  }
+
+  return {
+    exported_at: new Date().toISOString(),
+    truncated_at: LIMIT,
+    counts,
+    ...data,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Retention
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface RetentionPolicy {
+  tenant_id: string;
+  event_days: number | null;
+  session_days: number | null;
+  email_body_days: number | null;
+  notification_days: number | null;
+}
+
+export async function getRetentionPolicy(
+  tenantId: string,
+  runner: Queryable = db(),
+): Promise<RetentionPolicy> {
+  const row = await queryOne<RetentionPolicy>(
+    runner,
+    'SELECT * FROM retention_policies WHERE tenant_id = $1',
+    [tenantId],
+  );
+  return (
+    row ?? {
+      tenant_id: tenantId,
+      event_days: null,
+      session_days: null,
+      email_body_days: null,
+      notification_days: null,
+    }
+  );
+}
+
+export async function setRetentionPolicy(
+  tenantId: string,
+  policy: Partial<Omit<RetentionPolicy, 'tenant_id'>>,
+  runner: Queryable = db(),
+): Promise<RetentionPolicy> {
+  const days = (value: number | null | undefined): number | null => {
+    if (value === null || value === undefined) return null;
+    if (!Number.isInteger(value) || value < 1 || value > 3650) {
+      throw ApiError.badRequest('A retention window is 1 to 3650 days, or null to keep forever');
+    }
+    return value;
+  };
+
+  const row = await queryOne<RetentionPolicy>(
+    runner,
+    `INSERT INTO retention_policies (
+       tenant_id, event_days, session_days, email_body_days, notification_days
+     ) VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (tenant_id) DO UPDATE SET
+       -- Not COALESCE: null is how a retailer turns a window off, so it has to
+       -- be written rather than treated as "unchanged".
+       event_days = EXCLUDED.event_days,
+       session_days = EXCLUDED.session_days,
+       email_body_days = EXCLUDED.email_body_days,
+       notification_days = EXCLUDED.notification_days,
+       updated_at = now()
+     RETURNING *`,
+    [
+      tenantId,
+      days(policy.event_days),
+      days(policy.session_days),
+      days(policy.email_body_days),
+      days(policy.notification_days),
+    ],
+  );
+  return row!;
+}
+
+/**
+ * Delete what every tenant's policy says is past its window.
+ *
+ * Batched and capped per pass. A tenant that turns on a 30-day event policy
+ * after two years of collection has tens of millions of rows to shed, and a
+ * single unbounded DELETE would hold locks for minutes and bloat the WAL. It
+ * takes a bite each pass and catches up over a day, which is the right trade
+ * for a job nothing waits on.
+ */
+export async function runRetentionSweep(
+  runner: Queryable = db(),
+  batchSize = 5_000,
+): Promise<Record<string, number>> {
+  const { rows: policies } = await runner.query<RetentionPolicy>(
+    `SELECT * FROM retention_policies
+      WHERE event_days IS NOT NULL OR session_days IS NOT NULL
+         OR email_body_days IS NOT NULL OR notification_days IS NOT NULL`,
+  );
+
+  const totals: Record<string, number> = {};
+  const bump = (key: string, n: number): void => {
+    if (n > 0) totals[key] = (totals[key] ?? 0) + n;
+  };
+
+  for (const policy of policies) {
+    if (policy.event_days !== null) {
+      bump(
+        'events',
+        await deleteBatch(
+          runner,
+          `DELETE FROM events WHERE ctid IN (
+             SELECT ctid FROM events
+              WHERE tenant_id = $1 AND occurred_at < now() - ($2 || ' days')::interval
+              LIMIT ${batchSize}
+           )`,
+          [policy.tenant_id, String(policy.event_days)],
+        ),
+      );
+    }
+
+    if (policy.session_days !== null) {
+      bump(
+        'sessions',
+        await deleteBatch(
+          runner,
+          `DELETE FROM sessions WHERE ctid IN (
+             SELECT ctid FROM sessions
+              WHERE tenant_id = $1 AND started_at < now() - ($2 || ' days')::interval
+              LIMIT ${batchSize}
+           )`,
+          [policy.tenant_id, String(policy.session_days)],
+        ),
+      );
+    }
+
+    if (policy.email_body_days !== null) {
+      // The body only. Delivery metadata is what a suppression list is
+      // justified by, and deleting it makes every suppression unexplainable.
+      const { rowCount } = await runner.query(
+        `UPDATE email_messages SET html = '', text = NULL
+          WHERE tenant_id = $1
+            AND created_at < now() - ($2 || ' days')::interval
+            AND (html <> '' OR text IS NOT NULL)`,
+        [policy.tenant_id, String(policy.email_body_days)],
+      );
+      bump('email_bodies', rowCount ?? 0);
+    }
+
+    if (policy.notification_days !== null) {
+      bump(
+        'notifications',
+        await deleteBatch(
+          runner,
+          `DELETE FROM notifications WHERE ctid IN (
+             SELECT ctid FROM notifications
+              WHERE tenant_id = $1 AND created_at < now() - ($2 || ' days')::interval
+              LIMIT ${batchSize}
+           )`,
+          [policy.tenant_id, String(policy.notification_days)],
+        ),
+      );
+    }
+  }
+
+  return totals;
+}
+
+async function deleteBatch(
+  runner: Queryable,
+  sql: string,
+  params: unknown[],
+): Promise<number> {
+  const { rowCount } = await runner.query(sql, params);
+  return rowCount ?? 0;
+}
