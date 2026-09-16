@@ -1,6 +1,7 @@
 import { db, queryOne, withTransaction, type Queryable } from '../db/pool.js';
 import { config } from '../config.js';
 import { ApiError } from '../lib/errors.js';
+import { limitOf } from '../lib/paging.js';
 import { getTemplate, queueEmail, renderTemplate, senderFor } from './email.js';
 import { shouldTrack } from './email-tracking.js';
 import { assertGamificationKey } from './gamification.js';
@@ -384,7 +385,7 @@ async function audienceAfter(
              AND (s.expires_at IS NULL OR s.expires_at > now())
         )
       ORDER BY c.id
-      LIMIT ${Math.min(Math.max(limit, 1), 2000)}`,
+      LIMIT ${limitOf(limit, 200, 2000)}`,
     [segmentId, after],
   );
   return rows;

@@ -1,5 +1,6 @@
 import { db, queryOne, withTransaction, type Queryable } from '../db/pool.js';
 import { ApiError } from '../lib/errors.js';
+import { limitOf, offsetOf } from '../lib/paging.js';
 
 /**
  * The points ledger is append-only and every entry carries an idempotency key
@@ -465,8 +466,8 @@ export async function queryLedger(
   query: LedgerQuery = {},
   runner: Queryable = db(),
 ): Promise<{ rows: LedgerRow[]; total: number }> {
-  const limit = Math.min(Math.max(query.limit ?? 50, 1), 1000);
-  const offset = Math.max(query.offset ?? 0, 0);
+  const limit = limitOf(query.limit, 50, 1000);
+  const offset = offsetOf(query.offset);
 
   const where: string[] = ['l.tenant_id = $1'];
   const params: unknown[] = [tenantId];

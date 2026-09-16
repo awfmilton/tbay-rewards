@@ -1,5 +1,6 @@
 import { db, queryOne, type Queryable } from '../db/pool.js';
 import { ApiError } from '../lib/errors.js';
+import { limitOf, offsetOf } from '../lib/paging.js';
 import { compileGroup, type FilterGroup } from './segment-filters.js';
 import { assertGamificationKey } from './gamification.js';
 
@@ -171,7 +172,7 @@ export async function previewMatching(
     `SELECT c.id, c.email, c.name FROM contacts c
       WHERE ${where}
       ORDER BY c.created_at DESC
-      LIMIT ${Math.min(Math.max(limit, 1), 100)}`,
+      LIMIT ${limitOf(limit, 20, 100)}`,
     params,
   );
   return rows;
@@ -307,8 +308,8 @@ export async function segmentAudience(
   const segment = await getSegment(tenantId, key, runner);
   if (!segment) throw ApiError.notFound(`No segment "${key}"`);
 
-  const limit = Math.min(Math.max(options.limit ?? 500, 1), 10_000);
-  const offset = Math.max(options.offset ?? 0, 0);
+  const limit = limitOf(options.limit, 500, 10_000);
+  const offset = offsetOf(options.offset);
 
   const { rows } = await runner.query<{ id: string; email: string; name: string | null }>(
     `SELECT c.id, c.email, c.name
