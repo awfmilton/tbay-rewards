@@ -393,6 +393,16 @@
 	margin-bottom: var(--tbay-gap);
 }
 
+/* Currencies beside the main one: present, but plainly secondary to the
+   balance a member actually spends. */
+.tbay-rewards__grid--secondary .tbay-stat {
+	padding: .85rem 1.15rem;
+}
+
+.tbay-rewards__grid--secondary .tbay-stat__value {
+	font-size: 1.35rem;
+}
+
 .tbay-stat {
 	background: var(--tbay-surface);
 	border: 1px solid var(--tbay-border);

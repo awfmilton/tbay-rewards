@@ -25,7 +25,7 @@ re-saving the page never wipes a credential you cannot see.
 | `[tbay_points]` | Just the balance, for a header or menu |
 | `[tbay_badges]` | Badge wall |
 | `[tbay_bridge]` | The L2 → L1 bridge on its own |
-| `[tbay_leaderboard]` | Top members by lifetime points |
+| `[tbay_leaderboard]` | Top members by lifetime points, one board per currency |
 | `[tbay_share]` | Share buttons that pay when someone else clicks the link |
 | `[tbay_link product="123"]…[/tbay_link]` | A tracked product link earning the author commission |
 | `[tbay_my_commissions]` | A writer's own clicks, orders and earnings |
@@ -36,7 +36,13 @@ Attributes:
 [tbay_newsletter list="newsletter" title="Join us" button="Subscribe" name_field="yes"]
 [tbay_share networks="x,facebook,linkedin,copy" url="https://…"]
 [tbay_leaderboard limit="10"]
+[tbay_leaderboard limit="10" point_type="status"]
 ```
+
+A retailer running more than one currency puts one board up per currency:
+`point_type` names it, and omitting it gives the default. The member dashboard
+shows every currency on its own, so there is nothing to configure there.
+
 
 There is also a **TBAY newsletter signup** block in the editor's inserter, with
 list, heading, description and button label configurable in the sidebar.

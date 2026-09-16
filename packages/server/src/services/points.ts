@@ -91,7 +91,7 @@ export async function getBalances(
   tenantId: string,
   contactId: string,
   runner: Queryable = db(),
-): Promise<Balance[]> {
+): Promise<Array<Balance & { name: string; singular: string; plural: string }>> {
   const types = await listPointTypes(tenantId, runner);
   const { rows } = await runner.query<Balance>(
     `SELECT balance, pending, lifetime_earned, lifetime_spent, point_type
@@ -102,9 +102,18 @@ export async function getBalances(
   const held = new Map(rows.map((row) => [row.point_type, row]));
   // Every enabled currency appears, held or not: a storefront showing "status
   // credits: —" is clearer than one where the row vanishes at zero.
+  //
+  // Each row carries the retailer's own wording. Without it a storefront can
+  // only titlecase the key, so a currency the retailer named "Status Credits"
+  // renders as "Status" — which is exactly what a live page showed.
   return types
     .filter((type) => type.enabled)
-    .map((type) => held.get(type.key) ?? { ...ZERO_BALANCE, point_type: type.key });
+    .map((type) => ({
+      ...(held.get(type.key) ?? { ...ZERO_BALANCE, point_type: type.key }),
+      name: type.name,
+      singular: type.singular,
+      plural: type.plural,
+    }));
 }
 
 /** Credit points. Re-running with the same idempotency key is a no-op. */
