@@ -21,16 +21,28 @@ Built for [tbay.tk LLC](https://tbay.tk).
 - Abandoned carts, with a staged recovery email sequence and recovery reporting
 
 **Marketing automation (the Mautic replacement)**
-- Contacts, segments, tags and custom attributes
+- Contacts, tags and custom attributes
 - Newsletter with double opt-in, one-click unsubscribe and consent auditing
 - A trigger → conditions → actions automation engine
-- Transactional and broadcast email with a dedupe-keyed queue
+- Transactional and marketing email with a dedupe-keyed queue, editable
+  templates, and a transactional flag so a receipt is not withheld for want of
+  a marketing opt-in
+
+  *Not yet:* dynamic segments, audience broadcasts, open/click tracking,
+  bounce and complaint processing, campaign delays and branching. See
+  [docs/ROADMAP.md](docs/ROADMAP.md) — a feature review against Mautic 7.2
+  found these are what a store would reach for first.
 
 **Rewards and gamification (the myCred replacement)**
 - An append-only points ledger with idempotency keys and transactional balances
-- Reward rules with cooldowns, daily and lifetime caps, and hold periods
-- Badges with tiers, balance ranks, daily-login streaks, leaderboards
-- Member-to-member point transfers, coupon codes, points-gated content
+- Reward rules with cooldowns; daily, weekly, monthly and lifetime caps; a
+  per-award clamp; and hold periods — all in the retailer's own timezone
+- Per-product and per-category point overrides, and exclusions so staff and
+  test accounts do not earn or top the leaderboard
+- Badges with tiers and compound AND/OR criteria, ranks with manual pinning,
+  daily-login streaks, leaderboards with timeframes and your own position
+- Member-to-member point transfers with period limits, coupon codes with
+  balance bands and badge/rank grants, points-gated content
 - Social sharing that pays only when the shared link is actually clicked
 - Blog-writer commission links with refund-protection holds
 
