@@ -20,6 +20,13 @@ import {
 } from '../services/segments.js';
 import { describeFields } from '../services/segment-filters.js';
 import {
+  broadcastReport,
+  cancelBroadcast,
+  listBroadcasts,
+  startBroadcast,
+  upsertBroadcast,
+} from '../services/broadcasts.js';
+import {
   DEFAULT_TEMPLATES,
   deleteTemplate,
   getTemplate,
@@ -242,6 +249,47 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
       };
     },
   );
+
+  // ── Broadcasts ─────────────────────────────────────────────────────────────
+
+  app.get('/v1/broadcasts', async (request) => {
+    const tenant = tenantOf(request);
+    return { broadcasts: await listBroadcasts(tenant.id) };
+  });
+
+  app.get<{ Params: { key: string } }>('/v1/broadcasts/:key', async (request) => {
+    const tenant = tenantOf(request);
+    return broadcastReport(tenant.id, request.params.key);
+  });
+
+  app.put<{ Params: { key: string } }>('/v1/broadcasts/:key', async (request) => {
+    const tenant = tenantOf(request);
+    const schema = z.object({
+      name: z.string().min(1).max(200).optional(),
+      segmentKey: z.string().max(64).optional(),
+      templateKey: z.string().max(64).optional(),
+      subject: z.string().max(300).nullish(),
+      sendAt: z.string().max(40).nullish(),
+    });
+    const input = parse(schema, request.body);
+    return { broadcast: await upsertBroadcast(tenant.id, { key: request.params.key, ...input }) };
+  });
+
+  /**
+   * Arm a broadcast.
+   *
+   * Separate from the PUT that writes it, because sending to a whole segment
+   * is not something to do by accident while editing a subject line.
+   */
+  app.post<{ Params: { key: string } }>('/v1/broadcasts/:key/send', async (request) => {
+    const tenant = tenantOf(request);
+    return { broadcast: await startBroadcast(tenant.id, request.params.key) };
+  });
+
+  app.post<{ Params: { key: string } }>('/v1/broadcasts/:key/cancel', async (request) => {
+    const tenant = tenantOf(request);
+    return { broadcast: await cancelBroadcast(tenant.id, request.params.key) };
+  });
 
   // ── Deliverability ─────────────────────────────────────────────────────────
 
