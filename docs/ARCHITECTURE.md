@@ -116,13 +116,58 @@ mints a unique tracked link and stays *pending* until somebody else actually
 clicks it. Faking shares is therefore worthless — you would have to generate real
 referred traffic to earn anything.
 
-### Automations are deliberately small
+### An automation is a resumable sequence, not a single pass
 
-Trigger → conditions → actions, evaluated in a single pass. Mautic's campaign
-canvas is what this replaces, and nearly all real-world use is "when X happens to
-a contact, check a couple of facts, then email or tag them". Keeping the model
-this small means there is no scheduler state to get stuck in, and every run is
-idempotent through a dedupe key.
+Trigger → conditions → a list of *steps*, where a step is an action or one of
+`wait`, `if`, `goto`, `stop`. The action list is flat and `step_index` is the
+program counter, so the entire state of a paused sequence is one row — which is
+what makes it survive a restart.
+
+It started as a single pass, and that was wrong for the obvious case: "send the
+cart email, wait a day, and if they still have not bought, send another" could
+not be expressed, which is exactly why cart recovery had to be a hand-written
+worker with its stages in environment variables. A welcome series, a review
+request and a win-back all have that shape.
+
+The property to hold on to: **a condition after a wait is evaluated against
+live data**, not the frozen trigger payload. "If they still have not bought" is
+a question about now; answering it from a day-old snapshot sends the follow-up
+to everyone who did buy. The `if` step reuses the segment filter compiler, so it
+can ask anything a segment can and there is one field catalogue rather than two
+that drift.
+
+Every run is still idempotent through a dedupe key, and every *step* now
+contributes to the keys its actions write — without that, a sequence holding two
+`award_points` steps would give them the same key and silently drop the second.
+
+### Segments define who; consent decides whether
+
+A segment is a filter tree compiled to SQL, materialised by a worker. Consent
+and suppression are applied when an *audience is read*, never in the definition.
+
+That split is deliberate. A segment answers "who are these people"; consent
+answers "may we mail them". Folding the second into the first means every
+segment an admin builds has to remember the rule, and the one that forgets mails
+people who opted out.
+
+The compiler's own rule: no value from a definition ever reaches the SQL string.
+Fields come from a closed catalogue, operators from a per-type allow-list, and
+every value is bound. A definition is admin-supplied data that gets stored and
+replayed later, so treating it as trusted would be a stored injection with a
+delay fuse — and a catalogue that allowed arbitrary columns would turn a
+settings screen into an arbitrary read over the whole schema.
+
+### Analytics counters are eventually consistent; the ledger is not
+
+Heatmap cells, page rollups and product stats are folded in memory and flushed
+on a timer. A load review measured each increment as a full MVCC update — 370
+bytes of WAL and a dead tuple — and buffering changes what the write rate is
+proportional to: not visitors × samples, but distinct active cells per interval.
+
+The boundary matters more than the technique. The points ledger, balances,
+orders and token claims keep writing synchronously inside their transaction,
+because the cost of buffering is losing up to one interval on a crash. An
+approximate heatmap weight is fine. An approximate balance is not.
 
 ### The platform never custodies tokens (in mint mode)
 
@@ -183,6 +228,11 @@ Covered in [TOKEN.md](TOKEN.md).
 | `claim_expiry` | 60s | Expires unclaimed vouchers, refunds points, frees budget |
 | `claim_reconcile` | 2m | Asks the chain which vouchers were actually claimed |
 | `webhook_delivery` | 20s | Delivers signed webhooks with exponential backoff |
+| `challenge_purge` | 1h | Drops expired wallet-ownership challenges |
+| `segment_build` | 10m | Recomputes segment membership differentially |
+| `broadcast_send` | 30s | Advances a scheduled or in-flight broadcast one batch |
+| `automation_resume` | 30s | Resumes sequences whose wait has elapsed |
+| `counter_flush` | 10s | Safety net for the in-process counter buffer |
 
 Every job claims work with `FOR UPDATE SKIP LOCKED` or a unique key, so they are
 safe to run on several nodes. They run in-process by default and as a separate
