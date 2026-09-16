@@ -6,6 +6,7 @@ import { parse } from './collect.js';
 import { contactHandleSchema } from './schemas.js';
 import { requireContact } from '../services/contacts.js';
 import { queryLedger, type LedgerQuery } from '../services/points.js';
+import { contactSummary, contactTimeline } from '../services/timeline.js';
 import { listSuppressions, suppress, unsuppress } from '../services/deliverability.js';
 import { engagementReport } from '../services/email-tracking.js';
 import {
@@ -178,6 +179,47 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     const tenant = tenantOf(request);
     return { removed: await deleteProductRule(tenant.id, request.params.id) };
   });
+
+  // ── Contact timeline ───────────────────────────────────────────────────────
+
+  /**
+   * Everything that happened to one contact, newest first.
+   *
+   * The question support actually asks. Accepts the usual contact handles so
+   * it can be reached with an email address, which is all a support agent has.
+   */
+  app.get<{ Querystring: Record<string, string | undefined> }>(
+    '/v1/contacts/timeline',
+    async (request) => {
+      const tenant = tenantOf(request);
+      const contact = await requireContact(tenant.id, request.query);
+
+      const kinds = request.query.kinds
+        ? request.query.kinds.split(',').map((kind) => kind.trim()).filter(Boolean)
+        : null;
+
+      const before = request.query.before ? new Date(request.query.before) : null;
+      if (before && Number.isNaN(before.getTime())) {
+        throw ApiError.badRequest(`"${request.query.before}" is not a date`);
+      }
+
+      return {
+        contact: {
+          id: contact.id,
+          email: contact.email,
+          name: contact.name,
+          tags: contact.tags,
+          marketing_consent: contact.marketing_consent,
+        },
+        summary: await contactSummary(tenant.id, contact.id),
+        timeline: await contactTimeline(tenant.id, contact.id, {
+          limit: Number(request.query.limit) || 50,
+          before,
+          kinds: kinds as never,
+        }),
+      };
+    },
+  );
 
   // ── Automations ────────────────────────────────────────────────────────────
 
