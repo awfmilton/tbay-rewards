@@ -148,3 +148,152 @@ async function importBadges(
     );
   }
 }
+
+/**
+ * Import myCred's per-entry log history.
+ *
+ * `importMyCredBalances` above writes one opening entry per member, which
+ * keeps the balance exact but leaves every customer looking at an empty
+ * history on day one. For a store that has run a rewards programme for years,
+ * that history *is* the programme as far as its customers are concerned.
+ *
+ * This is a second pass, run after the balances, over a myCred log export
+ * (`wp_mycred_log`: ref, ref_id, user_id, creds, entry, ctime).
+ *
+ * Three decisions worth stating:
+ *
+ *  - **History does not move the balance.** Entries land as `imported` rows
+ *    that carry their original points in `meta` and a zero delta, because the
+ *    opening balance already accounts for them. Replaying the deltas *and*
+ *    keeping the opening entry would double every balance; dropping the
+ *    opening entry and replaying instead would be exact only if the export is
+ *    complete, which for a log that has been pruned it is not.
+ *  - **The original timestamp is preserved**, so the history reads in the
+ *    order it happened rather than all at the moment of the import.
+ *  - **The myCred row id is the idempotency key**, so a re-run after a partial
+ *    import adds only what is missing.
+ */
+export async function importMyCredHistory(
+  input: MyCredImportInput,
+  options: ImportOptions = {},
+): Promise<ImportReport> {
+  const report = emptyReport('mycred_history', options.dryRun === true);
+  const table = parseCsvTable(input.csv);
+
+  if (table.headers.length === 0) {
+    report.warnings.push('The file appears to be empty.');
+    return report;
+  }
+  if (!table.headers.some((header) => header.includes('email'))) {
+    report.warnings.push(
+      'No email column found. Export the myCred log joined to wp_users so each row carries a user_email.',
+    );
+    return report;
+  }
+
+  const rows = options.limit ? table.rows.slice(0, options.limit) : table.rows;
+  const { db } = await import('../db/pool.js');
+  const { findContactByEmail } = await import('../services/contacts.js');
+
+  // Cached because a log export is one row per *entry*: a member with four
+  // hundred entries would otherwise be looked up four hundred times.
+  const contactIds = new Map<string, string | null>();
+
+  for (const [index, row] of rows.entries()) {
+    report.read += 1;
+    options.onProgress?.(report.read, rows.length);
+
+    const email = pick(row, 'user_email', 'email').toLowerCase();
+    const points = Math.trunc(Number(pick(row, 'creds', 'points', 'amount') || '0'));
+    const entry = pick(row, 'entry', 'reason', 'description') || 'Imported from myCred';
+    const reference = pick(row, 'id', 'log_id', 'entry_id');
+    const ruleKey = pick(row, 'ref', 'reference') || null;
+
+    if (email === '' || !email.includes('@') || reference === '') {
+      report.skipped += 1;
+      continue;
+    }
+
+    try {
+      if (!contactIds.has(email)) {
+        const contact = await findContactByEmail(input.tenantId, email);
+        contactIds.set(email, contact?.id ?? null);
+      }
+      const contactId = contactIds.get(email);
+
+      if (!contactId) {
+        // Balances are imported first on purpose. A history row for somebody
+        // with no contact means the two exports disagree, which is worth
+        // saying rather than silently creating a member from a log line.
+        report.skipped += 1;
+        if (report.warnings.length < 20) {
+          report.warnings.push(`No contact for ${email} — import balances first.`);
+        }
+        continue;
+      }
+
+      if (options.dryRun) {
+        report.created += 1;
+        continue;
+      }
+
+      const occurredAt = parseMyCredTime(pick(row, 'ctime', 'time', 'date', 'created_at'));
+
+      const { rowCount } = await db().query(
+        `INSERT INTO points_ledger (
+           tenant_id, contact_id, delta_points, reason, rule_key, ref_type, ref_id,
+           idempotency_key, status, available_at, meta, created_at
+         ) VALUES ($1, $2, 0, $3, $4, 'import_history', $5, $6, 'cleared', $7, $8::jsonb, $7)
+         ON CONFLICT (tenant_id, idempotency_key) DO NOTHING`,
+        [
+          input.tenantId,
+          contactId,
+          entry.slice(0, 300),
+          ruleKey ? ruleKey.slice(0, 64) : null,
+          reference.slice(0, 191),
+          `import:mycred:log:${reference}`,
+          occurredAt,
+          JSON.stringify({
+            source: 'mycred',
+            // The real number lives here. The delta is zero so the balance,
+            // which the opening entry already set, does not move.
+            original_points: points,
+            mycred_ref: ruleKey,
+            historical: true,
+          }),
+        ],
+      );
+
+      if ((rowCount ?? 0) > 0) report.created += 1;
+      else report.skipped += 1;
+    } catch (err) {
+      recordError(report, index, err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  if (report.created > 0) {
+    report.warnings.push(
+      'Imported history carries its original points in meta and a zero balance effect — ' +
+        'the opening balance already accounts for it.',
+    );
+  }
+
+  return report;
+}
+
+/**
+ * myCred stores `ctime` as a Unix timestamp; exports sometimes carry a date
+ * string instead. Anything unreadable falls back to now rather than failing
+ * the row — a history entry with a wrong date is still better than no entry.
+ */
+function parseMyCredTime(value: string): Date {
+  const trimmed = value.trim();
+  if (trimmed === '') return new Date();
+
+  if (/^\d{9,11}$/.test(trimmed)) {
+    return new Date(Number(trimmed) * 1000);
+  }
+
+  const parsed = new Date(trimmed);
+  return Number.isNaN(parsed.getTime()) ? new Date() : parsed;
+}

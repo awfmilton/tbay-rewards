@@ -13,7 +13,7 @@ import { readFile } from 'node:fs/promises';
 import { closeDb } from '../db/pool.js';
 import { getTenantBySlug } from '../services/tenants.js';
 import { importMauticContacts } from './mautic.js';
-import { importMyCredBalances } from './mycred.js';
+import { importMyCredBalances, importMyCredHistory } from './mycred.js';
 import { importFlagswagCommissions, importFlagswagLinks } from './flagswag.js';
 import type { ImportReport } from './types.js';
 
@@ -57,6 +57,9 @@ try {
     console.log(`Usage:
   mautic               --tenant <slug> --file <contacts.csv> [--list newsletter] [--dry-run] [--limit N]
   mycred               --tenant <slug> --file <balances.csv> [--dry-run] [--limit N]
+  mycred-history       --tenant <slug> --file <log.csv> [--dry-run] [--limit N]
+                       Run after mycred. Export wp_mycred_log joined to wp_users
+                       so each row carries a user_email.
   flagswag-links       --tenant <slug> --file <links.csv> [--dry-run] [--limit N]
   flagswag-commissions --tenant <slug> --file <commissions.csv> [--dry-run] [--limit N]
 
@@ -84,6 +87,11 @@ Always run with --dry-run first.`);
         break;
       case 'mycred':
         report = await importMyCredBalances({ tenantId: tenant.id, csv }, options);
+        break;
+      case 'mycred-history':
+        // Run after `mycred`: a history row for somebody with no contact is
+        // reported rather than silently creating a member from a log line.
+        report = await importMyCredHistory({ tenantId: tenant.id, csv }, options);
         break;
       case 'flagswag-links':
         report = await importFlagswagLinks({ tenantId: tenant.id, csv }, options);

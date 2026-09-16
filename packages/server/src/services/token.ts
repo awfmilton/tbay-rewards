@@ -10,7 +10,7 @@ import {
   treasurySender,
   weiToTokenString,
 } from '../lib/chain.js';
-import { getBalance, reverse, spend } from './points.js';
+import { getBalance, reverse, spend, type Balance } from './points.js';
 import { randomCode } from '../lib/crypto.js';
 import type { Tenant } from './tenants.js';
 import type { Contact } from './contacts.js';
@@ -757,6 +757,131 @@ export async function verifySpendIntent(
 
     return { intent: updated, credit: credit! };
   });
+}
+
+/**
+ * Spend points directly for store credit.
+ *
+ * myCred lets a customer pay with points at checkout; here that went through a
+ * TBAY round trip — redeem points for tokens, connect a wallet, send them, get
+ * credit — which is a lot to ask of someone who just wants money off a jumper.
+ * This is the short path: points in, a credit code out, no wallet involved.
+ *
+ * The rate is deliberately the same one TBAY converts at
+ * (`CREDIT_CENTS_PER_TOKEN`, plus any retailer bonus), so a customer cannot
+ * arbitrage the two routes against each other. Spending points here and
+ * spending them via TBAY are worth exactly the same.
+ */
+export async function redeemPointsForCredit(
+  tenant: Tenant,
+  contactId: string,
+  points: number,
+  runner?: Queryable,
+): Promise<{ code: string; amount_cents: number; currency: string; balance: Balance }> {
+  const cfg = config();
+
+  if (!Number.isInteger(points) || points <= 0) {
+    throw ApiError.badRequest('points must be a positive integer');
+  }
+
+  const pointsPerToken = Math.max(
+    1,
+    Number(tenant.settings?.pointsPerToken ?? cfg.rewards.pointsPerToken),
+  );
+  if (points % pointsPerToken !== 0) {
+    throw ApiError.unprocessable(
+      `Points convert in blocks of ${pointsPerToken}`,
+      { points_per_token: pointsPerToken },
+    );
+  }
+
+  const bonusBps = Math.max(0, Number(tenant.settings?.creditBonusBps ?? 0));
+  const tokens = points / pointsPerToken;
+  const amountCents = Math.floor(
+    tokens * cfg.rewards.creditCentsPerToken * (1 + bonusBps / 10_000),
+  );
+
+  if (amountCents <= 0) {
+    throw ApiError.unprocessable('That is not enough points to be worth any credit');
+  }
+
+  const run = async (client: Queryable) => {
+    // One second of granularity in the key, matching the voucher path: it
+    // makes an accidental double-submit idempotent while still letting someone
+    // deliberately redeem twice.
+    const second = Math.floor(Date.now() / 1000);
+    const debit = await spend(
+      tenant.id,
+      {
+        contactId,
+        points,
+        reason: 'Redeemed for store credit',
+        refType: 'store_credit',
+        refId: `credit:${second}`,
+        idempotencyKey: `credit:${contactId}:${points}:${second}`,
+      },
+      client,
+    );
+
+    // The same guard the voucher path needed: an idempotency hit means the
+    // points were never debited a second time, so issuing a second credit
+    // would hand out value for free.
+    if (!debit.created) {
+      throw ApiError.conflict(
+        'That redemption was already made. Wait a moment before redeeming again.',
+      );
+    }
+
+    const code = `PTS-${randomCode(10)}`;
+    const credit = await queryOne<{ code: string; amount_cents: number; currency: string }>(
+      client,
+      `INSERT INTO store_credits (
+         tenant_id, contact_id, code, amount_cents, currency, source
+       ) VALUES ($1, $2, $3, $4, $5, 'points')
+       RETURNING code, amount_cents, currency`,
+      [tenant.id, contactId, code, amountCents, tenant.currency],
+    );
+
+    const { enqueueWebhook } = await import('./automations.js');
+    await enqueueWebhook(client, tenant.id, 'store_credit_issued', {
+      contact_id: contactId,
+      code: credit!.code,
+      amount_cents: credit!.amount_cents,
+      currency: credit!.currency,
+      source: 'points',
+    });
+
+    return { ...credit!, balance: debit.balance };
+  };
+
+  return runner ? run(runner) : withTransaction(run);
+}
+
+/**
+ * What a customer would get for their points, without spending any.
+ *
+ * The storefront shows this before the button, because "redeem 500 points"
+ * means nothing until it says what 500 points buys.
+ */
+export function creditQuote(
+  tenant: Tenant,
+  points: number,
+): { points: number; amount_cents: number; currency: string; points_per_token: number } {
+  const cfg = config();
+  const pointsPerToken = Math.max(
+    1,
+    Number(tenant.settings?.pointsPerToken ?? cfg.rewards.pointsPerToken),
+  );
+  const bonusBps = Math.max(0, Number(tenant.settings?.creditBonusBps ?? 0));
+  const usable = Math.floor(Math.max(0, points) / pointsPerToken) * pointsPerToken;
+  const tokens = usable / pointsPerToken;
+
+  return {
+    points: usable,
+    amount_cents: Math.floor(tokens * cfg.rewards.creditCentsPerToken * (1 + bonusBps / 10_000)),
+    currency: tenant.currency,
+    points_per_token: pointsPerToken,
+  };
 }
 
 export async function redeemStoreCredit(

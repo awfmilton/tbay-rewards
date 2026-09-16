@@ -36,6 +36,7 @@ require_once TBAY_REWARDS_DIR . 'includes/class-tbay-writer-links.php';
 require_once TBAY_REWARDS_DIR . 'includes/class-tbay-webhooks.php';
 require_once TBAY_REWARDS_DIR . 'includes/class-tbay-admin.php';
 require_once TBAY_REWARDS_DIR . 'includes/class-tbay-manage.php';
+require_once TBAY_REWARDS_DIR . 'includes/class-tbay-forms.php';
 require_once TBAY_REWARDS_DIR . 'includes/class-tbay-woocommerce.php';
 require_once TBAY_REWARDS_DIR . 'includes/class-tbay-mycred.php';
 
@@ -59,6 +60,7 @@ final class TBAY_Rewards {
 	public TBAY_Rewards_Webhooks $webhooks;
 	public TBAY_Rewards_Admin $admin;
 	private ?TBAY_Rewards_Manage $manage = null;
+	private ?TBAY_Rewards_Forms $forms = null;
 	public ?TBAY_Rewards_WooCommerce $woocommerce = null;
 	public ?TBAY_Rewards_MyCred $mycred        = null;
 
@@ -79,6 +81,7 @@ final class TBAY_Rewards {
 		$this->webhooks     = new TBAY_Rewards_Webhooks( $this->api );
 		$this->admin        = new TBAY_Rewards_Admin( $this->api );
 		$this->manage       = new TBAY_Rewards_Manage( $this->api );
+		$this->forms        = new TBAY_Rewards_Forms( $this->api );
 
 		add_action( 'plugins_loaded', array( $this, 'load_integrations' ), 20 );
 		add_action( 'init', array( $this, 'load_textdomain' ) );

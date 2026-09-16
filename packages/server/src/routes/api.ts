@@ -30,6 +30,8 @@ import {
   redeemStoreCredit,
   verifySpendIntent,
   walletSummary,
+  creditQuote,
+  redeemPointsForCredit,
 } from '../services/token.js';
 
 import { fire } from '../services/automations.js';
@@ -640,6 +642,27 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
   });
 
   // ── TBAY token ────────────────────────────────────────────────────────────
+
+  /**
+   * Spend points for store credit, no wallet involved.
+   *
+   * The short path to "money off my next order". Same rate as the TBAY route,
+   * so neither can be arbitraged against the other.
+   */
+  app.post('/v1/credit/redeem', async (request) => {
+    const tenant = tenantOf(request);
+    const input = parse(
+      contactHandleSchema.extend({ points: z.number().int().positive().max(10_000_000) }),
+      request.body,
+    );
+    const contact = await requireContact(tenant.id, input);
+    return redeemPointsForCredit(tenant, contact.id, input.points);
+  });
+
+  app.get<{ Querystring: { points?: string } }>('/v1/credit/quote', async (request) => {
+    const tenant = tenantOf(request);
+    return creditQuote(tenant, Number(request.query.points) || 0);
+  });
 
   app.post('/v1/token/redeem', async (request) => {
     const tenant = tenantOf(request);

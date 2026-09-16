@@ -271,7 +271,8 @@ describe('tenant settings', () => {
       tenant.id,
     ]);
     expect(rows.map((row) => row.key)).toEqual([
-      'account_created', 'newsletter_signup', 'purchase', 'referral', 'review', 'social_share',
+      'account_created', 'form_submission', 'newsletter_signup', 'purchase',
+      'referral', 'review', 'social_share',
     ]);
   });
 });

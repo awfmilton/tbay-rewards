@@ -116,6 +116,21 @@ export const DEFAULT_RULES: Array<Omit<RewardRule,
     requires_verification: false,
   },
   {
+    key: 'form_submission',
+    name: 'Filled in a form',
+    event_key: 'form.submitted',
+    mode: 'fixed',
+    points: 25,
+    // A form is the cheapest thing on the site to submit, so this is the rule
+    // most worth rate-limiting. A cooldown plus a daily cap makes filling the
+    // same contact form forty times worth one submission's points.
+    cooldown_seconds: 300,
+    daily_cap: 75,
+    lifetime_cap: null,
+    hold_seconds: 0,
+    requires_verification: false,
+  },
+  {
     key: 'review',
     name: 'Left a product review',
     event_key: 'product.reviewed',

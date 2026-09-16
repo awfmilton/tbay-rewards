@@ -344,7 +344,20 @@ class TBAY_Rewards_UI {
 				<button type="button" class="tbay-button" data-tbay-redeem <?php disabled( $points <= 0 ); ?>>
 					<?php esc_html_e( 'Redeem for TBAY', 'tbay-rewards' ); ?>
 				</button>
+
+				<?php
+				// The short path: no wallet, no chain, no gas — just money off
+				// the next order. Worth exactly what the TBAY route is worth,
+				// so choosing between them is about convenience, not value.
+				?>
+				<button type="button" class="tbay-button tbay-button--outline" data-tbay-credit
+					<?php disabled( $points <= 0 ); ?>>
+					<?php esc_html_e( 'Redeem for store credit', 'tbay-rewards' ); ?>
+				</button>
 			</div>
+
+			<?php // The credit code, once one has been issued. ?>
+			<div data-tbay-credit-result hidden></div>
 
 			<?php // A route into a wallet browser when this device has no provider. ?>
 			<div data-tbay-wallet-help hidden></div>
@@ -738,6 +751,8 @@ class TBAY_Rewards_UI {
 			'wallet/challenge' => array( 'POST', 'handle_wallet_challenge' ),
 			'wallet'           => array( 'POST', 'handle_wallet' ),
 			'redeem'         => array( 'POST', 'handle_redeem' ),
+			'credit'         => array( 'POST', 'handle_credit' ),
+			'credit-quote'   => array( 'GET', 'handle_credit_quote' ),
 			'claim-tx'       => array( 'POST', 'handle_claim_tx' ),
 			'balance'        => array( 'GET', 'handle_balance' ),
 			'profile'        => array( 'GET', 'handle_profile' ),
@@ -917,6 +932,48 @@ class TBAY_Rewards_UI {
 	 * else's points — and the voucher is bound by signature to the wallet the
 	 * *platform* has on file for that contact.
 	 */
+	/**
+	 * Spend points for a store credit code.
+	 *
+	 * The short path to money off an order: no wallet, no chain, no gas. Worth
+	 * exactly what the TBAY route is worth, so a customer choosing between them
+	 * is choosing convenience rather than value.
+	 */
+	public function handle_credit( WP_REST_Request $request ): WP_REST_Response {
+		$contact_id = $this->require_contact();
+		if ( null === $contact_id ) {
+			return $this->error( __( 'Your rewards account is not ready yet.', 'tbay-rewards' ) );
+		}
+
+		$points = (int) $request->get_param( 'points' );
+		if ( $points <= 0 ) {
+			return $this->error( __( 'How many points would you like to use?', 'tbay-rewards' ) );
+		}
+
+		$result = $this->api->post(
+			'/v1/credit/redeem',
+			array( 'contactId' => $contact_id, 'points' => $points )
+		);
+
+		return is_wp_error( $result )
+			? $this->error( $result->get_error_message() )
+			: new WP_REST_Response( $result, 200 );
+	}
+
+	/** What a number of points is worth, before anything is spent. */
+	public function handle_credit_quote( WP_REST_Request $request ): WP_REST_Response {
+		$result = $this->api->request(
+			'GET',
+			'/v1/credit/quote',
+			array(),
+			array( 'points' => (int) $request->get_param( 'points' ) )
+		);
+
+		return is_wp_error( $result )
+			? $this->error( $result->get_error_message() )
+			: new WP_REST_Response( $result, 200 );
+	}
+
 	public function handle_redeem( WP_REST_Request $request ): WP_REST_Response {
 		$contact_id = $this->require_contact();
 		if ( null === $contact_id ) {
