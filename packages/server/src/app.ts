@@ -11,6 +11,7 @@ import { apiRoutes } from './routes/api.js';
 import { reportRoutes } from './routes/reports.js';
 import { gamificationRoutes } from './routes/gamification.js';
 import { registerAdminRoutes } from './routes/admin.js';
+import { withAuthorisation } from './lib/authorise.js';
 import { healthRoutes } from './routes/health.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -33,7 +34,8 @@ export async function buildApp(): Promise<FastifyInstance> {
   });
 
   /**
-   * Form-encoded bodies, for RFC 8058 one-click unsubscribe.
+   * Form-encoded bodies: RFC 8058 one-click unsubscribe, and the preference
+   * page.
    *
    * A mail client's unsubscribe button POSTs
    * `List-Unsubscribe=One-Click` as `application/x-www-form-urlencoded`.
@@ -41,14 +43,30 @@ export async function buildApp(): Promise<FastifyInstance> {
    * silently does nothing — which is worse than never advertising the header,
    * because the customer believes they have unsubscribed.
    *
-   * The body is not read: the token in the URL is the whole request. Parsing
-   * it to an empty object keeps that explicit and means a malformed body from
-   * some client's implementation cannot fail the unsubscribe.
+   * A malformed body must never fail either request: the unsubscribe token is
+   * in the URL and is the whole request, so a client whose implementation
+   * sends something unexpected still unsubscribes. An unparseable body reads
+   * as no fields rather than as an error.
+   *
+   * `__proto__` and friends are dropped. The parsed object is passed straight
+   * to handler code that looks keys up on it, and a form field named
+   * `__proto__` would otherwise reach Object.prototype.
    */
   app.addContentTypeParser(
     'application/x-www-form-urlencoded',
-    { parseAs: 'string', bodyLimit: 4096 },
-    (_request, _body, done) => done(null, {}),
+    { parseAs: 'string', bodyLimit: 16_384 },
+    (_request, body, done) => {
+      const fields: Record<string, string> = Object.create(null);
+      try {
+        for (const [key, value] of new URLSearchParams(String(body))) {
+          if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
+          fields[key] = value;
+        }
+      } catch {
+        // Nothing to report: see above.
+      }
+      done(null, fields);
+    },
   );
 
   /**
@@ -87,6 +105,11 @@ export async function buildApp(): Promise<FastifyInstance> {
   app.setNotFoundHandler((request, reply) =>
     reply.code(404).send({ error: 'not_found', message: `No route for ${request.method} ${request.url}` }),
   );
+
+  // Before the routes, so every one of them is covered — including whichever
+  // is added next. See lib/authorise.ts for why it is one hook rather than a
+  // guard per handler.
+  withAuthorisation(app);
 
   await app.register(healthRoutes);
   await app.register(collectRoutes);

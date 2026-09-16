@@ -10,6 +10,8 @@ import { buildAllSegments } from '../services/segments.js';
 import { runDueBroadcasts } from '../services/broadcasts.js';
 import { runDueAutomations } from '../services/automations.js';
 import { flushCounters, startCounterBuffer, stopCounterBuffer } from '../services/counters.js';
+import { runRetentionSweep } from '../services/privacy.js';
+import { expirePauses } from '../services/preferences.js';
 import { config } from '../config.js';
 
 /**
@@ -57,6 +59,15 @@ export const JOBS: Job[] = [
   // case where that timer was never started because buffering is off in this
   // process but another one wrote into the maps.
   { name: 'counter_flush', intervalMs: 10_000, run: () => flushCounters() },
+  // Hourly, and deliberately bounded per pass. A retailer that turns on a
+  // 30-day event policy after two years of collection has tens of millions of
+  // rows to shed; taking a bite each hour catches up over a day or two without
+  // ever holding locks on the largest table in the schema for minutes.
+  { name: 'retention_sweep', intervalMs: 3_600_000, run: () => runRetentionSweep() },
+  // Clearing the column is tidiness, not correctness: every read compares the
+  // timestamp to now(), so a lapsed pause already sends. Doing it hourly means
+  // "is this contact paused" is answerable by looking at the row.
+  { name: 'pause_expiry', intervalMs: 3_600_000, run: () => expirePauses() },
 ];
 
 const timers: NodeJS.Timeout[] = [];

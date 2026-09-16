@@ -20,6 +20,8 @@ export interface Contact {
   tags: string[];
   first_seen_at: Date;
   last_seen_at: Date;
+  /** Set once a person has been erased; every identifier above is then null. */
+  erased_at: Date | null;
 }
 
 export interface ContactInput {
@@ -167,6 +169,39 @@ export async function upsertContact(
 
     if (existing && !options.allowIdentityChange) {
       assertIdentityUnchanged(existing, { email, externalRef: input.externalRef ?? null });
+    }
+
+    // An erased person stays erased.
+    //
+    // Erasure strips the address off the contact row, so nothing above finds
+    // them and the next identify or import would create a *new* contact with
+    // the same address — silently undoing an erasure the retailer is on record
+    // as having carried out. The hash is the only way to recognise an address
+    // we must refuse without keeping the address.
+    //
+    // Refused, not ignored: a caller that keeps sending this person's data
+    // should be told, and quietly discarding writes is how an integration
+    // develops a mystery.
+    if (!existing && email) {
+      // The same digest `hashPii` computes, evaluated in the database so the
+      // tenant's salt never has to be fetched into the process for a check
+      // that runs on every new contact. Postgres's built-in sha256 — no
+      // extension, and verified byte for byte against the TypeScript.
+      const { rows } = await client.query(
+        `SELECT 1 FROM contacts c
+           JOIN tenants t ON t.id = c.tenant_id
+          WHERE c.tenant_id = $1
+            AND c.erased_email_hash = left(
+                  encode(sha256(convert_to(t.pii_salt || ':' || $2, 'UTF8')), 'hex'), 32)
+          LIMIT 1`,
+        [tenantId, email],
+      );
+      if (rows.length > 0) {
+        throw ApiError.unprocessable(
+          'That person asked to be erased from this store and cannot be re-added',
+          { code: 'erased' },
+        );
+      }
     }
 
     if (existing) {

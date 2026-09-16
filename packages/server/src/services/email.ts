@@ -294,9 +294,23 @@ export function renderTemplate(
   vars: Record<string, unknown>,
 ): RenderedTemplate {
   const subject = interpolate(template.subject, vars);
-  const html = interpolate(template.html, vars);
+  let html = interpolate(template.html, vars);
+
+  // A missing variable interpolates to an empty string, which in an `href`
+  // means a link back to the email itself — worse than no link. Confirmation
+  // and cart-recovery mail has no preference page to point at, so the whole
+  // anchor goes rather than depending on five call sites to remember.
+  if (!vars.preferences_url) html = stripEmptyLinks(html);
+
   const text = template.text ? interpolate(template.text, vars) : stripHtml(html);
   return { subject, html, text };
+}
+
+/** Drop `<a href="">…</a>`, and any separator left stranded beside it. */
+function stripEmptyLinks(html: string): string {
+  return html
+    .replace(/<a\s+href=""[^>]*>[\s\S]*?<\/a>\s*(&nbsp;)?\s*(&middot;)?\s*(&nbsp;)?/gi, '')
+    .replace(/(&nbsp;)?\s*&middot;\s*(&nbsp;)?\s*(?=<\/p>)/gi, '');
 }
 
 function interpolate(input: string, vars: Record<string, unknown>): string {
@@ -342,13 +356,17 @@ export async function getTemplate(
 ): Promise<EmailTemplate | null> {
   const row = await queryOne<EmailTemplate>(
     runner,
-    'SELECT subject, html, text, transactional FROM email_templates WHERE tenant_id = $1 AND key = $2',
+    `SELECT subject, html, text, transactional, topic_key
+       FROM email_templates WHERE tenant_id = $1 AND key = $2`,
     [tenantId, key],
   );
   if (row) return row;
   const fallback = DEFAULT_TEMPLATES[key];
   if (!fallback) return null;
-  return { ...fallback, transactional: fallback.transactional ?? false };
+  // A built-in template belongs to no topic: these are the messages a store
+  // has not customised, and inventing a topic for them would filter mail the
+  // retailer never chose to categorise.
+  return { ...fallback, transactional: fallback.transactional ?? false, topic_key: null };
 }
 
 export interface EmailTemplate {
@@ -357,6 +375,8 @@ export interface EmailTemplate {
   text: string | null;
   /** True means consent is not required; see `upsertTemplate`. */
   transactional: boolean;
+  /** Which topic this belongs to, so a recipient's choice can be honoured. */
+  topic_key: string | null;
 }
 
 export async function upsertTemplate(
@@ -442,6 +462,12 @@ function layout(body: string): string {
       ${body}
       <hr style="border:none;border-top:1px solid #e5e5ea;margin:32px 0 16px;">
       <p style="margin:0;font-size:12px;color:#8e8e93;">
+        <!-- Preferences first, unsubscribe second. Most people who click the
+             second one want the first: less, or one of the things this store
+             sends rather than all of them. Offered only the exit, they take
+             it. -->
+        <a href="{{preferences_url}}" style="color:#8e8e93;">Email preferences</a>
+        &nbsp;&middot;&nbsp;
         <a href="{{unsubscribe_url}}" style="color:#8e8e93;">Unsubscribe</a>
       </p>
     </td></tr>

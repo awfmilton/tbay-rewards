@@ -1,4 +1,5 @@
 import { ApiError } from '../lib/errors.js';
+import type { FieldKind as ContactFieldKind } from './contact-fields.js';
 
 /**
  * Compiling a saved filter tree into SQL.
@@ -163,7 +164,10 @@ export const FIELDS: Record<string, FieldDef> = {
 const ALLOWED: Record<FieldKind, Operator[]> = {
   text: ['eq', 'ne', 'contains', 'not_contains', 'starts_with', 'ends_with', 'in', 'not_in', 'is_set', 'is_not_set'],
   number: ['eq', 'ne', 'gt', 'gte', 'lt', 'lte', 'is_set', 'is_not_set'],
-  boolean: ['eq', 'ne'],
+  // `is_set` matters for a retailer's own boolean: "trade account: not
+  // answered" is a different audience from "trade account: no", and the
+  // platform's booleans are never null so it costs them nothing.
+  boolean: ['eq', 'ne', 'is_set', 'is_not_set'],
   date: ['in_last_days', 'not_in_last_days', 'before', 'after', 'is_set', 'is_not_set'],
   text_array: ['contains', 'not_contains', 'in', 'not_in', 'is_set', 'is_not_set'],
   json: ['eq', 'ne', 'contains', 'is_set', 'is_not_set'],
@@ -192,12 +196,46 @@ const MAX_TOTAL_FILTERS = 200;
  * `startIndex` is the number of parameters the caller has already bound, so
  * the fragment can be spliced into a larger query.
  */
+/**
+ * A retailer's own fields, by key.
+ *
+ * Passed in rather than looked up here, because the compiler is synchronous
+ * and pure: given the same tree and the same catalogue it produces the same
+ * SQL, which is what makes it testable without a database.
+ *
+ * Their *names* are data, unlike everything in FIELDS — so the name is bound
+ * as a parameter rather than written into the SQL. That keeps the rule this
+ * file exists to enforce intact: no value from a definition ever reaches the
+ * SQL string. Only the kind, which comes from a fixed table, picks a column.
+ */
+export type CustomFields = Map<string, ContactFieldKind>;
+
+/** Custom field keys are addressed as `cf_<key>`, so they cannot shadow a built-in. */
+export const CUSTOM_PREFIX = 'cf_';
+
+const CUSTOM_COLUMN: Record<ContactFieldKind, string> = {
+  text: 'text_value',
+  select: 'text_value',
+  number: 'number_value',
+  date: 'date_value',
+  boolean: 'bool_value',
+};
+
+const CUSTOM_KIND: Record<ContactFieldKind, FieldKind> = {
+  text: 'text',
+  select: 'text',
+  number: 'number',
+  date: 'date',
+  boolean: 'boolean',
+};
+
 export function compileGroup(
   group: FilterGroup,
   timezone: string,
   startIndex = 0,
   depth = 0,
   budget: { remaining: number } = { remaining: MAX_TOTAL_FILTERS },
+  custom: CustomFields = new Map(),
 ): CompiledFilter {
   if (depth > MAX_DEPTH) {
     throw ApiError.badRequest(`Segment filters may not nest more than ${MAX_DEPTH} deep`);
@@ -223,14 +261,14 @@ export function compileGroup(
   }
 
   for (const filter of filters) {
-    const compiled = compileFilter(filter, timezone, index);
+    const compiled = compileFilter(filter, timezone, index, custom);
     parts.push(compiled.sql);
     params.push(...compiled.params);
     index += compiled.params.length;
   }
 
   for (const nested of groups) {
-    const compiled = compileGroup(nested, timezone, index, depth + 1, budget);
+    const compiled = compileGroup(nested, timezone, index, depth + 1, budget, custom);
     parts.push(`(${compiled.sql})`);
     params.push(...compiled.params);
     index += compiled.params.length;
@@ -244,15 +282,45 @@ export function compileGroup(
   return { sql: parts.join(` ${match} `), params };
 }
 
-function compileFilter(filter: Filter, timezone: string, startIndex: number): CompiledFilter {
-  // `Object.hasOwn`, not a truthiness check: `FIELDS['__proto__']`,
-  // `['constructor']` and `['toString']` all return inherited values, so a
-  // plain lookup passes and then `field.kind` is undefined — a TypeError and a
-  // 500 out of the one function whose whole job is rejecting bad definitions
-  // with a 400.
-  const field = Object.hasOwn(FIELDS, filter.field) ? FIELDS[filter.field] : undefined;
+function compileFilter(
+  filter: Filter,
+  timezone: string,
+  startIndex: number,
+  custom: CustomFields,
+): CompiledFilter {
+  const name = String(filter.field ?? '');
+
+  // A retailer's own field. The key is bound, never interpolated; only the
+  // kind — from the retailer's stored definition, checked against a fixed
+  // table — decides which typed column the subquery reads.
+  let field: FieldDef | undefined;
+  let fieldParams: unknown[] = [];
+
+  if (name.startsWith(CUSTOM_PREFIX)) {
+    const key = name.slice(CUSTOM_PREFIX.length);
+    const kind = custom.get(key);
+    if (!kind || !Object.hasOwn(CUSTOM_COLUMN, kind)) {
+      throw ApiError.badRequest(`Unknown segment field "${name}"`);
+    }
+    fieldParams = [key];
+    field = {
+      kind: CUSTOM_KIND[kind]!,
+      sql: `(SELECT v.${CUSTOM_COLUMN[kind]} FROM contact_field_values v
+              WHERE v.tenant_id = c.tenant_id AND v.contact_id = c.id
+                AND v.field_key = $${startIndex + 1})`,
+      label: key,
+    };
+  } else {
+    // `Object.hasOwn`, not a truthiness check: `FIELDS['__proto__']`,
+    // `['constructor']` and `['toString']` all return inherited values, so a
+    // plain lookup passes and then `field.kind` is undefined — a TypeError and
+    // a 500 out of the one function whose whole job is rejecting bad
+    // definitions with a 400.
+    field = Object.hasOwn(FIELDS, name) ? FIELDS[name] : undefined;
+  }
+
   if (!field) {
-    throw ApiError.badRequest(`Unknown segment field "${String(filter.field)}"`);
+    throw ApiError.badRequest(`Unknown segment field "${name}"`);
   }
 
   const operator = filter.operator;
@@ -263,112 +331,122 @@ function compileFilter(filter: Filter, timezone: string, startIndex: number): Co
   }
 
   const column = field.sql;
-  const p = (offset = 0) => `$${startIndex + 1 + offset}`;
+  // The field's own parameter, if it has one, sits first; the operator's
+  // follow it.
+  const p = (offset = 0) => `$${startIndex + 1 + fieldParams.length + offset}`;
+  const withField = (compiled: CompiledFilter): CompiledFilter => ({
+    sql: compiled.sql,
+    params: [...fieldParams, ...compiled.params],
+  });
 
-  switch (operator) {
-    case 'is_set':
-      return {
-        sql: field.kind === 'text_array'
-          ? `COALESCE(array_length(${column}, 1), 0) > 0`
-          : `${column} IS NOT NULL`,
-        params: [],
-      };
-    case 'is_not_set':
-      return {
-        sql: field.kind === 'text_array'
-          ? `COALESCE(array_length(${column}, 1), 0) = 0`
-          : `${column} IS NULL`,
-        params: [],
-      };
-  }
-
-  if (field.kind === 'text_array') {
-    const values = asStringList(filter.value);
+  const compiled = ((): CompiledFilter => {
     switch (operator) {
+      case 'is_set':
+        return {
+          sql: field.kind === 'text_array'
+            ? `COALESCE(array_length(${column}, 1), 0) > 0`
+            : `${column} IS NOT NULL`,
+          params: [],
+        };
+      case 'is_not_set':
+        return {
+          sql: field.kind === 'text_array'
+            ? `COALESCE(array_length(${column}, 1), 0) = 0`
+            : `${column} IS NULL`,
+          params: [],
+        };
+    }
+
+    if (field.kind === 'text_array') {
+      const values = asStringList(filter.value);
+      switch (operator) {
+        case 'contains':
+        case 'in':
+          // Overlap, so "in [vip, gold]" means "has either", which is what the
+          // UI's multi-select reads as.
+          return { sql: `${column} && ${p()}::text[]`, params: [values] };
+        case 'not_contains':
+        case 'not_in':
+          return { sql: `NOT (${column} && ${p()}::text[])`, params: [values] };
+      }
+    }
+
+    if (field.kind === 'date') {
+      switch (operator) {
+        case 'in_last_days':
+          return {
+            sql: `${column} >= (date_trunc('day', now() AT TIME ZONE ${p(1)})
+                                AT TIME ZONE ${p(1)}) - (${p()} || ' days')::interval`,
+            params: [String(asPositiveInt(filter.value)), timezone],
+          };
+        case 'not_in_last_days':
+          // NULL means "never", which must count as "not in the last N days".
+          return {
+            sql: `(${column} IS NULL OR ${column} < (date_trunc('day', now() AT TIME ZONE ${p(1)})
+                                AT TIME ZONE ${p(1)}) - (${p()} || ' days')::interval)`,
+            params: [String(asPositiveInt(filter.value)), timezone],
+          };
+        case 'before':
+          return { sql: `${column} < ${p()}::timestamptz`, params: [asDate(filter.value)] };
+        case 'after':
+          return { sql: `${column} > ${p()}::timestamptz`, params: [asDate(filter.value)] };
+      }
+    }
+
+    if (field.kind === 'boolean') {
+      const value = Boolean(filter.value);
+      return {
+        sql: operator === 'eq' ? `${column} IS ${value ? 'TRUE' : 'NOT TRUE'}`
+                               : `${column} IS ${value ? 'NOT TRUE' : 'TRUE'}`,
+        params: [],
+      };
+    }
+
+    if (field.kind === 'number') {
+      const value = asNumber(filter.value);
+      const sqlOp = { eq: '=', ne: '<>', gt: '>', gte: '>=', lt: '<', lte: '<=' }[
+        operator as 'eq' | 'ne' | 'gt' | 'gte' | 'lt' | 'lte'
+      ];
+      // COALESCE so "balance < 100" includes people with no balance row, which
+      // is what "fewer than 100 points" means to the person asking.
+      return { sql: `COALESCE(${column}, 0) ${sqlOp} ${p()}`, params: [value] };
+    }
+
+    // text
+    switch (operator) {
+      case 'eq':
+        return { sql: `lower(${column}) = lower(${p()})`, params: [asString(filter.value)] };
+      case 'ne':
+        return {
+          // NULL is not equal to anything, so a plain <> would drop contacts who
+          // have no value at all — rarely what "is not X" is meant to say.
+          sql: `(${column} IS NULL OR lower(${column}) <> lower(${p()}))`,
+          params: [asString(filter.value)],
+        };
       case 'contains':
-      case 'in':
-        // Overlap, so "in [vip, gold]" means "has either", which is what the
-        // UI's multi-select reads as.
-        return { sql: `${column} && ${p()}::text[]`, params: [values] };
+        return { sql: `${column} ILIKE ${p()}`, params: [`%${escapeLike(asString(filter.value))}%`] };
       case 'not_contains':
+        return {
+          sql: `(${column} IS NULL OR ${column} NOT ILIKE ${p()})`,
+          params: [`%${escapeLike(asString(filter.value))}%`],
+        };
+      case 'starts_with':
+        return { sql: `${column} ILIKE ${p()}`, params: [`${escapeLike(asString(filter.value))}%`] };
+      case 'ends_with':
+        return { sql: `${column} ILIKE ${p()}`, params: [`%${escapeLike(asString(filter.value))}`] };
+      case 'in':
+        return { sql: `lower(${column}) = ANY(${p()}::text[])`, params: [asStringList(filter.value).map((v) => v.toLowerCase())] };
       case 'not_in':
-        return { sql: `NOT (${column} && ${p()}::text[])`, params: [values] };
-    }
-  }
-
-  if (field.kind === 'date') {
-    switch (operator) {
-      case 'in_last_days':
         return {
-          sql: `${column} >= (date_trunc('day', now() AT TIME ZONE ${p(1)})
-                              AT TIME ZONE ${p(1)}) - (${p()} || ' days')::interval`,
-          params: [String(asPositiveInt(filter.value)), timezone],
+          sql: `(${column} IS NULL OR NOT (lower(${column}) = ANY(${p()}::text[])))`,
+          params: [asStringList(filter.value).map((v) => v.toLowerCase())],
         };
-      case 'not_in_last_days':
-        // NULL means "never", which must count as "not in the last N days".
-        return {
-          sql: `(${column} IS NULL OR ${column} < (date_trunc('day', now() AT TIME ZONE ${p(1)})
-                              AT TIME ZONE ${p(1)}) - (${p()} || ' days')::interval)`,
-          params: [String(asPositiveInt(filter.value)), timezone],
-        };
-      case 'before':
-        return { sql: `${column} < ${p()}::timestamptz`, params: [asDate(filter.value)] };
-      case 'after':
-        return { sql: `${column} > ${p()}::timestamptz`, params: [asDate(filter.value)] };
     }
-  }
 
-  if (field.kind === 'boolean') {
-    const value = Boolean(filter.value);
-    return {
-      sql: operator === 'eq' ? `${column} IS ${value ? 'TRUE' : 'NOT TRUE'}`
-                             : `${column} IS ${value ? 'NOT TRUE' : 'TRUE'}`,
-      params: [],
-    };
-  }
+    throw ApiError.badRequest(`Operator "${String(operator)}" is not supported`);
+  })();
 
-  if (field.kind === 'number') {
-    const value = asNumber(filter.value);
-    const sqlOp = { eq: '=', ne: '<>', gt: '>', gte: '>=', lt: '<', lte: '<=' }[
-      operator as 'eq' | 'ne' | 'gt' | 'gte' | 'lt' | 'lte'
-    ];
-    // COALESCE so "balance < 100" includes people with no balance row, which
-    // is what "fewer than 100 points" means to the person asking.
-    return { sql: `COALESCE(${column}, 0) ${sqlOp} ${p()}`, params: [value] };
-  }
-
-  // text
-  switch (operator) {
-    case 'eq':
-      return { sql: `lower(${column}) = lower(${p()})`, params: [asString(filter.value)] };
-    case 'ne':
-      return {
-        // NULL is not equal to anything, so a plain <> would drop contacts who
-        // have no value at all — rarely what "is not X" is meant to say.
-        sql: `(${column} IS NULL OR lower(${column}) <> lower(${p()}))`,
-        params: [asString(filter.value)],
-      };
-    case 'contains':
-      return { sql: `${column} ILIKE ${p()}`, params: [`%${escapeLike(asString(filter.value))}%`] };
-    case 'not_contains':
-      return {
-        sql: `(${column} IS NULL OR ${column} NOT ILIKE ${p()})`,
-        params: [`%${escapeLike(asString(filter.value))}%`],
-      };
-    case 'starts_with':
-      return { sql: `${column} ILIKE ${p()}`, params: [`${escapeLike(asString(filter.value))}%`] };
-    case 'ends_with':
-      return { sql: `${column} ILIKE ${p()}`, params: [`%${escapeLike(asString(filter.value))}`] };
-    case 'in':
-      return { sql: `lower(${column}) = ANY(${p()}::text[])`, params: [asStringList(filter.value).map((v) => v.toLowerCase())] };
-    case 'not_in':
-      return {
-        sql: `(${column} IS NULL OR NOT (lower(${column}) = ANY(${p()}::text[])))`,
-        params: [asStringList(filter.value).map((v) => v.toLowerCase())],
-      };
-  }
-
-  throw ApiError.badRequest(`Operator "${String(operator)}" is not supported`);
+  return withField(compiled);
 }
 
 /**

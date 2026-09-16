@@ -20,8 +20,8 @@ export class ApiError extends Error {
     return new ApiError(401, 'unauthorized', message);
   }
 
-  static forbidden(message = 'Not permitted'): ApiError {
-    return new ApiError(403, 'forbidden', message);
+  static forbidden(message = 'Not permitted', details?: unknown): ApiError {
+    return new ApiError(403, 'forbidden', message, details);
   }
 
   static notFound(message = 'Not found'): ApiError {

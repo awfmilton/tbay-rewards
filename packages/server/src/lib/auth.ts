@@ -63,6 +63,11 @@ export async function requireSecretKey(request: FastifyRequest): Promise<Tenant>
 
   request.tenant = tenant;
   request.authScope = 'secret';
+  // The role guard and the audit log both read these; see lib/authorise.ts.
+  request.role = tenant.keyContext?.role ?? 'owner';
+  request.operatorId = tenant.keyContext?.operatorId ?? null;
+  request.keyId = tenant.keyContext?.keyId ?? null;
+  request.actorLabel = tenant.keyContext?.label ?? '';
   return tenant;
 }
 
