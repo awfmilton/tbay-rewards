@@ -746,6 +746,8 @@ class TBAY_Rewards_UI {
 			'bridge/history' => array( 'GET', 'handle_bridge_history' ),
 			'coupon'         => array( 'POST', 'handle_coupon' ),
 			'transfer'       => array( 'POST', 'handle_transfer' ),
+			'notifications'  => array( 'GET', 'handle_notifications' ),
+			'notifications/read' => array( 'POST', 'handle_notifications_read' ),
 		);
 
 		foreach ( $routes as $path => $spec ) {
@@ -759,6 +761,56 @@ class TBAY_Rewards_UI {
 				)
 			);
 		}
+	}
+
+	/**
+	 * Badge, rank and streak notifications for the signed-in member.
+	 *
+	 * The platform has written these since gamification shipped and nothing
+	 * ever read them, so an unlocked badge was a row in a table the customer
+	 * never saw. Unread-only by default: the toast strip shows what is new,
+	 * and the rewards page can ask for the full list.
+	 */
+	public function handle_notifications( WP_REST_Request $request ): WP_REST_Response {
+		$contact_id = $this->require_contact();
+		if ( null === $contact_id ) {
+			return $this->error( __( 'Your rewards account is not ready yet.', 'tbay-rewards' ) );
+		}
+
+		$result = $this->api->request(
+			'GET',
+			'/v1/gamification/notifications',
+			array(),
+			array(
+				'contactId' => $contact_id,
+				// The platform reads `unread=1`; anything else means all.
+				'unread'    => $request->get_param( 'all' ) ? '0' : '1',
+			)
+		);
+
+		return is_wp_error( $result )
+			? $this->error( $result->get_error_message() )
+			: new WP_REST_Response( $result, 200 );
+	}
+
+	/** Mark notifications seen so they do not pop again on the next page. */
+	public function handle_notifications_read( WP_REST_Request $request ): WP_REST_Response {
+		$contact_id = $this->require_contact();
+		if ( null === $contact_id ) {
+			return $this->error( __( 'Your rewards account is not ready yet.', 'tbay-rewards' ) );
+		}
+
+		$ids = $request->get_param( 'ids' );
+		$ids = is_array( $ids ) ? array_slice( array_map( 'sanitize_text_field', $ids ), 0, 50 ) : array();
+
+		$result = $this->api->post(
+			'/v1/gamification/notifications/read',
+			array( 'contactId' => $contact_id, 'ids' => $ids )
+		);
+
+		return is_wp_error( $result )
+			? $this->error( $result->get_error_message() )
+			: new WP_REST_Response( $result, 200 );
 	}
 
 	public function handle_share( WP_REST_Request $request ): WP_REST_Response {

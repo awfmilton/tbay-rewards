@@ -143,6 +143,7 @@ class TBAY_Rewards_Tracker {
 					'claimPending'   => __( 'You have an unfinished claim for %s TBAY.', 'tbay-rewards' ),
 					'claimResume'    => __( 'Finish claiming', 'tbay-rewards' ),
 					'claimWrongWallet' => __( 'Your wallet switched accounts. Select the account you verified and try again.', 'tbay-rewards' ),
+					'dismiss'        => __( 'Dismiss', 'tbay-rewards' ),
 					'bridgeAsked'    => __( 'You asked to bridge', 'tbay-rewards' ),
 					'bridgeStays'    => __( 'Returned to the treasury', 'tbay-rewards' ),
 					'bridgeRounding' => __( 'Amounts are rounded down to the precision Ethereum TBAY uses. The contract returns anything smaller to the treasury in the same transaction, so nothing is stranded.', 'tbay-rewards' ),

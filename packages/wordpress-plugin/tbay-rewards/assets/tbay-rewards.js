@@ -957,11 +957,72 @@
 		});
 	}
 
+	// ── Notifications ────────────────────────────────────────────────────────
+
+	/**
+	 * Show badge, rank and streak notifications the platform has recorded.
+	 *
+	 * These rows have existed since gamification shipped and nothing rendered
+	 * them, so unlocking a badge was silent. Marked read as soon as they are
+	 * shown, which is the only honest moment: the customer has now seen them,
+	 * and a toast that reappears on every page is worse than none.
+	 */
+	function initNotifications() {
+		// Only for signed-in members — anonymous visitors have no notifications
+		// and the REST route would just 401 on every page load.
+		if (!config.restUrl || !config.loggedIn) return;
+
+		rest('notifications', null, 'GET').then(function (data) {
+			var items = (data && data.notifications) || [];
+			if (items.length === 0) return;
+
+			var strip = document.createElement('div');
+			strip.className = 'tbay-toasts';
+			strip.setAttribute('role', 'status');
+			strip.setAttribute('aria-live', 'polite');
+
+			items.slice(0, 3).forEach(function (item) {
+				var toast = document.createElement('div');
+				toast.className = 'tbay-toast tbay-toast--' + escapeHtml(String(item.kind || 'info'));
+				toast.innerHTML =
+					'<strong class="tbay-toast__title">' + escapeHtml(item.title || '') + '</strong>' +
+					(item.body ? '<span class="tbay-toast__body">' + escapeHtml(item.body) + '</span>' : '') +
+					'<button type="button" class="tbay-toast__close" aria-label="' +
+					escapeHtml(i18n.dismiss || 'Dismiss') + '">&times;</button>';
+
+				toast.querySelector('.tbay-toast__close').addEventListener('click', function () {
+					toast.remove();
+					if (!strip.querySelector('.tbay-toast')) strip.remove();
+				});
+
+				strip.appendChild(toast);
+			});
+
+			document.body.appendChild(strip);
+
+			rest('notifications/read', { ids: items.map(function (item) { return item.id; }) })
+				['catch'](function () { /* seen is seen; a failed mark retries next load */ });
+
+			// Auto-dismiss, but only for people who have not asked for reduced
+			// motion — for them the strip stays until dismissed.
+			var still = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+			if (!still) {
+				setTimeout(function () {
+					strip.classList.add('tbay-toasts--out');
+					setTimeout(function () { strip.remove(); }, 400);
+				}, 8000);
+			}
+		})['catch'](function () {
+			// A notification is never worth an error in front of a customer.
+		});
+	}
+
 	function boot() {
 		document.querySelectorAll('[data-tbay-credit]').forEach(initCredit);
 		document.querySelectorAll('[data-tbay-newsletter]').forEach(initNewsletter);
 		document.querySelectorAll('[data-tbay-share]').forEach(initShare);
 		document.querySelectorAll('[data-tbay-rewards]').forEach(initRewards);
+		initNotifications();
 
 		// A bridge panel used on its own, outside the dashboard.
 		document.querySelectorAll('[data-tbay-bridge]').forEach(function (panel) {
