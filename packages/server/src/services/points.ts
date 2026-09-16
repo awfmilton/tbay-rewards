@@ -566,10 +566,13 @@ export async function queryLedger(
 
   const clause = where.join(' AND ');
 
+  // `c.tenant_id = l.tenant_id` on the join, not just the id: a ledger row
+  // whose contact belongs to another tenant must never hand this caller that
+  // stranger's email and name.
   const totalRow = await queryOne<{ n: string }>(
     runner,
     `SELECT COUNT(*) AS n FROM points_ledger l
-       LEFT JOIN contacts c ON c.id = l.contact_id
+       LEFT JOIN contacts c ON c.id = l.contact_id AND c.tenant_id = l.tenant_id
       WHERE ${clause}`,
     params,
   );
@@ -577,7 +580,7 @@ export async function queryLedger(
   const { rows } = await runner.query<LedgerRow>(
     `SELECT l.*, c.email AS contact_email, c.name AS contact_name
        FROM points_ledger l
-       LEFT JOIN contacts c ON c.id = l.contact_id
+       LEFT JOIN contacts c ON c.id = l.contact_id AND c.tenant_id = l.tenant_id
       WHERE ${clause}
       ORDER BY l.created_at DESC, l.id DESC
       LIMIT ${limit} OFFSET ${offset}`,
