@@ -187,3 +187,52 @@ Run exactly one `worker` container. More is safe (every job claims work with
 | Tracker 404s | `PUBLIC_URL` wrong, or the proxy is not forwarding `/tbay.js` |
 | `chain_unavailable` on bridging | No RPC configured; burns cannot be verified without one |
 | Reward allocation exhausted | `TBAY_REWARD_SUPPLY_CAP_WEI` reached — see [TOKEN.md](TOKEN.md) |
+
+---
+
+## Verified build
+
+The image has been built and run end to end, not just written:
+
+```
+docker build -t tbay-rewards .          # 345 MB, node:22-alpine, non-root
+docker run  -e DATABASE_URL=... tbay-rewards
+```
+
+On a first boot against an empty database it applies all eleven migrations,
+runs preflight, starts thirteen background jobs, and answers `/health`. A round
+trip through the running container — tracker served, a tracked pageview
+accepted with the public key, an order recorded with the secret key, a segment
+built, a timeline read — behaves exactly as the test suite says it does.
+
+Preflight is not decorative. On that first boot it refused the shipped
+defaults:
+
+```
+[ERROR] default_secret: IDENTITY_SALT is still the development default in production.
+[ERROR] default_secret: TOKEN_SECRET is still the development default in production.
+[WARNING] email_to_log: EMAIL_TRANSPORT is "log" in production: message bodies go to the application log.
+```
+
+Set those before you put anything real behind it. `/health` reports
+`status: "misconfigured"` until you do.
+
+### Behind a TLS-inspecting proxy
+
+If your build network intercepts TLS, `npm ci` fails inside the build with
+`SELF_SIGNED_CERT_IN_CHAIN` — and npm reports it unhelpfully as
+`Exit handler never called!`, which reads like an out-of-memory error and is
+not one. Supply your CA rather than disabling verification:
+
+```bash
+docker build --secret id=ca,src=/path/to/ca-bundle.crt .
+```
+
+and in a local override of the build stage:
+
+```dockerfile
+RUN --mount=type=secret,id=ca,target=/ca.crt NODE_EXTRA_CA_CERTS=/ca.crt npm ci
+```
+
+The shipped Dockerfile deliberately does not require a secret, so an ordinary
+build stays a plain `docker build .`.
