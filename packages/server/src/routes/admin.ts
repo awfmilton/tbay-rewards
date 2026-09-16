@@ -20,6 +20,13 @@ import {
 } from '../services/segments.js';
 import { describeFields } from '../services/segment-filters.js';
 import {
+  deleteAutomation,
+  listAutomations,
+  listRuns,
+  upsertAutomation,
+  validateSteps,
+} from '../services/automations.js';
+import {
   broadcastReport,
   cancelBroadcast,
   listBroadcasts,
@@ -170,6 +177,60 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
   app.delete<{ Params: { id: string } }>('/v1/rewards/product-rules/:id', async (request) => {
     const tenant = tenantOf(request);
     return { removed: await deleteProductRule(tenant.id, request.params.id) };
+  });
+
+  // ── Automations ────────────────────────────────────────────────────────────
+
+  app.get('/v1/automations', async (request) => {
+    const tenant = tenantOf(request);
+    return { automations: await listAutomations(tenant.id) };
+  });
+
+  app.put<{ Params: { key: string } }>('/v1/automations/:key', async (request) => {
+    const tenant = tenantOf(request);
+    const schema = z.object({
+      name: z.string().min(1).max(200).optional(),
+      triggerType: z.string().max(64).optional(),
+      conditions: z.array(z.record(z.unknown())).max(20).optional(),
+      /**
+       * The step list. Shape-checked loosely here and validated properly by
+       * `validateSteps`, which knows which action and control types exist —
+       * duplicating that list in a zod enum would give two places to forget.
+       */
+      actions: z.array(z.record(z.unknown())).max(50).optional(),
+      enabled: z.boolean().optional(),
+    });
+    const input = parse(schema, request.body);
+
+    if (input.actions) validateSteps(input.actions as never);
+
+    const existing = (await listAutomations(tenant.id)).find(
+      (row) => row.key === request.params.key,
+    );
+
+    const triggerType = input.triggerType ?? existing?.trigger_type;
+    if (!triggerType) throw ApiError.badRequest('An automation needs a triggerType');
+
+    const automation = await upsertAutomation(tenant.id, {
+      key: request.params.key,
+      name: input.name ?? existing?.name ?? request.params.key,
+      triggerType,
+      conditions: (input.conditions ?? existing?.conditions ?? []) as never,
+      actions: (input.actions ?? existing?.actions ?? []) as never,
+      enabled: input.enabled ?? existing?.enabled ?? true,
+    });
+    return { automation };
+  });
+
+  app.delete<{ Params: { key: string } }>('/v1/automations/:key', async (request) => {
+    const tenant = tenantOf(request);
+    return { removed: await deleteAutomation(tenant.id, request.params.key) };
+  });
+
+  /** Parked runs, so an admin can see a sequence actually waiting. */
+  app.get<{ Querystring: { key?: string } }>('/v1/automations/runs', async (request) => {
+    const tenant = tenantOf(request);
+    return { runs: await listRuns(tenant.id, request.query.key) };
   });
 
   // ── Segments ───────────────────────────────────────────────────────────────

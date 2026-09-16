@@ -1,7 +1,9 @@
 import { db, queryOne, type Queryable } from '../db/pool.js';
 import { config } from '../config.js';
+import { ApiError } from '../lib/errors.js';
 import { getTemplate, queueEmail, renderTemplate, senderFor } from './email.js';
 import { shouldTrack } from './email-tracking.js';
+import { advanceRun, resumeDueRuns, waitSeconds, type Step } from './automation-runner.js';
 import { award } from './points.js';
 import { getTenantById, type Tenant } from './tenants.js';
 import type { Contact } from './contacts.js';
@@ -41,6 +43,14 @@ export type Action =
   | { type: 'add_tag'; tag: string }
   | { type: 'remove_tag'; tag: string }
   | { type: 'webhook'; topic: string };
+
+/**
+ * What an automation's `actions` array may hold.
+ *
+ * Control steps (`wait`, `if`, `goto`, `stop`) are handled by the step machine
+ * and never reach `runActionStep`; see `automation-runner.ts`.
+ */
+export type AutomationStep = Step;
 
 export interface Automation {
   id: string;
@@ -117,6 +127,8 @@ export async function upsertAutomation(
 export interface FireResult {
   ran: string[];
   skipped: string[];
+  /** Runs parked on a wait; the worker finishes them later. */
+  waiting: string[];
 }
 
 /**
@@ -135,13 +147,15 @@ export async function fire(
     'SELECT * FROM automations WHERE tenant_id = $1 AND trigger_type = $2 AND enabled',
     [tenantId, triggerType],
   );
-  if (automations.length === 0) return { ran: [], skipped: [] };
+  if (automations.length === 0) return { ran: [], skipped: [], waiting: [] };
 
   const tenant = await getTenantById(tenantId);
-  if (!tenant) return { ran: [], skipped: [] };
+  if (!tenant) return { ran: [], skipped: [], waiting: [] };
 
   const ran: string[] = [];
   const skipped: string[] = [];
+  /** Runs that parked on a wait and will finish later. */
+  const waiting: string[] = [];
 
   for (const automation of automations) {
     if (!evaluateConditions(automation.conditions ?? [], ctx)) {
@@ -169,31 +183,68 @@ export async function fire(
     }
 
     try {
-      await runActions(runner, tenant, automation, ctx);
-      ran.push(automation.key);
+      // Runs through the step machine even when there is no wait in the list,
+      // so there is one execution path rather than two that drift.
+      const result = await advanceRun(
+        runner,
+        tenant,
+        automation,
+        {
+          id: claim.id,
+          tenant_id: tenantId,
+          automation_id: automation.id,
+          contact_id: ctx.contact?.id ?? null,
+          dedupe_key: ctx.dedupeKey,
+          status: 'running',
+          step_index: 0,
+          resume_at: null,
+          attempts: 0,
+          context: ctx.data ?? {},
+          error: null,
+        },
+        runActionStep,
+      );
+
+      await runner.query(
+        `UPDATE automation_runs
+            SET status = $2, step_index = $3, resume_at = $4, updated_at = now()
+          WHERE id = $1`,
+        [claim.id, result.status, result.stepIndex, result.resumeAt],
+      );
+
+      if (result.status === 'waiting') waiting.push(automation.key);
+      else ran.push(automation.key);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       await runner.query(
-        `UPDATE automation_runs SET status = 'failed', error = $2 WHERE id = $1`,
+        `UPDATE automation_runs SET status = 'failed', error = $2, updated_at = now() WHERE id = $1`,
         [claim.id, message.slice(0, 500)],
       );
       skipped.push(automation.key);
     }
   }
 
-  return { ran, skipped };
+  return { ran, skipped, waiting };
 }
 
-async function runActions(
+/**
+ * Perform one action.
+ *
+ * The sequencing — order, waits, branches — belongs to the step machine in
+ * `automation-runner.ts`. This only knows how to do one thing to one contact.
+ */
+async function runActionStep(
   runner: Queryable,
   tenant: Tenant,
   automation: Automation,
+  action: Action,
   ctx: AutomationContext,
+  stepIndex: number,
 ): Promise<void> {
-  for (const action of automation.actions ?? []) {
+  {
     switch (action.type) {
       case 'send_email':
-        await sendEmailAction(runner, tenant, automation, action, ctx);
+        await sendEmailAction(runner, tenant, automation, action, ctx, stepIndex);
         break;
 
       case 'award_points':
@@ -206,7 +257,7 @@ async function runActions(
               reason: action.reason ?? automation.name,
               refType: 'automation',
               refId: automation.id,
-              idempotencyKey: `automation:${automation.key}:${ctx.dedupeKey}`,
+              idempotencyKey: `automation:${automation.key}:${stepIndex}:${ctx.dedupeKey}`,
             },
             runner,
           );
@@ -250,6 +301,7 @@ async function sendEmailAction(
   automation: Automation,
   action: Extract<Action, { type: 'send_email' }>,
   ctx: AutomationContext,
+  stepIndex: number,
 ): Promise<void> {
   if (!ctx.contact?.email) return;
 
@@ -284,7 +336,7 @@ async function sendEmailAction(
       subject: rendered.subject,
       html: rendered.html,
       text: rendered.text,
-      dedupeKey: action.dedupe ?? `automation:${automation.key}:${ctx.dedupeKey}`,
+      dedupeKey: action.dedupe ?? `automation:${automation.key}:${stepIndex}:${ctx.dedupeKey}`,
       // Marketing mail is tracked; a transactional receipt is not. The same
       // flag that decides whether consent is required decides this, because
       // the two questions have the same answer: is this a campaign or a
@@ -410,4 +462,113 @@ export async function installDefaultAutomations(
     },
     runner,
   );
+}
+
+/**
+ * Resume parked runs whose wait has elapsed.
+ *
+ * Lives here rather than in the runner so the action implementations stay
+ * private to this module; the runner only ever receives them as a callback.
+ */
+export async function runDueAutomations(limit = 50): Promise<{
+  resumed: number;
+  completed: number;
+  failed: number;
+}> {
+  return resumeDueRuns(runActionStep, limit);
+}
+
+export async function deleteAutomation(
+  tenantId: string,
+  key: string,
+  runner: Queryable = db(),
+): Promise<boolean> {
+  const { rowCount } = await runner.query(
+    'DELETE FROM automations WHERE tenant_id = $1 AND key = $2',
+    [tenantId, key],
+  );
+  return (rowCount ?? 0) > 0;
+}
+
+/** Runs, newest first — mostly so an admin can see a sequence actually parked. */
+export async function listRuns(
+  tenantId: string,
+  automationKey?: string,
+  runner: Queryable = db(),
+): Promise<
+  Array<{
+    id: string;
+    automation_key: string;
+    contact_id: string | null;
+    status: string;
+    step_index: number;
+    resume_at: Date | null;
+    error: string | null;
+    created_at: Date;
+  }>
+> {
+  const { rows } = await runner.query(
+    `SELECT r.id, a.key AS automation_key, r.contact_id, r.status, r.step_index,
+            r.resume_at, r.error, r.created_at
+       FROM automation_runs r JOIN automations a ON a.id = r.automation_id
+      WHERE r.tenant_id = $1 AND ($2::text IS NULL OR a.key = $2)
+      ORDER BY r.created_at DESC
+      LIMIT 200`,
+    [tenantId, automationKey ?? null],
+  );
+  return rows as never;
+}
+
+const ACTION_TYPES = ['send_email', 'award_points', 'add_tag', 'remove_tag', 'webhook'];
+const CONTROL_TYPES = ['wait', 'if', 'goto', 'stop'];
+
+/**
+ * Check a step list before it is saved.
+ *
+ * Validating here rather than at run time means a bad sequence is rejected
+ * while an admin is looking at the form, not silently parked forever when a
+ * customer triggers it at two in the morning.
+ */
+export function validateSteps(steps: Array<Record<string, unknown>>): void {
+  steps.forEach((step, index) => {
+    const type = String(step.type ?? '');
+
+    if (CONTROL_TYPES.includes(type)) {
+      if (type === 'wait') {
+        // Throws on a zero or absurd duration.
+        waitSeconds(step as never);
+      }
+      if (type === 'if' && typeof step.filter !== 'object') {
+        throw ApiError.badRequest(`Step ${index}: an "if" needs a filter`);
+      }
+      if (type === 'goto') {
+        const target = Number(step.step);
+        if (!Number.isInteger(target) || target < 0 || target >= steps.length) {
+          throw ApiError.badRequest(`Step ${index}: "goto" points outside the sequence`);
+        }
+      }
+      return;
+    }
+
+    if (!ACTION_TYPES.includes(type)) {
+      throw ApiError.badRequest(`Step ${index}: unknown step type "${type}"`);
+    }
+    if (type === 'send_email' && typeof step.template !== 'string') {
+      throw ApiError.badRequest(`Step ${index}: "send_email" needs a template`);
+    }
+    if (type === 'award_points' && !Number.isFinite(Number(step.points))) {
+      throw ApiError.badRequest(`Step ${index}: "award_points" needs points`);
+    }
+    if ((type === 'add_tag' || type === 'remove_tag') && typeof step.tag !== 'string') {
+      throw ApiError.badRequest(`Step ${index}: "${type}" needs a tag`);
+    }
+    if (type === 'webhook' && typeof step.topic !== 'string') {
+      throw ApiError.badRequest(`Step ${index}: "webhook" needs a topic`);
+    }
+  });
+
+  // A sequence that only waits does nothing but occupy the worker.
+  if (steps.length > 0 && steps.every((step) => CONTROL_TYPES.includes(String(step.type)))) {
+    throw ApiError.badRequest('A sequence needs at least one action');
+  }
 }

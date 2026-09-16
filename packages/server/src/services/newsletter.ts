@@ -353,6 +353,12 @@ export async function unsubscribeByToken(token: string, runner: Queryable = db()
     [hashToken(token)],
   );
 
+  // Parked sequences stop too. A welcome series that keeps arriving after
+  // someone unsubscribed is the complaint that turns into a spam report, and
+  // the consent check at send time would not save a run already mid-flight if
+  // one of its steps were ever made transactional.
+  await cancelParkedRuns(runner, token);
+
   // Unconditional: someone clicking an unsubscribe link a second time still
   // means "stop", and the first click may have flipped the list row without
   // the consent flag under the old code above.
@@ -402,6 +408,18 @@ export async function unsubscribeByEmail(
     `UPDATE contacts
         SET marketing_consent = false, updated_at = now()
       WHERE tenant_id = $1 AND email_normalised = $2 AND marketing_consent`,
+    [tenantId, normalised],
+  );
+
+  // Same reasoning as the token path: stop the sequences already in flight,
+  // not just the next one that would start.
+  await runner.query(
+    `UPDATE automation_runs r
+        SET status = 'cancelled', resume_at = NULL, updated_at = now()
+       FROM contacts c
+      WHERE r.contact_id = c.id AND r.tenant_id = $1
+        AND c.email_normalised = $2
+        AND r.status IN ('waiting', 'running')`,
     [tenantId, normalised],
   );
 
@@ -456,4 +474,17 @@ export async function subscribersFor(
     [tenantId, listSlug, Math.min(limit, 10_000)],
   );
   return rows;
+}
+
+/** Cancel every parked automation run for the contact behind an unsub token. */
+async function cancelParkedRuns(runner: Queryable, token: string): Promise<void> {
+  await runner.query(
+    `UPDATE automation_runs
+        SET status = 'cancelled', resume_at = NULL, updated_at = now()
+      WHERE status IN ('waiting', 'running')
+        AND contact_id IN (
+          SELECT contact_id FROM subscriptions WHERE unsub_token_hash = $1
+        )`,
+    [hashToken(token)],
+  );
 }

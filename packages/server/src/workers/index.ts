@@ -8,6 +8,7 @@ import { expireStaleClaims, reconcileClaims } from '../services/token.js';
 import { purgeExpiredChallenges } from '../services/wallets.js';
 import { buildAllSegments } from '../services/segments.js';
 import { runDueBroadcasts } from '../services/broadcasts.js';
+import { runDueAutomations } from '../services/automations.js';
 
 /**
  * Background jobs.
@@ -47,6 +48,9 @@ export const JOBS: Job[] = [
   // Every 30 seconds: a scheduled broadcast should go out close to its time,
   // and a send in progress should keep moving.
   { name: 'broadcast_send', intervalMs: 30_000, run: () => runDueBroadcasts() },
+  // Every 30 seconds: a sequence that says "wait one hour" should resume close
+  // to the hour, not up to ten minutes late.
+  { name: 'automation_resume', intervalMs: 30_000, run: () => runDueAutomations() },
 ];
 
 const timers: NodeJS.Timeout[] = [];
