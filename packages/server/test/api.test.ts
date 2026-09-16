@@ -408,14 +408,23 @@ describe('automations', () => {
 });
 
 describe('email consent in automations', () => {
-  it('will not send automation email to a contact without consent', async () => {
-    await authed('PUT', '/v1/rewards/rules', { key: 'review', points: 100 });
-    await authed('POST', '/v1/contacts', { email: 'noconsent@example.com' });
-
+  beforeEach(async () => {
     await db().query(
       `UPDATE automations SET enabled = true WHERE tenant_id = $1 AND key = 'welcome_points_email'`,
       [tenant.id],
     );
+    await authed('PUT', '/v1/rewards/rules', { key: 'review', points: 100 });
+  });
+
+  it('will not send a marketing automation email without consent', async () => {
+    // The points_awarded template ships transactional, so make this tenant's
+    // copy marketing to test the gate that still applies to most mail.
+    await authed('PUT', '/v1/email/templates/points_awarded', {
+      subject: 'Points',
+      html: '<p>{{points}}</p>',
+      transactional: false,
+    });
+    await authed('POST', '/v1/contacts', { email: 'noconsent@example.com' });
 
     await authed('POST', '/v1/rewards/trigger', {
       email: 'noconsent@example.com',
@@ -425,6 +434,42 @@ describe('email consent in automations', () => {
 
     await flushEmailQueue();
     expect(outbox()).toHaveLength(0);
+  });
+
+  it('sends a transactional automation email without marketing consent', async () => {
+    // "You earned 100 points" is a receipt for something the person just did.
+    // Withholding it for want of a *marketing* opt-in was the bug.
+    await authed('POST', '/v1/contacts', { email: 'transactional@example.com' });
+
+    await authed('POST', '/v1/rewards/trigger', {
+      email: 'transactional@example.com',
+      ruleKey: 'review',
+      refId: 'r2',
+    });
+
+    await flushEmailQueue();
+    expect(outbox().map((message) => message.to)).toContain('transactional@example.com');
+  });
+
+  it('still sends a marketing automation email when consent was given', async () => {
+    await authed('PUT', '/v1/email/templates/points_awarded', {
+      subject: 'Points',
+      html: '<p>{{points}}</p>',
+      transactional: false,
+    });
+    await authed('POST', '/v1/contacts', {
+      email: 'consented@example.com',
+      marketingConsent: true,
+    });
+
+    await authed('POST', '/v1/rewards/trigger', {
+      email: 'consented@example.com',
+      ruleKey: 'review',
+      refId: 'r3',
+    });
+
+    await flushEmailQueue();
+    expect(outbox().map((message) => message.to)).toContain('consented@example.com');
   });
 });
 

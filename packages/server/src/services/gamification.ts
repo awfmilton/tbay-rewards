@@ -1,6 +1,6 @@
 import { db, queryOne, withTransaction, type Queryable } from '../db/pool.js';
 import { ApiError } from '../lib/errors.js';
-import { award, getBalance, spend, type Balance } from './points.js';
+import { award, getBalance, reverse, spend, type Balance } from './points.js';
 import { trigger } from './rewards.js';
 
 /**
@@ -23,15 +23,32 @@ export interface BadgeTier {
   image_url?: string;
 }
 
-export type BadgeCriteria =
+/** A single measurable quantity. */
+export type SimpleCriteria =
   | { type: 'rule_count'; rule_key: string }
   | { type: 'rule_points'; rule_key: string }
   | { type: 'lifetime_points' }
   | { type: 'order_count' }
   | { type: 'referral_count' }
   | { type: 'share_count' }
-  | { type: 'streak'; streak_key: string }
-  | { type: 'manual' };
+  | { type: 'streak'; streak_key: string };
+
+/**
+ * Several conditions at once, as myCred's badge levels do with `compare`.
+ *
+ * `and` measures 1 when every requirement is met and 0 otherwise, so a badge
+ * with a single tier at threshold 1 is the myCred behaviour exactly. `or`
+ * measures *how many* requirements are met, which the tier list can then use
+ * to award "any one of these" at 1 and "all three" at 3 — a generalisation
+ * myCred cannot express.
+ */
+export interface CompoundCriteria {
+  type: 'compound';
+  compare: 'and' | 'or';
+  requires: Array<SimpleCriteria & { threshold: number }>;
+}
+
+export type BadgeCriteria = SimpleCriteria | CompoundCriteria | { type: 'manual' };
 
 export interface Badge {
   id: string;
@@ -296,6 +313,19 @@ async function measureCriteria(
   criteria: BadgeCriteria,
 ): Promise<number> {
   switch (criteria?.type) {
+    case 'compound': {
+      const requires = criteria.requires ?? [];
+      if (requires.length === 0) return 0;
+      let met = 0;
+      for (const requirement of requires) {
+        const value = await measureCriteria(client, tenantId, contactId, requirement);
+        if (value >= requirement.threshold) met += 1;
+        // An unmet requirement settles an `and` immediately; no point costing
+        // the database another query for a badge that cannot be earned.
+        else if (criteria.compare === 'and') return 0;
+      }
+      return criteria.compare === 'and' ? (met === requires.length ? 1 : 0) : met;
+    }
     case 'rule_count': {
       const row = await queryOne<{ n: string }>(
         client,
@@ -355,6 +385,286 @@ async function measureCriteria(
     }
     default:
       return 0;
+  }
+}
+
+/**
+ * Create or update a badge.
+ *
+ * Badges shipped as seed data with no way to edit them, which meant a retailer
+ * wanting a fourth tier had to write SQL. Validation is here rather than at the
+ * route so the importers get it too.
+ */
+export async function upsertBadge(
+  tenantId: string,
+  input: {
+    key: string;
+    name?: string;
+    description?: string;
+    imageUrl?: string | null;
+    criteria?: BadgeCriteria;
+    tiers?: BadgeTier[];
+    pointsPerTier?: number;
+    manualOnly?: boolean;
+    displayOrder?: number;
+    enabled?: boolean;
+  },
+  runner: Queryable = db(),
+): Promise<Badge> {
+  const key = assertGamificationKey(input.key, 'badge key');
+
+  if (input.tiers) {
+    const levels = new Set<number>();
+    for (const tier of input.tiers) {
+      if (!Number.isInteger(tier.level) || tier.level < 1) {
+        throw ApiError.badRequest('Each tier needs an integer level of 1 or more');
+      }
+      if (levels.has(tier.level)) {
+        throw ApiError.badRequest(`Duplicate tier level ${tier.level}`);
+      }
+      levels.add(tier.level);
+      if (!Number.isFinite(tier.threshold) || tier.threshold < 0) {
+        throw ApiError.badRequest('Each tier needs a threshold of 0 or more');
+      }
+    }
+    // Ascending thresholds, or evaluateBadges awards the wrong tier: it walks
+    // the list keeping the last one passed, so an out-of-order list silently
+    // caps people at whichever level happens to sit last.
+    const sorted = [...input.tiers].sort((a, b) => a.level - b.level);
+    for (let i = 1; i < sorted.length; i += 1) {
+      if (sorted[i]!.threshold < sorted[i - 1]!.threshold) {
+        throw ApiError.badRequest('Tier thresholds must not decrease as levels rise');
+      }
+    }
+  }
+
+  if (input.criteria) assertCriteria(input.criteria);
+
+  const row = await queryOne<Badge>(
+    runner,
+    `INSERT INTO badges (
+       tenant_id, key, name, description, image_url, criteria, tiers,
+       points_per_tier, manual_only, display_order, enabled
+     ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, $9, $10, $11)
+     ON CONFLICT (tenant_id, key) DO UPDATE SET
+       name = COALESCE(EXCLUDED.name, badges.name),
+       description = COALESCE(EXCLUDED.description, badges.description),
+       image_url = EXCLUDED.image_url,
+       criteria = COALESCE(EXCLUDED.criteria, badges.criteria),
+       tiers = COALESCE(EXCLUDED.tiers, badges.tiers),
+       points_per_tier = COALESCE(EXCLUDED.points_per_tier, badges.points_per_tier),
+       manual_only = COALESCE(EXCLUDED.manual_only, badges.manual_only),
+       display_order = COALESCE(EXCLUDED.display_order, badges.display_order),
+       enabled = COALESCE(EXCLUDED.enabled, badges.enabled),
+       updated_at = now()
+     RETURNING *`,
+    [
+      tenantId,
+      key,
+      input.name ?? key,
+      input.description ?? '',
+      input.imageUrl ?? null,
+      input.criteria ? JSON.stringify(input.criteria) : null,
+      input.tiers ? JSON.stringify(input.tiers) : null,
+      input.pointsPerTier ?? null,
+      input.manualOnly ?? null,
+      input.displayOrder ?? null,
+      input.enabled ?? null,
+    ],
+  );
+  return row!;
+}
+
+export async function deleteBadge(
+  tenantId: string,
+  key: string,
+  runner: Queryable = db(),
+): Promise<boolean> {
+  const { rowCount } = await runner.query(
+    'DELETE FROM badges WHERE tenant_id = $1 AND key = $2',
+    [tenantId, key],
+  );
+  return (rowCount ?? 0) > 0;
+}
+
+/**
+ * Take a badge back.
+ *
+ * myCred calls this "divest". The points already awarded for reaching a tier
+ * are deliberately left alone: they were earned under the rules as they stood,
+ * and clawing them back turns a cosmetic correction into a balance dispute.
+ * Pass `reclaimPoints` to reverse them anyway, which an admin fixing a bug
+ * rather than a person will sometimes want.
+ */
+export async function revokeBadge(
+  tenantId: string,
+  contactId: string,
+  badgeKey: string,
+  options: { reclaimPoints?: boolean } = {},
+  runner?: Queryable,
+): Promise<{ revoked: boolean; pointsReversed: number }> {
+  const run = async (client: Queryable) => {
+    const badge = await queryOne<Badge>(
+      client,
+      'SELECT * FROM badges WHERE tenant_id = $1 AND key = $2',
+      [tenantId, badgeKey],
+    );
+    if (!badge) throw ApiError.notFound(`No badge "${badgeKey}"`);
+
+    const { rowCount } = await client.query(
+      'DELETE FROM badge_awards WHERE tenant_id = $1 AND badge_id = $2 AND contact_id = $3',
+      [tenantId, badge.id, contactId],
+    );
+    if ((rowCount ?? 0) === 0) return { revoked: false, pointsReversed: 0 };
+
+    let pointsReversed = 0;
+    if (options.reclaimPoints) {
+      const { rows } = await client.query<{ id: string; delta_points: number }>(
+        `SELECT id, delta_points FROM points_ledger
+          WHERE tenant_id = $1 AND contact_id = $2 AND ref_type = 'badge' AND ref_id = $3
+            AND status <> 'reversed'`,
+        [tenantId, contactId, badge.id],
+      );
+      for (const entry of rows) {
+        // Clamped: a member who has already spent the points should end at
+        // zero, not be pushed into a negative balance they cannot clear.
+        await reverse(tenantId, entry.id, 'Badge revoked', client, { clampToBalance: true });
+        pointsReversed += entry.delta_points;
+      }
+    }
+
+    return { revoked: true, pointsReversed };
+  };
+
+  return runner ? run(runner) : withTransaction(run);
+}
+
+/** Create or update a rank. */
+export async function upsertRank(
+  tenantId: string,
+  input: {
+    key: string;
+    name?: string;
+    description?: string;
+    imageUrl?: string | null;
+    minPoints?: number;
+    maxPoints?: number | null;
+    perks?: Record<string, unknown>;
+    manualOnly?: boolean;
+    displayOrder?: number;
+    enabled?: boolean;
+  },
+  runner: Queryable = db(),
+): Promise<Rank> {
+  const key = assertGamificationKey(input.key, 'rank key');
+  if (
+    input.maxPoints != null &&
+    input.minPoints != null &&
+    input.maxPoints <= input.minPoints
+  ) {
+    throw ApiError.badRequest('maxPoints must be above minPoints');
+  }
+
+  const row = await queryOne<Rank>(
+    runner,
+    `INSERT INTO ranks (
+       tenant_id, key, name, description, image_url, min_points, max_points,
+       perks, manual_only, display_order, enabled
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11)
+     ON CONFLICT (tenant_id, key) DO UPDATE SET
+       name = COALESCE(EXCLUDED.name, ranks.name),
+       description = COALESCE(EXCLUDED.description, ranks.description),
+       image_url = EXCLUDED.image_url,
+       min_points = COALESCE(EXCLUDED.min_points, ranks.min_points),
+       max_points = EXCLUDED.max_points,
+       perks = COALESCE(EXCLUDED.perks, ranks.perks),
+       manual_only = COALESCE(EXCLUDED.manual_only, ranks.manual_only),
+       display_order = COALESCE(EXCLUDED.display_order, ranks.display_order),
+       enabled = COALESCE(EXCLUDED.enabled, ranks.enabled)
+     RETURNING *`,
+    [
+      tenantId,
+      key,
+      input.name ?? key,
+      input.description ?? '',
+      input.imageUrl ?? null,
+      input.minPoints ?? null,
+      input.maxPoints ?? null,
+      input.perks ? JSON.stringify(input.perks) : null,
+      input.manualOnly ?? null,
+      input.displayOrder ?? null,
+      input.enabled ?? null,
+    ],
+  );
+  return row!;
+}
+
+export async function deleteRank(
+  tenantId: string,
+  key: string,
+  runner: Queryable = db(),
+): Promise<boolean> {
+  const { rowCount } = await runner.query(
+    'DELETE FROM ranks WHERE tenant_id = $1 AND key = $2',
+    [tenantId, key],
+  );
+  return (rowCount ?? 0) > 0;
+}
+
+/** Keys become part of ledger idempotency strings, so keep them boring. */
+export function assertGamificationKey(key: string, label: string): string {
+  const trimmed = String(key ?? '').trim().toLowerCase();
+  if (!/^[a-z0-9_]{2,64}$/.test(trimmed)) {
+    throw ApiError.badRequest(`${label} must be 2-64 chars of a-z, 0-9 or underscore`);
+  }
+  return trimmed;
+}
+
+const SIMPLE_CRITERIA_TYPES = [
+  'rule_count',
+  'rule_points',
+  'lifetime_points',
+  'order_count',
+  'referral_count',
+  'share_count',
+  'streak',
+];
+
+function assertCriteria(criteria: BadgeCriteria, depth = 0): void {
+  const type = criteria?.type;
+  if (type === 'manual') return;
+
+  if (type === 'compound') {
+    // One level only. Nesting buys nothing an `or` of `and`s cannot express and
+    // would let a malformed document recurse the evaluator on every award.
+    if (depth > 0) throw ApiError.badRequest('Compound criteria cannot be nested');
+    const requires = (criteria as CompoundCriteria).requires;
+    if (!Array.isArray(requires) || requires.length === 0) {
+      throw ApiError.badRequest('Compound criteria need at least one requirement');
+    }
+    if (requires.length > 10) {
+      throw ApiError.badRequest('Compound criteria are limited to 10 requirements');
+    }
+    if (!['and', 'or'].includes((criteria as CompoundCriteria).compare)) {
+      throw ApiError.badRequest('compare must be "and" or "or"');
+    }
+    for (const requirement of requires) {
+      if (!Number.isFinite(requirement.threshold)) {
+        throw ApiError.badRequest('Each requirement needs a numeric threshold');
+      }
+      assertCriteria(requirement, depth + 1);
+    }
+    return;
+  }
+
+  if (!SIMPLE_CRITERIA_TYPES.includes(String(type))) {
+    throw ApiError.badRequest(`Unknown criteria type "${String(type)}"`);
+  }
+  if ((type === 'rule_count' || type === 'rule_points') && !('rule_key' in criteria)) {
+    throw ApiError.badRequest(`Criteria "${type}" needs a rule_key`);
+  }
+  if (type === 'streak' && !('streak_key' in criteria)) {
+    throw ApiError.badRequest('Criteria "streak" needs a streak_key');
   }
 }
 
@@ -423,18 +733,162 @@ export async function listRanks(tenantId: string, runner: Queryable = db()): Pro
  * Deliberately *not* the spendable balance: redeeming points for TBAY should
  * never demote someone who has already done the work to earn the rank.
  */
+/** The rank a contact currently holds, pinned or earned. */
+export async function currentRank(
+  tenantId: string,
+  contactId: string,
+  runner: Queryable = db(),
+): Promise<Rank | null> {
+  return queryOne<Rank>(
+    runner,
+    `SELECT r.* FROM ranks r
+       JOIN points_balances b ON b.current_rank_id = r.id
+      WHERE b.tenant_id = $1 AND b.contact_id = $2`,
+    [tenantId, contactId],
+  );
+}
+
+/**
+ * Pin a contact to a rank by hand.
+ *
+ * Sets `rank_locked`, so nothing an automatic evaluation computes afterwards
+ * moves them. `unpinRank` gives them back to the engine, which re-evaluates on
+ * the spot rather than leaving them on a stale tier until their next award.
+ */
+export async function assignRankManually(
+  tenantId: string,
+  contactId: string,
+  rankKey: string,
+  runner?: Queryable,
+): Promise<Rank> {
+  const run = async (client: Queryable): Promise<Rank> => {
+    const rank = await queryOne<Rank>(
+      client,
+      'SELECT * FROM ranks WHERE tenant_id = $1 AND key = $2',
+      [tenantId, rankKey],
+    );
+    if (!rank) throw ApiError.notFound(`No rank "${rankKey}"`);
+
+    await client.query(
+      'UPDATE contacts SET rank_locked = true, updated_at = now() WHERE tenant_id = $1 AND id = $2',
+      [tenantId, contactId],
+    );
+    await client.query(
+      `UPDATE points_balances SET current_rank_id = $3, updated_at = now()
+        WHERE tenant_id = $1 AND contact_id = $2`,
+      [tenantId, contactId, rank.id],
+    );
+    const award = await queryOne<{ id: string }>(
+      client,
+      `INSERT INTO rank_awards (tenant_id, contact_id, rank_id, manual) VALUES ($1, $2, $3, true)
+       ON CONFLICT (contact_id, rank_id) DO UPDATE SET manual = true
+       RETURNING id`,
+      [tenantId, contactId, rank.id],
+    );
+    if (award) {
+      await notify(client, tenantId, contactId, 'rank_up', `You reached ${rank.name}`, rank.description, {
+        rank_key: rank.key,
+        manual: true,
+      });
+    }
+    return rank;
+  };
+
+  return runner ? run(runner) : withTransaction(run);
+}
+
+/** Release a manual pin and recompute from the contact's points. */
+export async function unpinRank(
+  tenantId: string,
+  contactId: string,
+  runner?: Queryable,
+): Promise<{ rank: Rank | null; promoted: boolean }> {
+  const run = async (client: Queryable) => {
+    await client.query(
+      'UPDATE contacts SET rank_locked = false, updated_at = now() WHERE tenant_id = $1 AND id = $2',
+      [tenantId, contactId],
+    );
+    return evaluateRank(tenantId, contactId, client);
+  };
+  return runner ? run(runner) : withTransaction(run);
+}
+
+/**
+ * Re-evaluate every contact's badges and rank.
+ *
+ * myCred's "Assign Ranks to Users" tool, which a store needs after editing
+ * thresholds or importing balances. Batched and run outside one giant
+ * transaction: a tenant with 200,000 contacts should not hold a single
+ * snapshot open for the duration, and a partial pass is safe to repeat.
+ */
+export async function reevaluateAll(
+  tenantId: string,
+  options: { badges?: boolean; ranks?: boolean; batchSize?: number } = {},
+  runner: Queryable = db(),
+): Promise<{ contacts: number; promoted: number; badgesAwarded: number }> {
+  const doBadges = options.badges ?? true;
+  const doRanks = options.ranks ?? true;
+  const batchSize = Math.min(Math.max(options.batchSize ?? 500, 1), 5000);
+
+  let after = '00000000-0000-0000-0000-000000000000';
+  let contacts = 0;
+  let promoted = 0;
+  let badgesAwarded = 0;
+
+  for (;;) {
+    const { rows } = await runner.query<{ id: string }>(
+      `SELECT contact_id AS id FROM points_balances
+        WHERE tenant_id = $1 AND contact_id > $2
+        ORDER BY contact_id
+        LIMIT $3`,
+      [tenantId, after, batchSize],
+    );
+    if (rows.length === 0) break;
+
+    for (const row of rows) {
+      contacts += 1;
+      if (doBadges) {
+        const earned = await evaluateBadges(tenantId, row.id, runner);
+        badgesAwarded += earned.length;
+      }
+      if (doRanks) {
+        const result = await evaluateRank(tenantId, row.id, runner);
+        if (result.promoted) promoted += 1;
+      }
+    }
+
+    after = rows[rows.length - 1]!.id;
+    if (rows.length < batchSize) break;
+  }
+
+  return { contacts, promoted, badgesAwarded };
+}
+
 export async function evaluateRank(
   tenantId: string,
   contactId: string,
   runner?: Queryable,
 ): Promise<{ rank: Rank | null; promoted: boolean }> {
   const run = async (client: Queryable) => {
+    // A hand-assigned rank is a decision, not a calculation. myCred's Manual
+    // Mode exists because stores pin a VIP tier that no points total explains,
+    // and an automatic re-evaluation quietly undoing that is the bug.
+    const pinned = await queryOne<{ rank_locked: boolean }>(
+      client,
+      'SELECT rank_locked FROM contacts WHERE tenant_id = $1 AND id = $2',
+      [tenantId, contactId],
+    );
+    if (pinned?.rank_locked) {
+      const held = await currentRank(tenantId, contactId, client);
+      return { rank: held, promoted: false };
+    }
+
     const balance = await getBalance(tenantId, contactId, client);
 
     const rank = await queryOne<Rank>(
       client,
       `SELECT * FROM ranks
-        WHERE tenant_id = $1 AND enabled
+        WHERE tenant_id = $1 AND enabled AND NOT manual_only
           AND min_points <= $2
           AND (max_points IS NULL OR max_points >= $2)
         ORDER BY min_points DESC
@@ -672,13 +1126,30 @@ export async function createCoupon(
     maxUses?: number | null;
     perContactLimit?: number;
     expiresAt?: string | null;
+    /** Balance band the redeemer must sit inside, mirroring myCred. */
+    minBalance?: number | null;
+    maxBalance?: number | null;
+    /** Badge and rank handed out alongside the points. */
+    grantBadgeKey?: string | null;
+    grantRankKey?: string | null;
   },
   runner: Queryable = db(),
 ): Promise<{ code: string; points: number }> {
+  if (
+    input.minBalance != null &&
+    input.maxBalance != null &&
+    input.maxBalance < input.minBalance
+  ) {
+    throw ApiError.badRequest('maxBalance cannot be below minBalance');
+  }
+
   const row = await queryOne<{ code: string; points: number }>(
     runner,
-    `INSERT INTO point_coupons (tenant_id, code, points, max_uses, per_contact_limit, expires_at)
-     VALUES ($1, $2, $3, $4, $5, $6)
+    `INSERT INTO point_coupons (
+       tenant_id, code, points, max_uses, per_contact_limit, expires_at,
+       min_balance, max_balance, grant_badge_key, grant_rank_key
+     )
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
      ON CONFLICT (tenant_id, code) DO NOTHING
      RETURNING code, points`,
     [
@@ -688,6 +1159,10 @@ export async function createCoupon(
       input.maxUses ?? null,
       input.perContactLimit ?? 1,
       input.expiresAt ?? null,
+      input.minBalance ?? null,
+      input.maxBalance ?? null,
+      input.grantBadgeKey ?? null,
+      input.grantRankKey ?? null,
     ],
   );
   if (!row) throw ApiError.conflict('That coupon code already exists');
@@ -716,14 +1191,18 @@ export async function redeemCoupon(
       per_contact_limit: number;
       expires_at: Date | null;
       enabled: boolean;
+      min_balance: number | null;
+      max_balance: number | null;
+      grant_badge_key: string | null;
+      grant_rank_key: string | null;
     }>(
       client,
       `SELECT * FROM point_coupons WHERE tenant_id = $1 AND code = $2 FOR UPDATE`,
       [tenantId, code.trim().toUpperCase()],
     );
 
-    // One message for every failure mode: a coupon endpoint must not become an
-    // oracle for guessing which codes exist.
+    // One message for every failure mode that would reveal whether a code
+    // exists: a coupon endpoint must not become an oracle for guessing them.
     const invalid = ApiError.unprocessable('That code is not valid');
     if (!coupon || !coupon.enabled) throw invalid;
     if (coupon.expires_at && new Date(coupon.expires_at).getTime() < Date.now()) throw invalid;
@@ -735,6 +1214,27 @@ export async function redeemCoupon(
       [coupon.id, contactId],
     );
     if (Number(mine?.n ?? 0) >= coupon.per_contact_limit) throw invalid;
+
+    // Balance conditions are the one place a specific message is worth the
+    // leak. The holder has typed a *correct* code, and "not valid" would send
+    // them to support over a coupon that works fine tomorrow. What it reveals
+    // — that the code exists — a successful redemption reveals anyway, and the
+    // endpoint is rate limited per tenant.
+    if (coupon.min_balance !== null || coupon.max_balance !== null) {
+      const current = await getBalance(tenantId, contactId, client);
+      if (coupon.min_balance !== null && current.balance < coupon.min_balance) {
+        throw ApiError.unprocessable(
+          `That code needs a balance of at least ${coupon.min_balance} points`,
+          { min_balance: coupon.min_balance, balance: current.balance },
+        );
+      }
+      if (coupon.max_balance !== null && current.balance > coupon.max_balance) {
+        throw ApiError.unprocessable(
+          `That code is only for balances up to ${coupon.max_balance} points`,
+          { max_balance: coupon.max_balance, balance: current.balance },
+        );
+      }
+    }
 
     await client.query('UPDATE point_coupons SET uses = uses + 1 WHERE id = $1', [coupon.id]);
     await client.query(
@@ -756,7 +1256,16 @@ export async function redeemCoupon(
       client,
     );
 
-    await evaluateRank(tenantId, contactId, client);
+    // A coupon can carry a badge or a rank, which is how myCred runs "redeem
+    // this at the event and become a Founding Member".
+    if (coupon.grant_badge_key) {
+      await awardBadgeManually(tenantId, contactId, coupon.grant_badge_key, 1, client);
+    }
+    if (coupon.grant_rank_key) {
+      await assignRankManually(tenantId, contactId, coupon.grant_rank_key, client);
+    } else {
+      await evaluateRank(tenantId, contactId, client);
+    }
 
     return { points: coupon.points, balance: result.balance };
   };

@@ -247,11 +247,15 @@ async function sendEmailAction(
   ctx: AutomationContext,
 ): Promise<void> {
   if (!ctx.contact?.email) return;
-  // Never mail someone who has not opted in.
-  if (!ctx.contact.marketing_consent) return;
 
   const template = await getTemplate(tenant.id, action.template, runner);
   if (!template) throw new Error(`Unknown email template "${action.template}"`);
+
+  // Marketing needs consent; a transactional message does not. Gating both on
+  // the same flag meant "you earned 250 points on your order" was suppressed
+  // for anyone who had not also opted into marketing — a receipt withheld for
+  // want of a marketing opt-in. See `upsertTemplate` for where the line sits.
+  if (!template.transactional && !ctx.contact.marketing_consent) return;
 
   const rendered = renderTemplate(template, {
     tenant_name: tenant.name,

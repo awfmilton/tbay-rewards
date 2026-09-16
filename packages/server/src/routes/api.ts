@@ -195,6 +195,13 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
       externalRef: z.string().max(128).nullish(),
       walletAddress: z.string().max(64).nullish(),
       isWriter: z.boolean().optional(),
+      /**
+       * Only ever set from a server-to-server call holding the tenant secret,
+       * because it records a legal claim that the person agreed to marketing.
+       * The public /v1/identify endpoint cannot reach it.
+       */
+      marketingConsent: z.boolean().optional(),
+      consentSource: z.string().max(120).optional(),
       attributes: z.record(z.unknown()).optional(),
       tags: z.array(z.string().max(64)).max(50).optional(),
     });
@@ -221,6 +228,20 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
         contact.id,
         input.isWriter,
       ]);
+    }
+
+    if (input.marketingConsent !== undefined) {
+      await db().query(
+        `UPDATE contacts
+            SET marketing_consent = $2,
+                consent_source = COALESCE($3, consent_source),
+                -- Stamp when consent is granted, keep the original date on a
+                -- re-grant, and leave the audit trail intact on withdrawal.
+                consent_at = CASE WHEN $2 THEN COALESCE(consent_at, now()) ELSE consent_at END,
+                updated_at = now()
+          WHERE id = $1`,
+        [contact.id, input.marketingConsent, input.consentSource ?? null],
+      );
     }
 
     return { contact_id: contact.id, member_id: contact.member_id };

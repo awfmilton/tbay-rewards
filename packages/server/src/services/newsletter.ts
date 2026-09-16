@@ -5,6 +5,7 @@ import { ApiError } from '../lib/errors.js';
 import { isValidEmail, upsertContact, type Contact } from './contacts.js';
 import { getTemplate, queueEmail, renderTemplate, senderFor } from './email.js';
 import { trigger } from './rewards.js';
+import { fire } from './automations.js';
 import { getBalance } from './points.js';
 import type { Tenant } from './tenants.js';
 
@@ -292,6 +293,24 @@ async function completeSubscription(
     client,
   );
 
+  // `newsletter.confirmed` was a declared trigger type with no caller, so a
+  // welcome series built on it never ran. This is the moment it describes:
+  // double opt-in complete, consent recorded.
+  await fire(
+    tenant.id,
+    'newsletter.confirmed',
+    {
+      contact,
+      data: {
+        list_id: subscription.list_id,
+        subscription_id: subscription.id,
+        points_awarded: outcome.awarded ? outcome.points : 0,
+      },
+      dedupeKey: `subscription:${subscription.id}`,
+    },
+    client,
+  );
+
   const template = await getTemplate(tenant.id, 'newsletter_welcome', client);
   if (!template || !contact.email) return;
 
@@ -331,34 +350,59 @@ export async function unsubscribeByToken(token: string, runner: Queryable = db()
     [hashToken(token)],
   );
 
-  if (rowCount && rowCount > 0) {
-    await runner.query(
-      `UPDATE contacts SET marketing_consent = false, updated_at = now()
-        WHERE id IN (
-          SELECT contact_id FROM subscriptions WHERE unsub_token_hash = $1
-        )`,
-      [hashToken(token)],
-    );
-  }
-  return (rowCount ?? 0) > 0;
+  // Unconditional: someone clicking an unsubscribe link a second time still
+  // means "stop", and the first click may have flipped the list row without
+  // the consent flag under the old code above.
+  const { rowCount: consentRows } = await runner.query(
+    `UPDATE contacts SET marketing_consent = false, updated_at = now()
+      WHERE marketing_consent AND id IN (
+        SELECT contact_id FROM subscriptions WHERE unsub_token_hash = $1
+      )`,
+    [hashToken(token)],
+  );
+  return (rowCount ?? 0) > 0 || (consentRows ?? 0) > 0;
 }
 
+/**
+ * Unsubscribe everything for an address.
+ *
+ * This clears `marketing_consent` as well as the list rows, and the order
+ * matters more than it looks: automation and cart-recovery mail gates on
+ * `contacts.marketing_consent`, not on list membership, so an unsubscribe that
+ * only touched `subscriptions` left those sequences running. The link in those
+ * very emails points here, which made "Unsubscribe" a button that did nothing
+ * for the mail the person was actually trying to stop.
+ *
+ * Consent is cleared whether or not a subscription row existed, because the
+ * request is "stop emailing me" and a contact can be mailable without ever
+ * having joined a list.
+ */
 export async function unsubscribeByEmail(
   tenantId: string,
   email: string,
   runner: Queryable = db(),
 ): Promise<boolean> {
-  const { rowCount } = await runner.query(
+  const normalised = email.trim().toLowerCase();
+
+  const { rowCount: listRows } = await runner.query(
     `UPDATE subscriptions s
         SET status = 'unsubscribed', unsubscribed_at = now()
        FROM contacts c
       WHERE s.contact_id = c.id
         AND s.tenant_id = $1
-        AND c.email_normalised = lower($2)
+        AND c.email_normalised = $2
         AND s.status <> 'unsubscribed'`,
-    [tenantId, email.trim()],
+    [tenantId, normalised],
   );
-  return (rowCount ?? 0) > 0;
+
+  const { rowCount: consentRows } = await runner.query(
+    `UPDATE contacts
+        SET marketing_consent = false, updated_at = now()
+      WHERE tenant_id = $1 AND email_normalised = $2 AND marketing_consent`,
+    [tenantId, normalised],
+  );
+
+  return (listRows ?? 0) > 0 || (consentRows ?? 0) > 0;
 }
 
 export interface ListStats {

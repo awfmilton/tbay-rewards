@@ -4,6 +4,8 @@ import { randomCode } from '../lib/crypto.js';
 import { ApiError } from '../lib/errors.js';
 import { createLink, getLinkByCode, type Link } from './links.js';
 import { trigger } from './rewards.js';
+import { fire } from './automations.js';
+import { getContact } from './contacts.js';
 import type { Tenant } from './tenants.js';
 
 /**
@@ -205,6 +207,26 @@ export async function creditShareClick(
         SET status = 'verified', verified_at = now(), points_awarded = $2
       WHERE id = $1`,
     [share.id, outcome.awarded ? outcome.points : 0],
+  );
+
+  // `share.verified` was declared and never fired, so "thank someone whose
+  // share brought a real visitor" was unbuildable. Fired even when the rule
+  // declined to award (cap, cooldown): the share was still verified, and an
+  // automation may care about that regardless of the points.
+  await fire(
+    tenantId,
+    'share.verified',
+    {
+      contact: await getContact(tenantId, share.contact_id, runner),
+      data: {
+        network: share.network,
+        target_url: share.target_url,
+        verified_clicks: share.verified_clicks,
+        points_awarded: outcome.awarded ? outcome.points : 0,
+      },
+      dedupeKey: `share:${share.id}`,
+    },
+    runner,
   );
 
   return outcome.awarded;
