@@ -32,8 +32,8 @@ export class ApiError extends Error {
     return new ApiError(409, 'conflict', message, details);
   }
 
-  static tooManyRequests(message = 'Rate limit exceeded'): ApiError {
-    return new ApiError(429, 'rate_limited', message);
+  static tooManyRequests(message = 'Rate limit exceeded', details?: unknown): ApiError {
+    return new ApiError(429, 'rate_limited', message, details);
   }
 
   static unprocessable(message: string, details?: unknown): ApiError {

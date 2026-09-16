@@ -116,7 +116,8 @@ export async function isExcluded(
         AND (
           (x.kind = 'contact'      AND x.value = me.id::text)
        OR (x.kind = 'email'        AND me.email <> '' AND x.value = me.email)
-       OR (x.kind = 'email_domain' AND me.email <> '' AND me.email LIKE '%@' || x.value)
+       OR (x.kind = 'email_domain' AND me.email <> ''
+              AND me.email LIKE '%@' || replace(replace(replace(x.value, '\\', '\\\\'), '%', '\\%'), '_', '\\_'))
        OR (x.kind = 'tag'          AND x.value = ANY (SELECT lower(t) FROM unnest(me.tags) AS t))
        OR (x.kind = 'role'         AND EXISTS (
               SELECT 1 FROM jsonb_array_elements_text(me.roles) AS r

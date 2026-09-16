@@ -1,7 +1,7 @@
 import { db, queryOne, withTransaction, type Queryable } from '../db/pool.js';
 import { ApiError } from '../lib/errors.js';
 import { defaultPointType, listPointTypes, resolvePointType } from './point-types.js';
-import { limitOf, offsetOf } from '../lib/paging.js';
+import { likeLiteral, limitOf, offsetOf } from '../lib/paging.js';
 
 /**
  * The points ledger is append-only and every entry carries an idempotency key
@@ -152,6 +152,24 @@ export async function award(
         'SELECT * FROM points_ledger WHERE tenant_id = $1 AND idempotency_key = $2',
         [tenantId, input.idempotencyKey],
       );
+
+      // The same guard `spend` has, for the same reason. An idempotency hit
+      // only means "already done" when it is the SAME operation. A key that
+      // matches but names a different contact, amount or currency is a
+      // different award wearing a borrowed key, and reporting success for it
+      // told the caller — and, through `trigger`, the storefront — that points
+      // had moved when nothing had.
+      if (
+        existing &&
+        (existing.contact_id !== input.contactId ||
+          existing.delta_points !== input.points ||
+          existing.point_type !== pointType)
+      ) {
+        throw ApiError.conflict('That idempotency key was already used for a different operation', {
+          idempotency_key: input.idempotencyKey,
+        });
+      }
+
       return {
         entry: existing!,
         balance: await getBalance(tenantId, input.contactId, client, existing?.point_type),
@@ -558,7 +576,7 @@ export async function queryLedger(
   if (query.search) {
     // ILIKE with a leading wildcard cannot use a btree, so this is bounded by
     // the other filters. Support always has at least a date range in practice.
-    params.push(`%${query.search}%`);
+    params.push(`%${likeLiteral(query.search)}%`);
     where.push(
       `(l.reason ILIKE $${params.length} OR c.email ILIKE $${params.length} OR c.name ILIKE $${params.length})`,
     );

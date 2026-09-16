@@ -911,16 +911,26 @@ export async function reevaluateAll(
 
     for (const row of rows) {
       contacts += 1;
-      if (doBadges) {
-        const earned = await evaluateBadges(tenantId, row.id, runner);
-        badgesAwarded += earned.length;
-      }
-      if (doRanks) {
-        for (const ladder of ladders) {
-          const result = await evaluateRank(tenantId, row.id, runner, ladder);
-          if (result.promoted) promoted += 1;
+
+      // One transaction per contact. `runner` here is the pool, so handing it
+      // straight to evaluateBadges made its ledger INSERT and the balance
+      // update separate autocommit statements: a crash between them would
+      // leave a ledger row with no balance change, which is the one thing the
+      // ledger is supposed to make impossible. Per contact rather than per
+      // batch so a tenant with 200,000 members still never holds one snapshot
+      // open for the whole run.
+      await withTransaction(async (client) => {
+        if (doBadges) {
+          const earned = await evaluateBadges(tenantId, row.id, client);
+          badgesAwarded += earned.length;
         }
-      }
+        if (doRanks) {
+          for (const ladder of ladders) {
+            const result = await evaluateRank(tenantId, row.id, client, ladder);
+            if (result.promoted) promoted += 1;
+          }
+        }
+      });
     }
 
     after = rows[rows.length - 1]!.id;

@@ -77,10 +77,29 @@ export interface RedeemResult {
   balance: { balance: number; pending: number };
 }
 
-function pointsPerToken(tenant: Tenant): number {
+/**
+ * The one place the conversion rate is decided.
+ *
+ * It used to be worked out three times over — `typeof x === 'number' && x > 0`
+ * on the token path, `Math.max(1, Number(...))` on the credit path and again in
+ * the quote. A stored 0, a negative or a string therefore converted at the
+ * network rate for TBAY and at 1:1 for store credit, a hundredfold difference
+ * between two routes that exist precisely so neither can be arbitraged against
+ * the other.
+ */
+export function pointsPerToken(tenant: Tenant): number {
   const override = tenant.settings?.pointsPerToken;
-  const value = typeof override === 'number' && override > 0 ? override : config().rewards.pointsPerToken;
-  return value;
+  const value = typeof override === 'number' && Number.isFinite(override) && override > 0
+    ? Math.floor(override)
+    : config().rewards.pointsPerToken;
+  return Math.max(1, value);
+}
+
+/** Bonus basis points on store credit, clamped the same way everywhere. */
+export function creditBonusBps(tenant: Tenant): number {
+  const raw = Number(tenant.settings?.creditBonusBps ?? 0);
+  if (!Number.isFinite(raw) || raw <= 0) return 0;
+  return Math.min(Math.trunc(raw), 100_000);
 }
 
 /** Points → wei, floor-divided so we never mint more than the points bought. */
@@ -144,6 +163,7 @@ export async function redeemPointsForTokens(
   const signer = cfg.chain.supplyMode === 'treasury' ? null : claimSigner();
 
   const run = async (client: Queryable): Promise<RedeemResult> => {
+    await reserveTenantBudget(client, tenant, amountWei);
     await reserveMintCapacity(client, amountWei);
     await reserveSupplyBudget(client, amountWei);
 
@@ -314,6 +334,7 @@ async function deliverFromTreasury(
       result.claim.id,
     ]);
     await releaseSupplyBudget(db(), amountWei);
+    await releaseTenantBudget(db(), tenantId, amountWei);
     if (result.claim.ledger_entry_id) {
       await reverse(tenantId, result.claim.ledger_entry_id, 'Treasury transfer failed');
     }
@@ -325,6 +346,104 @@ async function deliverFromTreasury(
           'The reward transfer could not be sent. Your points have not been spent.',
         );
   }
+}
+
+/** A retailer's own budget, falling back to the platform default. */
+function tenantBudget(tenant: Tenant, key: 'tokenMintPerWindowWei' | 'tokenSupplyCapWei'): bigint {
+  const cfg = config();
+  const override = tenant.settings?.[key];
+  const fallback =
+    key === 'tokenMintPerWindowWei' ? cfg.chain.tenantMintPerWindowWei : cfg.chain.tenantSupplyCapWei;
+
+  const raw = typeof override === 'string' && /^\d+$/.test(override) ? override : fallback;
+  try {
+    return BigInt(raw);
+  } catch {
+    return 0n;
+  }
+}
+
+/**
+ * Book this retailer's share before touching the platform's.
+ *
+ * The window and supply budgets below are keyed (chain, contract), so every
+ * tenant shares them. One retailer setting pointsPerToken to 1 and redeeming a
+ * few million self-adjusted points would therefore exhaust the hourly mint
+ * allowance for every OTHER retailer's customers — or commit the whole reward
+ * supply, or in treasury mode actually drain the wallet. A misconfigured
+ * conversion rate does the same damage as a malicious one.
+ *
+ * Reserved first, so a tenant over its own share is refused before it consumes
+ * any shared capacity. Both counters live in the redemption transaction, so a
+ * later failure gives the booking back.
+ */
+async function reserveTenantBudget(
+  client: Queryable,
+  tenant: Tenant,
+  amountWei: bigint,
+): Promise<void> {
+  const cfg = config();
+  const contract = cfg.chain.l2Contract.toLowerCase();
+
+  const windowCap = tenantBudget(tenant, 'tokenMintPerWindowWei');
+  if (windowCap > 0n) {
+    const windowMs = cfg.chain.rateLimitWindowSeconds * 1000;
+    const windowStart = new Date(Math.floor(Date.now() / windowMs) * windowMs);
+
+    const row = await queryOne<{ minted_wei: string }>(
+      client,
+      `INSERT INTO tenant_token_windows (tenant_id, chain_id, contract_address, window_start, minted_wei)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (tenant_id, chain_id, contract_address, window_start) DO UPDATE
+         SET minted_wei = tenant_token_windows.minted_wei + EXCLUDED.minted_wei
+       RETURNING minted_wei`,
+      [tenant.id, cfg.chain.chainId, contract, windowStart, amountWei.toString()],
+    );
+
+    if (BigInt(row!.minted_wei) > windowCap) {
+      throw ApiError.tooManyRequests(
+        'This store has reached its TBAY allowance for the hour; please try again shortly',
+        { cap_wei: windowCap.toString() },
+      );
+    }
+  }
+
+  const supplyCap = tenantBudget(tenant, 'tokenSupplyCapWei');
+  if (supplyCap > 0n) {
+    const row = await queryOne<{ issued_wei: string; reversed_wei: string }>(
+      client,
+      `INSERT INTO tenant_token_budgets (tenant_id, chain_id, contract_address, issued_wei)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (tenant_id, chain_id, contract_address) DO UPDATE
+         SET issued_wei = tenant_token_budgets.issued_wei + EXCLUDED.issued_wei,
+             updated_at = now()
+       RETURNING issued_wei, reversed_wei`,
+      [tenant.id, cfg.chain.chainId, contract, amountWei.toString()],
+    );
+
+    const outstanding = BigInt(row!.issued_wei) - BigInt(row!.reversed_wei);
+    if (outstanding > supplyCap) {
+      throw ApiError.unprocessable(
+        'This store has committed its full TBAY reward allocation.',
+        { cap_wei: supplyCap.toString(), committed_wei: outstanding.toString() },
+      );
+    }
+  }
+}
+
+/** Give a retailer's budget back when a voucher expires or is cancelled. */
+async function releaseTenantBudget(
+  client: Queryable,
+  tenantId: string,
+  amountWei: bigint,
+): Promise<void> {
+  const cfg = config();
+  await client.query(
+    `UPDATE tenant_token_budgets
+        SET reversed_wei = reversed_wei + $4, updated_at = now()
+      WHERE tenant_id = $1 AND chain_id = $2 AND contract_address = $3`,
+    [tenantId, cfg.chain.chainId, cfg.chain.l2Contract.toLowerCase(), amountWei.toString()],
+  );
 }
 
 /**
@@ -462,6 +581,7 @@ export async function expireStaleClaims(runner: Queryable = db()): Promise<numbe
 
   for (const claim of rows) {
     await releaseSupplyBudget(runner, BigInt(claim.token_amount_wei));
+    await releaseTenantBudget(runner, claim.tenant_id, BigInt(claim.token_amount_wei));
     if (!claim.ledger_entry_id) continue;
     const compensation = await reverse(
       claim.tenant_id,
@@ -801,19 +921,16 @@ export async function redeemPointsForCredit(
   // Store credit is money, so the same rule as the token path applies.
   const pointType = await assertConvertible(tenant.id, pointTypeKey, runner ?? db());
 
-  const pointsPerToken = Math.max(
-    1,
-    Number(tenant.settings?.pointsPerToken ?? cfg.rewards.pointsPerToken),
-  );
-  if (points % pointsPerToken !== 0) {
+  const rate = pointsPerToken(tenant);
+  if (points % rate !== 0) {
     throw ApiError.unprocessable(
-      `Points convert in blocks of ${pointsPerToken}`,
-      { points_per_token: pointsPerToken },
+      `Points convert in blocks of ${rate}`,
+      { points_per_token: rate },
     );
   }
 
-  const bonusBps = Math.max(0, Number(tenant.settings?.creditBonusBps ?? 0));
-  const tokens = points / pointsPerToken;
+  const bonusBps = creditBonusBps(tenant);
+  const tokens = points / rate;
   const amountCents = Math.floor(
     tokens * cfg.rewards.creditCentsPerToken * (1 + bonusBps / 10_000),
   );
@@ -886,19 +1003,16 @@ export function creditQuote(
   points: number,
 ): { points: number; amount_cents: number; currency: string; points_per_token: number } {
   const cfg = config();
-  const pointsPerToken = Math.max(
-    1,
-    Number(tenant.settings?.pointsPerToken ?? cfg.rewards.pointsPerToken),
-  );
-  const bonusBps = Math.max(0, Number(tenant.settings?.creditBonusBps ?? 0));
-  const usable = Math.floor(Math.max(0, points) / pointsPerToken) * pointsPerToken;
-  const tokens = usable / pointsPerToken;
+  const rate = pointsPerToken(tenant);
+  const bonusBps = creditBonusBps(tenant);
+  const usable = Math.floor(Math.max(0, points) / rate) * rate;
+  const tokens = usable / rate;
 
   return {
     points: usable,
     amount_cents: Math.floor(tokens * cfg.rewards.creditCentsPerToken * (1 + bonusBps / 10_000)),
     currency: tenant.currency,
-    points_per_token: pointsPerToken,
+    points_per_token: rate,
   };
 }
 

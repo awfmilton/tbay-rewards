@@ -409,3 +409,104 @@ describe('reward supply budget', () => {
     expect(status.remaining_wei).toBeNull();
   });
 });
+
+describe('a retailer cannot spend the platform’s allowance (HIGH)', () => {
+  /**
+   * The hourly mint window and the supply budget are keyed (chain, contract),
+   * so every tenant shares them. One store setting pointsPerToken to 1 and
+   * redeeming a few million self-adjusted points would lock every OTHER
+   * store's customers out with "the TBAY hourly mint allowance is exhausted".
+   * A misconfigured conversion rate does that as readily as a malicious one.
+   */
+  it('stops at its own hourly budget, leaving the shared window intact', async () => {
+    // 3 TBAY an hour per retailer; the platform default stays where it is.
+    process.env.TBAY_TENANT_MINT_PER_WINDOW_WEI = (3n * 10n ** 18n).toString();
+    resetConfig();
+
+    try {
+      const greedy = await makeTenant();
+      const neighbour = await makeTenant();
+
+      const seed = async (t: TestTenant, email: string) => {
+        const contact = await upsertContact(t.id, { email });
+        await award(t.id, {
+          contactId: contact.id,
+          points: 1_000_000,
+          reason: 'Grant',
+          idempotencyKey: `seed-${t.id}`,
+        });
+        return contact;
+      };
+
+      const hog = await seed(greedy, 'hog@example.com');
+      const bystander = await seed(neighbour, 'bystander@example.com');
+
+      const greedyRow = (await getTenantById(greedy.id))!;
+      const neighbourRow = (await getTenantById(neighbour.id))!;
+
+      // 100 points = 1 TBAY. Three redemptions fit the 3 TBAY budget.
+      for (let i = 0; i < 3; i += 1) {
+        await redeemPointsForTokens(greedyRow, {
+          contact: hog,
+          points: 100,
+          walletAddress: HOLDER,
+        });
+        await new Promise((resolve) => setTimeout(resolve, 1100));
+      }
+
+      await expect(
+        redeemPointsForTokens(greedyRow, { contact: hog, points: 100, walletAddress: HOLDER }),
+      ).rejects.toMatchObject({ statusCode: 429 });
+
+      // The neighbour is entirely unaffected — that is the whole point.
+      const ok = await redeemPointsForTokens(neighbourRow, {
+        contact: bystander,
+        points: 100,
+        walletAddress: HOLDER,
+      });
+      expect(ok.claim.status).toBe('signed');
+    } finally {
+      delete process.env.TBAY_TENANT_MINT_PER_WINDOW_WEI;
+      resetConfig();
+    }
+  });
+
+  it('gives the refused reservation back rather than counting it', async () => {
+    process.env.TBAY_TENANT_MINT_PER_WINDOW_WEI = (2n * 10n ** 18n).toString();
+    resetConfig();
+
+    try {
+      const contact = await upsertContact(tenant.id, { email: 'refund@example.com' });
+      await award(tenant.id, {
+        contactId: contact.id,
+        points: 100_000,
+        reason: 'Grant',
+        idempotencyKey: 'refund-seed',
+      });
+      const tenantRow = (await getTenantById(tenant.id))!;
+
+      // 3 TBAY against a 2 TBAY budget: refused, and the booking must roll
+      // back with the transaction or the next, smaller redemption would find
+      // the budget already spent by an attempt that never issued anything.
+      await expect(
+        redeemPointsForTokens(tenantRow, { contact, points: 300, walletAddress: HOLDER }),
+      ).rejects.toMatchObject({ statusCode: 429 });
+
+      const booked = await db().query(
+        'SELECT minted_wei FROM tenant_token_windows WHERE tenant_id = $1',
+        [tenant.id],
+      );
+      expect(booked.rows.map((row) => row.minted_wei)).toEqual([]);
+
+      const ok = await redeemPointsForTokens(tenantRow, {
+        contact,
+        points: 100,
+        walletAddress: HOLDER,
+      });
+      expect(ok.claim.status).toBe('signed');
+    } finally {
+      delete process.env.TBAY_TENANT_MINT_PER_WINDOW_WEI;
+      resetConfig();
+    }
+  });
+});

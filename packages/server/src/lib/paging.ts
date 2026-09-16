@@ -1,3 +1,5 @@
+import { ApiError } from './errors.js';
+
 /**
  * Clamping numbers that end up inside a SQL string.
  *
@@ -41,4 +43,33 @@ export function limitOf(value: unknown, fallback: number, max: number): number {
 /** An offset: never negative, and bounded so a huge page cannot be requested. */
 export function offsetOf(value: unknown, max = 1_000_000): number {
   return clampInt(value, 0, 0, max);
+}
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * A uuid from the path or query string, or a 400.
+ *
+ * Postgres raises "invalid input syntax for type uuid" on anything else, which
+ * surfaced as a 500 — an internal error for what is plainly a bad request, and
+ * one that hides the real cause behind the production error handler.
+ */
+export function uuidOf(value: string | undefined | null, field: string): string | null {
+  if (value === undefined || value === null || value === '') return null;
+  if (!UUID.test(value)) {
+    throw ApiError.badRequest(`"${field}" must be a uuid`);
+  }
+  return value;
+}
+
+/**
+ * Escape LIKE/ILIKE metacharacters so a search term matches itself.
+ *
+ * `%` and `_` are wildcards in a pattern, so searching the ledger for the
+ * reason "10_off" silently matched "10xoff" too, and an `email_domain`
+ * exclusion for "a_b.com" excluded "axb.com". A person typing into a search
+ * box means the characters they typed.
+ */
+export function likeLiteral(value: string): string {
+  return value.replace(/[\\%_]/g, (char) => `\\${char}`);
 }

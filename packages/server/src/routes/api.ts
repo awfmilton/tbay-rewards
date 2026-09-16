@@ -19,6 +19,7 @@ import { getTenantById, updateTenantSettings } from '../services/tenants.js';
 import { assertAddress, weiToTokenString } from '../lib/chain.js';
 import { recordOrder, refundOrder, commissionSummary, listCommissions, markCommissionsPaid } from '../services/commissions.js';
 import { createLink, linkReport, listLinks } from '../services/links.js';
+import { uuidOf } from '../lib/paging.js';
 import { award, getBalance, getBalances, listLedger, spend } from '../services/points.js';
 import { leaderboard, listRules, trigger, upsertRule, assertRuleKey } from '../services/rewards.js';
 import { createShare, listShares } from '../services/shares.js';
@@ -625,7 +626,7 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
     const board = await leaderboard(tenant.id, {
       window: window ?? 'all',
       limit: request.query.limit ? Number(request.query.limit) : undefined,
-      contactId: request.query.contactId ?? null,
+      contactId: uuidOf(request.query.contactId, 'contactId'),
       pointType: request.query.pointType ?? null,
     });
     // `leaders` kept for the existing storefront; the rest are new.

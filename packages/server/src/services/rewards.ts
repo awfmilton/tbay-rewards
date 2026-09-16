@@ -332,16 +332,39 @@ async function tenantTimezone(tenantId: string, runner: Queryable): Promise<stri
     'SELECT timezone FROM tenants WHERE id = $1',
     [tenantId],
   );
-  // Postgres rejects an unknown zone name at query time, which would turn a
-  // typo in a settings field into a failed award. Verify once, here.
-  let zone = row?.timezone?.trim() || 'UTC';
-  try {
-    await runner.query('SELECT now() AT TIME ZONE $1', [zone]);
-  } catch {
-    zone = 'UTC';
-  }
+  const candidate = row?.timezone?.trim() || 'UTC';
+  const zone = (await isKnownTimezone(candidate, runner)) ? candidate : 'UTC';
   timezoneCache.set(tenantId, { zone, at: Date.now() });
   return zone;
+}
+
+/** `+05:30`, `-08`, `+0530` — accepted by AT TIME ZONE, absent from the catalogues. */
+const NUMERIC_OFFSET = /^[+-]\d{1,2}(:?\d{2})?$/;
+
+/**
+ * Is this a zone `AT TIME ZONE` will accept?
+ *
+ * Asked by looking it up, never by trying it. `SELECT now() AT TIME ZONE $1`
+ * raises on an unknown name, and inside a transaction that raise aborts the
+ * whole thing — so the catch that used to sit around it could set 'UTC' but
+ * could not undo the abort. Every statement after it failed with "current
+ * transaction is aborted", which meant a single typo'd timezone on a tenant
+ * rolled back that customer's order, its commissions and its cart conversion,
+ * once a minute forever.
+ *
+ * The catalogue lookup cannot raise, and covers every IANA name and
+ * abbreviation. Numeric offsets are the one thing it misses, so they are
+ * matched by shape.
+ */
+export async function isKnownTimezone(zone: string, runner: Queryable): Promise<boolean> {
+  if (NUMERIC_OFFSET.test(zone)) return true;
+  const row = await queryOne<{ ok: boolean }>(
+    runner,
+    `SELECT EXISTS (SELECT 1 FROM pg_timezone_names  WHERE name   = $1)
+         OR EXISTS (SELECT 1 FROM pg_timezone_abbrevs WHERE abbrev = $1) AS ok`,
+    [zone],
+  );
+  return row?.ok === true;
 }
 
 /** Exposed so a tenant's timezone change takes effect without a restart. */
@@ -600,7 +623,8 @@ export async function leaderboard(
            (x.kind = 'contact'      AND x.value = c.id::text)
         OR (x.kind = 'email'        AND x.value = lower(coalesce(c.email_normalised, c.email, '')))
         OR (x.kind = 'email_domain' AND coalesce(c.email_normalised, c.email, '') <> ''
-              AND lower(coalesce(c.email_normalised, c.email, '')) LIKE '%@' || x.value)
+              AND lower(coalesce(c.email_normalised, c.email, '')) LIKE '%@'
+                  || replace(replace(replace(x.value, '\\', '\\\\'), '%', '\\%'), '_', '\\_'))
         OR (x.kind = 'tag'          AND x.value = ANY (SELECT lower(t) FROM unnest(c.tags) AS t))
         OR (x.kind = 'role'         AND EXISTS (
                SELECT 1 FROM jsonb_array_elements_text(contact_roles(c.attributes)) AS r

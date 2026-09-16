@@ -4,6 +4,7 @@ import { requireSecretKey, tenantOf } from '../lib/auth.js';
 import { ApiError } from '../lib/errors.js';
 import { parse } from './collect.js';
 import { contactHandleSchema, pointTypeField } from './schemas.js';
+import { uuidOf } from '../lib/paging.js';
 import {
   deletePointType,
   listPointTypes,
@@ -155,7 +156,7 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
 
   app.delete<{ Params: { id: string } }>('/v1/rewards/exclusions/:id', async (request) => {
     const tenant = tenantOf(request);
-    return { removed: await removeExclusion(tenant.id, request.params.id) };
+    return { removed: await removeExclusion(tenant.id, uuidOf(request.params.id, 'id')!) };
   });
 
   // ── Per-product point overrides ────────────────────────────────────────────
@@ -182,7 +183,7 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
 
   app.delete<{ Params: { id: string } }>('/v1/rewards/product-rules/:id', async (request) => {
     const tenant = tenantOf(request);
-    return { removed: await deleteProductRule(tenant.id, request.params.id) };
+    return { removed: await deleteProductRule(tenant.id, uuidOf(request.params.id, 'id')!) };
   });
 
   // ── Contact timeline ───────────────────────────────────────────────────────
@@ -710,7 +711,7 @@ function parseLedgerQuery(
   );
 
   return {
-    contactId: query.contactId ?? null,
+    contactId: uuidOf(query.contactId, 'contactId'),
     ruleKey: query.ruleKey ?? null,
     pointType: query.pointType ?? null,
     refType: query.refType ?? null,
