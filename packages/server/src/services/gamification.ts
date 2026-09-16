@@ -1,7 +1,8 @@
 import { db, queryOne, withTransaction, type Queryable } from '../db/pool.js';
 import { ApiError } from '../lib/errors.js';
 import { award, getBalance, reverse, spend, type Balance } from './points.js';
-import { trigger } from './rewards.js';
+import { tenantTimezone, trigger } from './rewards.js';
+import { randomToken } from '../lib/crypto.js';
 import {
   assertTransferable,
   defaultPointType,
@@ -1209,6 +1210,7 @@ export async function transferPoints(
     );
 
     const limits = await transferLimitsFor(tenantId, client);
+    const zone = await tenantTimezone(tenantId, client);
 
     if (input.points < limits.minimum) {
       throw ApiError.unprocessable(
@@ -1220,12 +1222,15 @@ export async function transferPoints(
     for (const window of TRANSFER_WINDOWS) {
       const cap = limits[window.key];
       if (cap === null) continue;
+      // The retailer's day, not the database's — same reasoning as the reward
+      // caps. A limit that rolls over at 20:00 local because the server runs
+      // UTC is a support ticket every evening.
       const sent = await queryOne<{ total: string }>(
         client,
         `SELECT COALESCE(SUM(points), 0) AS total FROM point_transfers
           WHERE tenant_id = $1 AND from_contact_id = $2 AND point_type = $4
-            AND created_at >= date_trunc($3, now())`,
-        [tenantId, input.fromContactId, window.unit, type.key],
+            AND created_at >= (date_trunc($3, now() AT TIME ZONE $5) AT TIME ZONE $5)`,
+        [tenantId, input.fromContactId, window.unit, type.key, zone],
       );
       if (Number(sent?.total ?? 0) + input.points > cap) {
         throw ApiError.unprocessable(
@@ -1235,7 +1240,12 @@ export async function transferPoints(
       }
     }
 
-    const reference = `${input.fromContactId}:${input.toContactId}:${Date.now()}`;
+    // Random, not a millisecond clock. Two identical transfers in the same
+    // millisecond shared a reference: the ledger legs collapsed on their
+    // idempotency keys, but the point_transfers INSERT below has no such key,
+    // so a second row was written and counted against the sending limits for
+    // points that only moved once.
+    const reference = `${input.fromContactId}:${input.toContactId}:${randomToken(8)}`;
 
     const debit = await spend(
       tenantId,
@@ -1266,6 +1276,12 @@ export async function transferPoints(
       },
       client,
     );
+
+    // A replayed leg means no points moved this time round. Recording a second
+    // transfer would double-count it against the sender's limits.
+    if (!debit.created || !credit.created) {
+      throw ApiError.conflict('That transfer has already been recorded');
+    }
 
     const transfer = await queryOne<{ id: string }>(
       client,

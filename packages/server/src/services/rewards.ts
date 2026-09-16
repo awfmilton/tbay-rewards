@@ -323,7 +323,7 @@ export type TriggerOutcome =
 const timezoneCache = new Map<string, { zone: string; at: number }>();
 const TIMEZONE_TTL_MS = 60_000;
 
-async function tenantTimezone(tenantId: string, runner: Queryable): Promise<string> {
+export async function tenantTimezone(tenantId: string, runner: Queryable): Promise<string> {
   const hit = timezoneCache.get(tenantId);
   if (hit && Date.now() - hit.at < TIMEZONE_TTL_MS) return hit.zone;
 
