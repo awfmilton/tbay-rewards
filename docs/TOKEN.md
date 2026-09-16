@@ -49,8 +49,13 @@ power over.
 | Burn function | **None** | `crosschainBurn()`, `ERC20Burnable` |
 | Contract | plain `ERC20 + Ownable` | `ERC20 + Burnable + Pausable + Permit + AccessControl + IERC7802` |
 
-The decimal gap is deliberate and the bridge scales by `10^9` in both
+The decimal gap is deliberate and the deployed bridge scales by `10^9` in both
 directions. `TBAYL2.getL1Info()` returns `(l1Address, 9, 18)`, which matches.
+
+**`10^9` is a decimal conversion, not an exchange rate.** Nine decimals to
+eighteen is exactly `10^9`, so as deployed the bridge is a strict **1 L1 TBAY
+⇄ 1 L2 TBAY**. See *The exchange rate* below for what changes if the L2 supply
+is meant to be larger than the L1 supply.
 
 ### The constraint that shapes everything
 
@@ -66,6 +71,90 @@ first holders to bridge would be fine; the last would find nothing there.
 
 ---
 
+## The exchange rate
+
+`TBAY_BRIDGE_L2_PER_L1` is how many whole L2 TBAY one whole L1 TBAY is worth.
+
+```
+TBAY_BRIDGE_L2_PER_L1=1        # default; matches the contract as deployed
+TBAY_BRIDGE_L2_PER_L1=10000    # 10,000 L2 TBAY = 1 L1 TBAY
+```
+
+The number falls out of the two supplies. If every L2 token has to be
+redeemable, then:
+
+```
+rate  =  total L2 supply  ÷  L1 tokens held for bridging
+```
+
+So a 10,000,000,000 L2 supply against the whole 1,000,000 L1 supply gives:
+
+```
+10,000,000,000  ÷  1,000,000  =  10,000
+```
+
+**Yes — at that rate 10,000 L2 TBAY buys 1 L1 TBAY**, and the full 10 billion
+L2 is exactly backed by the full 1 million L1. Burn 10,000 on zkSync, receive 1
+on Ethereum.
+
+The rate is a *policy* number, not a law of the contracts. A smaller L2 supply,
+or a decision to back only part of it, moves it. What cannot move is the
+inequality the platform enforces:
+
+```
+total L2 supply  ≤  rate  ×  L1 tokens held for bridging
+```
+
+`TBAY_L1_RESERVE_TOKENS` is the right-hand side — how many of the 1,000,000 L1
+TBAY are actually set aside for bridging. Left at `0` the platform assumes the
+full supply. At boot, preflight checks the inequality against
+`TBAY_REWARD_SUPPLY_CAP_WEI` and refuses to pretend if it does not hold
+(`reserve_exceeds_l1_supply`, `cap_exceeds_backing`).
+
+### The deployed contract does not implement a rate
+
+This matters before anyone sets `10000` in production:
+
+```solidity
+// TBAY-L2-1-0-1.sol — as deployed
+uint256 private constant MAX_SUPPLY = 100_000_000 * 1e18;   // 100M ceiling
+function bridgeMint(...)     { uint256 l2Amount = l1Amount * 10**9; }
+function crosschainBurn(...) { uint256 l1Amount = _amount / 10**9; }
+```
+
+`10**9` is the decimal conversion and nothing else, so the chain performs a 1:1
+swap no matter what the platform is configured to quote. And `MAX_SUPPLY` caps
+L2 at 100,000,000 — **10 billion cannot be minted at all**.
+
+Two constants make the 10,000:1 design real, and both need a redeploy:
+
+```solidity
+uint256 private constant MAX_SUPPLY = 10_000_000_000 * 1e18;   // was 100_000_000
+uint256 private constant L2_PER_L1  = 10_000;                  // new
+
+// bridgeMint:      l2Amount = l1Amount * 10**9 * L2_PER_L1;
+// crosschainBurn:  l1Amount = _amount / (10**9 * L2_PER_L1);
+```
+
+Until that ships, setting `TBAY_BRIDGE_L2_PER_L1` above `1` logs a
+`bridge_rate_not_one` warning at boot: the platform would be quoting a
+conversion the chain will not perform, and every withdrawal would release the
+wrong amount of L1.
+
+### What the rate does to precision
+
+One L1 base unit is the smallest thing that can cross. In L2 wei that is
+`rate × 10^9`:
+
+| Rate | Minimum bridgeable L2 | In L1 |
+|---|---|---|
+| 1 | `1e9` wei = 0.000000001 TBAY | 0.000000001 TBAY |
+| 10,000 | `1e13` wei = 0.00001 TBAY | 0.000000001 TBAY |
+
+Anything below that floor is dust — see below.
+
+---
+
 ## The supply budget
 
 `TBAY_REWARD_SUPPLY_CAP_WEI` is the lifetime ceiling, in wei, on reward tokens
@@ -77,14 +166,19 @@ TBAY_REWARD_SUPPLY_CAP_WEI=1000000000000000000000000   # the full 1,000,000
 TBAY_REWARD_SUPPLY_CAP_WEI=0                           # unlimited (testnet only)
 ```
 
-Set it to the L1 reserve you actually hold for bridging, minus anything already
-circulating on L2 that could bridge (the L2 constructor minted 1,000,000 to the
-deployer wallet on day one — those count).
+Set it to what the L1 reserve you actually hold can back at the configured
+rate, minus anything already circulating on L2 that could bridge (the L2
+constructor minted 1,000,000 to the deployer wallet on day one — those count).
 
 ```
-reward budget  =  L1 tokens held for bridging
+reward budget  =  rate × L1 tokens held for bridging
                 − L2 tokens already circulating that could bridge
 ```
+
+`TBAY_L1_RESERVE_TOKENS` tells preflight the first term so it can check the
+arithmetic for you at boot instead of leaving it to a spreadsheet. At the
+default rate of 1 the two numbers are the same; at 10,000:1 a 1,000,000 reserve
+backs 10,000,000,000 L2.
 
 ### The arithmetic today
 
@@ -118,8 +212,15 @@ Three ways out, in rough order of preference:
    and visibly budgeted on-chain. No contract change, but the platform needs a
    funded hot wallet.
 3. **Split the L1 million explicitly.** Decide how much is bridge reserve (say
-   600,000) and how much is treasury, set the cap to the reserve, and accept
-   that the L2 constructor mint is not fully bridgeable.
+   600,000) and how much is treasury, set `TBAY_L1_RESERVE_TOKENS` to the
+   reserve, set the cap to what it backs, and accept that the L2 constructor
+   mint is not fully bridgeable.
+
+At a 10,000:1 rate the problem mostly evaporates: the constructor's 1,000,000
+L2 is a claim on just **100 L1 TBAY**, or 0.01% of the reserve, so option 1
+stops being urgent. The discipline survives the rate change though — total L2
+supply divided by the rate still has to fit inside the L1 held for bridging,
+and that is the inequality preflight enforces.
 
 The platform refuses to pretend either way: booting on a mainnet chain with no
 cap set logs an `uncapped_on_mainnet` error and `/health` reports
@@ -273,15 +374,43 @@ cannot redirect an existing withdrawal to a new recipient.
 Releasing on L1 is an assertion the platform cannot verify from L2, so it sits
 behind a separate `BRIDGE_OPERATOR_TOKEN` rather than any retailer's API secret.
 
-### Dust
+### Dust, and the wrapper that recovers it
 
-L1 has 9 decimals, L2 has 18. Anything below `1e9` wei — a billionth of a
-token — has no L1 representation and cannot cross. `crosschainBurn` sweeps that
-remainder to the treasury wallet rather than silently rounding it into the
-bridged amount.
+L1 has 9 decimals, L2 has 18, so the smallest thing that can cross is one L1
+base unit — `rate × 10^9` wei on L2. A burn of any other amount carries a
+remainder with no L1 representation.
+
+`crosschainBurn` is the wrapper that handles it, in one transaction:
+
+```solidity
+uint256 l1Amount   = _amount / 10**9;        // whole units that can cross
+uint256 burnAmount = l1Amount * 10**9;
+uint256 dust       = _amount - burnAmount;
+
+_burn(_from, burnAmount);                     // leaves L2 supply, releases L1
+if (dust > 0) _transfer(_from, TREASURY_WALLET, dust);
+```
+
+So the remainder is **not** burned and **not** stranded — it moves back into the
+company's L2 supply at `TREASURY_WALLET`
+(`0x33ea3C510337dC8F7938e2aB2b4678F2bc9ccdEE`), where it can be reissued as
+rewards. Total L2 supply falls by exactly the bridged amount and not a wei more,
+which is what keeps the backing inequality above exact.
+
+**The client therefore submits the full requested amount, not the rounded-down
+one.** Passing `bridgeableWei` would skip the sweep and leave an unspendable
+crumb in the holder's wallet; passing `amountWei` lets the contract do the job it
+was written to do.
+
+Verification mirrors this: `recordWithdrawal` looks for the burn leg (a Transfer
+to the zero address from the declared wallet) and separately sums the non-burn
+legs from the same wallet as the dust, so the recorded `dust_wei` is what the
+chain actually moved rather than what the quote predicted.
 
 The quote endpoint returns the exact dust amount and a plain-language note, and
-the storefront shows both **before** the customer signs anything.
+the storefront shows both **before** the customer signs anything — rendered at
+full 18-decimal precision, since dust is by definition smaller than the bridge
+unit and any shorter display would read as a misleading `0`.
 
 ---
 
@@ -311,7 +440,11 @@ The L2 contract exposes `contractURI()` for thirdweb dashboards, and
 ## Launch checklist
 
 - [ ] Confirm `0xC17e…9116` is verified on Etherscan and `decimals()` really is 9
-- [ ] Decide the L1 bridge reserve and set `TBAY_REWARD_SUPPLY_CAP_WEI`
+- [ ] Decide the L1 bridge reserve and set `TBAY_L1_RESERVE_TOKENS`
+- [ ] Decide the L2:L1 rate, set `TBAY_BRIDGE_L2_PER_L1`, and make sure the
+      deployed L2 contract applies the *same* rate in `bridgeMint` and
+      `crosschainBurn` — it does not by default
+- [ ] Set `TBAY_REWARD_SUPPLY_CAP_WEI` to what the reserve backs at that rate
 - [ ] Move the reserve to a wallet the bridge operator controls
 - [ ] Switch `TBAY_CHAIN_ID` to 324 and deploy the L2 contract to Era mainnet
 - [ ] Grant `CLAIMER_ROLE` to the platform signing key; grant nothing else

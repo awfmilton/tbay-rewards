@@ -1,5 +1,5 @@
 import { config } from '../config.js';
-import { chainInfo } from './chains.js';
+import { chainInfo, maxBackedL2Wei } from './chains.js';
 
 /**
  * Configuration checks that run at boot.
@@ -47,16 +47,53 @@ export function preflight(): PreflightFinding[] {
     });
   }
 
-  // Even the full L1 supply cannot back more than 1,000,000 bridged tokens.
-  const l1CapacityWei = L1_TOTAL_SUPPLY_TOKENS * 10n ** 18n;
-  if (cap > l1CapacityWei) {
+  const rate = BigInt(Math.max(1, Math.trunc(cfg.chain.bridgeL2PerL1)));
+
+  // The deployed TBAYL2 scales by exactly 10^9, i.e. 1 L1 token per 1 L2 token.
+  // Configuring a different rate here without changing the contract would have
+  // the platform quote conversions the chain will not perform.
+  if (rate !== 1n) {
+    findings.push({
+      level: 'warning',
+      code: 'bridge_rate_not_one',
+      message:
+        `TBAY_BRIDGE_L2_PER_L1 is ${rate}, but the deployed TBAYL2 scales by ` +
+        '10^9 exactly, which is a strict 1:1 token bridge. Only set this above 1 ' +
+        'against an L2 contract whose bridgeMint/crosschainBurn apply the same ' +
+        'rate, or withdrawals will release the wrong amount of L1.',
+    });
+  }
+
+  // Whatever the rate, L2 supply has to stay inside what the L1 reserve backs.
+  const reserve =
+    cfg.chain.l1ReserveTokens > 0
+      ? BigInt(Math.trunc(cfg.chain.l1ReserveTokens))
+      : L1_TOTAL_SUPPLY_TOKENS;
+
+  if (reserve > L1_TOTAL_SUPPLY_TOKENS) {
     findings.push({
       level: 'error',
-      code: 'cap_exceeds_l1_supply',
+      code: 'reserve_exceeds_l1_supply',
       message:
-        `TBAY_REWARD_SUPPLY_CAP_WEI allows ${cap / 10n ** 18n} TBAY, but only ` +
-        `${L1_TOTAL_SUPPLY_TOKENS} L1 TBAY will ever exist. Anything above that ` +
-        'cannot be bridged back to Ethereum, whatever reserve you hold.',
+        `TBAY_L1_RESERVE_TOKENS is ${reserve}, but only ${L1_TOTAL_SUPPLY_TOKENS} ` +
+        'L1 TBAY will ever exist and none can be minted.',
+    });
+  }
+
+  const backedWei = maxBackedL2Wei(
+    reserve > L1_TOTAL_SUPPLY_TOKENS ? L1_TOTAL_SUPPLY_TOKENS : reserve,
+    rate,
+  );
+
+  if (cap > backedWei) {
+    findings.push({
+      level: 'error',
+      code: 'cap_exceeds_backing',
+      message:
+        `TBAY_REWARD_SUPPLY_CAP_WEI allows ${cap / 10n ** 18n} L2 TBAY, but a ` +
+        `reserve of ${reserve} L1 TBAY at ${rate}:1 backs only ` +
+        `${backedWei / 10n ** 18n}. Anything above that cannot be bridged back ` +
+        'to Ethereum, whatever else is true.',
     });
   }
 

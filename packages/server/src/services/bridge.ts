@@ -41,6 +41,10 @@ export interface BridgeWithdrawal {
 export const BURN_ADDRESS = '0x0000000000000000000000000000000000000000';
 
 /** What the browser needs to call crosschainBurn itself. */
+export function bridgeRate(): bigint {
+  return BigInt(Math.max(1, Math.trunc(config().chain.bridgeL2PerL1)));
+}
+
 export function withdrawalInstructions(amountWei: bigint): {
   chainId: number;
   contractAddress: string;
@@ -50,15 +54,18 @@ export function withdrawalInstructions(amountWei: bigint): {
   bridgeableTokens: string;
   l1Amount: string;
   dustWei: string;
+  l2PerL1: string;
   dustNote: string | null;
 } {
   const cfg = config();
-  const { l1Amount, burnable, dust } = splitBridgeAmount(amountWei);
+  const rate = bridgeRate();
+  const { l1Amount, burnable, dust } = splitBridgeAmount(amountWei, rate);
 
   if (l1Amount <= 0n) {
+    // The smallest bridgeable amount is one L1 base unit's worth of L2.
     throw ApiError.unprocessable(
-      'That amount is below one whole L1 unit, so nothing would cross the bridge',
-      { minimum_wei: (10n ** 9n).toString() },
+      'That amount is below the smallest amount the bridge can carry',
+      { minimum_wei: (rate * 10n ** 9n).toString() },
     );
   }
 
@@ -71,11 +78,19 @@ export function withdrawalInstructions(amountWei: bigint): {
     bridgeableTokens: weiToTokenString(burnable),
     l1Amount: l1Amount.toString(),
     dustWei: dust.toString(),
-    // The contract sweeps any sub-L1-unit remainder to the treasury rather than
-    // silently rounding it into the bridged amount. Say so before they sign.
+    l2PerL1: rate.toString(),
+    // `crosschainBurn` burns the whole L1 units and sweeps the sub-unit
+    // remainder to the treasury wallet, returning it to the company's L2
+    // supply rather than leaving an unbridgeable crumb in the holder's wallet.
+    // That happens inside the contract, so the only honest thing to do is say
+    // it before they sign. Full precision on the amount: the remainder is by
+    // definition smaller than one bridge unit, so a 6-decimal display would
+    // print it as a misleading "0".
     dustNote:
       dust > 0n
-        ? `${weiToTokenString(dust)} TBAY cannot cross (below one L1 unit) and will be sent to the treasury wallet by the contract.`
+        ? `${weiToTokenString(dust, 18)} TBAY is smaller than the bridge can carry. ` +
+          'The contract returns it to the treasury wallet as part of the same ' +
+          'transaction, so nothing is left stranded.'
         : null,
   };
 }
@@ -134,9 +149,10 @@ export async function recordWithdrawal(
     );
   }
 
-  // The burn amount is already a whole multiple of 10^9 (the contract enforces
-  // it), but recompute rather than trust: the dust leg is a separate Transfer.
-  const { l1Amount } = splitBridgeAmount(burn.value);
+  // Recompute rather than trust the caller: the burn is already a whole
+  // multiple of the bridge unit (the contract enforces it), and the dust leg is
+  // a separate Transfer.
+  const { l1Amount } = splitBridgeAmount(burn.value, bridgeRate());
   if (l1Amount <= 0n) {
     throw ApiError.unprocessable('That burn is below one whole L1 unit');
   }
