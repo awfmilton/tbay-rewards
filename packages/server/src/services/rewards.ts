@@ -1,5 +1,6 @@
 import { db, queryOne, withTransaction, type Queryable } from '../db/pool.js';
 import { ApiError } from '../lib/errors.js';
+import { limitOf } from '../lib/paging.js';
 import { award, getBalance, type AwardResult, type Balance } from './points.js';
 import { isExcluded } from './exclusions.js';
 
@@ -551,7 +552,7 @@ export async function leaderboard(
   } = {},
   runner: Queryable = db(),
 ): Promise<LeaderboardResult> {
-  const limit = Math.min(Math.max(options.limit ?? 10, 1), 100);
+  const limit = limitOf(options.limit, 10, 100);
   const window = options.window ?? 'all';
 
   // Excluded contacts never appear, and the exclusion is resolved in SQL so a

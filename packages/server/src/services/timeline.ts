@@ -1,4 +1,5 @@
 import { db, type Queryable } from '../db/pool.js';
+import { limitOf } from '../lib/paging.js';
 
 /**
  * Everything that happened to one contact, in one list.
@@ -50,7 +51,7 @@ export async function contactTimeline(
   options: TimelineOptions = {},
   runner: Queryable = db(),
 ): Promise<TimelineEntry[]> {
-  const limit = Math.min(Math.max(options.limit ?? 50, 1), 500);
+  const limit = limitOf(options.limit, 50, 500);
   const before = options.before ?? null;
 
   // Each arm is bounded by the same limit before the union, so a contact with
