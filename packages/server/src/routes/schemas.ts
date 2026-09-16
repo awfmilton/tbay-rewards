@@ -117,6 +117,10 @@ export const orderSchema = z.object({
         quantity: z.number().int().positive().max(10_000),
         subtotalCents: z.number().int().min(0),
         commissionRateBps: z.number().int().min(0).max(10_000).nullish(),
+        // Category slugs, so per-category reward overrides can match a line.
+        // Zod strips unknown keys, so without this the field was silently
+        // dropped and every category rule quietly matched nothing.
+        categoryRefs: z.array(z.string().max(128)).max(30).optional(),
       }),
     )
     .max(500)

@@ -80,6 +80,12 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
         pageKeyPatterns: z.array(z.string().max(255)).max(100).optional(),
         fromName: z.string().max(128).optional(),
         fromEmail: z.string().email().max(254).optional(),
+        // Member-to-member transfer limits. Unset means unlimited, which is
+        // what every tenant has today, so these change nothing until set.
+        transferMinimum: z.number().int().min(1).max(1_000_000).optional(),
+        transferDailyLimit: z.number().int().min(1).max(100_000_000).optional(),
+        transferWeeklyLimit: z.number().int().min(1).max(100_000_000).optional(),
+        transferMonthlyLimit: z.number().int().min(1).max(100_000_000).optional(),
       })
       .strict();
 
@@ -460,7 +466,13 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
       pointsPerUnit: z.number().min(0).max(10_000).optional(),
       cooldownSeconds: z.number().int().min(0).optional(),
       dailyCap: z.number().int().min(0).nullish(),
+      weeklyCap: z.number().int().min(0).nullish(),
+      monthlyCap: z.number().int().min(0).nullish(),
       lifetimeCap: z.number().int().min(0).nullish(),
+      /** Clamps one award however the amount was calculated. */
+      maxPerAward: z.number().int().min(1).max(10_000_000).nullish(),
+      /** Ledger wording; %amount%, %rule%, %ref%, %value% are substituted. */
+      logTemplate: z.string().max(300).nullish(),
       holdSeconds: z.number().int().min(0).optional(),
       enabled: z.boolean().optional(),
     });
@@ -476,7 +488,11 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
       points_per_unit: input.pointsPerUnit as never,
       cooldown_seconds: input.cooldownSeconds,
       daily_cap: input.dailyCap ?? null,
+      weekly_cap: input.weeklyCap ?? null,
+      monthly_cap: input.monthlyCap ?? null,
       lifetime_cap: input.lifetimeCap ?? null,
+      max_per_award: input.maxPerAward ?? null,
+      log_template: input.logTemplate ?? null,
       hold_seconds: input.holdSeconds,
       enabled: input.enabled,
     } as never);
@@ -568,10 +584,22 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
     return { applied: result.created, points: input.points, balance: result.balance };
   });
 
-  app.get('/v1/rewards/leaderboard', async (request) => {
-    const tenant = tenantOf(request);
-    return { leaders: await leaderboard(tenant.id) };
-  });
+  app.get<{ Querystring: { window?: string; limit?: string; contactId?: string } }>(
+    '/v1/rewards/leaderboard',
+    async (request) => {
+      const tenant = tenantOf(request);
+      const window = (['all', 'day', 'week', 'month', 'year'] as const).find(
+        (candidate) => candidate === request.query.window,
+      );
+      const board = await leaderboard(tenant.id, {
+        window: window ?? 'all',
+        limit: request.query.limit ? Number(request.query.limit) : undefined,
+        contactId: request.query.contactId ?? null,
+      });
+      // `leaders` kept for the existing storefront; `you` and `window` are new.
+      return { leaders: board.rows, you: board.you, window: board.window };
+    },
+  );
 
   // ── Social sharing ────────────────────────────────────────────────────────
 

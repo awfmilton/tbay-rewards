@@ -156,6 +156,12 @@ export async function gamificationRoutes(app: FastifyInstance): Promise<void> {
         maxUses: z.number().int().positive().nullish(),
         perContactLimit: z.number().int().positive().max(100).optional(),
         expiresAt: z.string().max(40).nullish(),
+        // Balance band the redeemer must sit inside, and what the code hands
+        // out besides points.
+        minBalance: z.number().int().min(0).nullish(),
+        maxBalance: z.number().int().min(0).nullish(),
+        grantBadgeKey: z.string().max(64).nullish(),
+        grantRankKey: z.string().max(64).nullish(),
       }),
       request.body,
     );

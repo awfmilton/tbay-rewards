@@ -496,26 +496,115 @@ export function pointsFor(rule: RewardRule, valueCents?: number): number {
   return rule.points;
 }
 
-/** Leaderboard of top earners, for the storefront rewards page. */
+export type LeaderboardWindow = 'all' | 'day' | 'week' | 'month' | 'year';
+
+export interface LeaderboardRow {
+  contact_id: string;
+  name: string | null;
+  points: number;
+  rank: number;
+}
+
+export interface LeaderboardResult {
+  window: LeaderboardWindow;
+  rows: LeaderboardRow[];
+  /** The asking member's position, even when they are outside the top N. */
+  you: LeaderboardRow | null;
+}
+
+/**
+ * Leaderboard of top earners.
+ *
+ * Three things myCred has that a single lifetime query does not:
+ *
+ *  - a timeframe, because "top this month" is a board a new customer can still
+ *    win, while an all-time board is settled by whoever joined first;
+ *  - the asking member's own position, so someone in 400th place sees a number
+ *    rather than a list of strangers;
+ *  - exclusions, so staff and test accounts are not permanent champions.
+ *
+ * The windowed variants sum the ledger; `all` reads the balances cache, which
+ * is what makes the default cheap.
+ */
 export async function leaderboard(
   tenantId: string,
-  limit = 10,
+  options: {
+    limit?: number;
+    window?: LeaderboardWindow;
+    /** Include this contact's own row even if they are below the cut. */
+    contactId?: string | null;
+  } = {},
   runner: Queryable = db(),
-): Promise<Array<{ contact_id: string; name: string | null; lifetime_earned: number }>> {
-  const { rows } = await runner.query<{
-    contact_id: string;
-    name: string | null;
-    lifetime_earned: number;
-  }>(
-    `SELECT b.contact_id, c.name, b.lifetime_earned
-       FROM points_balances b
-       JOIN contacts c ON c.id = b.contact_id
-      WHERE b.tenant_id = $1 AND b.lifetime_earned > 0
-      ORDER BY b.lifetime_earned DESC
-      LIMIT $2`,
-    [tenantId, Math.min(limit, 100)],
+): Promise<LeaderboardResult> {
+  const limit = Math.min(Math.max(options.limit ?? 10, 1), 100);
+  const window = options.window ?? 'all';
+
+  // Excluded contacts never appear, and the exclusion is resolved in SQL so a
+  // large board does not turn into one round trip per row.
+  const notExcluded = `
+    NOT EXISTS (
+      SELECT 1 FROM reward_exclusions x
+       WHERE x.tenant_id = $1
+         AND (
+           (x.kind = 'contact'      AND x.value = c.id::text)
+        OR (x.kind = 'email'        AND x.value = lower(coalesce(c.email_normalised, c.email, '')))
+        OR (x.kind = 'email_domain' AND coalesce(c.email_normalised, c.email, '') <> ''
+              AND lower(coalesce(c.email_normalised, c.email, '')) LIKE '%@' || x.value)
+        OR (x.kind = 'tag'          AND x.value = ANY (SELECT lower(t) FROM unnest(c.tags) AS t))
+        OR (x.kind = 'role'         AND EXISTS (
+               SELECT 1 FROM jsonb_array_elements_text(coalesce(c.attributes->'roles', '[]'::jsonb)) AS r
+                WHERE lower(r) = x.value))
+         )
+    )`;
+
+  const source =
+    window === 'all'
+      ? `SELECT b.contact_id, c.name, b.lifetime_earned::bigint AS points
+           FROM points_balances b
+           JOIN contacts c ON c.id = b.contact_id
+          WHERE b.tenant_id = $1 AND b.lifetime_earned > 0 AND ${notExcluded}`
+      : `SELECT l.contact_id, c.name, SUM(l.delta_points)::bigint AS points
+           FROM points_ledger l
+           JOIN contacts c ON c.id = l.contact_id
+          WHERE l.tenant_id = $1
+            AND l.delta_points > 0
+            AND l.status <> 'reversed'
+            AND l.created_at >= date_trunc($2, now())
+            AND ${notExcluded}
+          GROUP BY l.contact_id, c.name
+         HAVING SUM(l.delta_points) > 0`;
+
+  const params: unknown[] = window === 'all' ? [tenantId] : [tenantId, window];
+
+  const { rows } = await runner.query<LeaderboardRow>(
+    `WITH board AS (${source})
+     SELECT contact_id, name, points::int AS points,
+            ROW_NUMBER() OVER (ORDER BY points DESC, contact_id)::int AS rank
+       FROM board
+      ORDER BY rank
+      LIMIT ${limit}`,
+    params,
   );
-  return rows;
+
+  let you: LeaderboardRow | null = null;
+  if (options.contactId) {
+    const mine = rows.find((row) => row.contact_id === options.contactId);
+    you =
+      mine ??
+      (await queryOne<LeaderboardRow>(
+        runner,
+        `WITH board AS (${source}),
+              ranked AS (
+                SELECT contact_id, name, points::int AS points,
+                       ROW_NUMBER() OVER (ORDER BY points DESC, contact_id)::int AS rank
+                  FROM board
+              )
+         SELECT * FROM ranked WHERE contact_id = $${params.length + 1}`,
+        [...params, options.contactId],
+      ));
+  }
+
+  return { window, rows, you };
 }
 
 export function assertRuleKey(key: string): string {
