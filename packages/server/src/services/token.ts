@@ -41,6 +41,8 @@ export interface TokenClaim {
   ledger_entry_id: string | null;
   tx_hash: string | null;
   expires_at: Date;
+  /** When the reconcile sweep last asked the chain about this voucher. */
+  last_checked_at: Date | null;
   created_at: Date;
 }
 
@@ -496,12 +498,25 @@ export async function reconcileClaims(limit = 100, runner: Queryable = db()): Pr
 
   // 'expired' is included on purpose: an aged-out voucher is still claimable
   // on-chain, so we keep watching for it rather than losing track of the mint.
+  // Ordered by when we last looked, not by age. An expired voucher stays
+  // claimable on-chain and is never refunded, so expired rows pile up at the
+  // head of a created_at ordering — past `limit` of them, every pass re-checked
+  // the same oldest hundred and no newer voucher was ever reconciled. Rotating
+  // on last_checked_at gives every open claim a turn.
   const { rows } = await runner.query<TokenClaim>(
     `SELECT * FROM token_claims
       WHERE status IN ('signed', 'expired')
-      ORDER BY created_at LIMIT $1`,
+      ORDER BY last_checked_at NULLS FIRST, created_at
+      LIMIT $1`,
     [limit],
   );
+
+  if (rows.length > 0) {
+    await runner.query(
+      'UPDATE token_claims SET last_checked_at = now() WHERE id = ANY($1::uuid[])',
+      [rows.map((row) => row.id)],
+    );
+  }
 
   let settled = 0;
   for (const claim of rows) {

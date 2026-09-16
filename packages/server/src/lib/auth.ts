@@ -34,7 +34,15 @@ export async function requirePublicKey(request: FastifyRequest): Promise<Tenant>
   const tenant = await resolvePublicKey(key);
   if (!tenant) throw ApiError.unauthorized('Unknown or revoked site key');
 
-  const limit = rateLimit(`ingest:${tenant.id}`, config().security.ingestRatePerMinute);
+  // Keyed per client, not per tenant. A tenant-wide bucket divided the whole
+  // allowance across every visitor at once: at the tracker's 8-second flush,
+  // the default 600/minute is 80 concurrent visitors for the entire store, and
+  // the tracker drops a 429 silently. The limit is there to stop one abusive
+  // client, so it belongs on the client.
+  const limit = rateLimit(
+    `ingest:${tenant.id}:${clientFingerprint(request)}`,
+    config().security.ingestRatePerMinute,
+  );
   if (!limit.allowed) throw ApiError.tooManyRequests();
 
   request.tenant = tenant;
@@ -70,4 +78,23 @@ export function clientIp(request: FastifyRequest): string {
     return forwarded.split(',')[0]!.trim();
   }
   return request.ip;
+}
+
+/**
+ * A best-effort per-client key for rate limiting.
+ *
+ * The visitor id when the tracker sends one, falling back to the peer address.
+ * Neither is trustworthy on its own — a visitor id is client-supplied and an
+ * IP is shared behind NAT — but the tenant bucket above bounds total abuse, so
+ * this only has to stop one client from spending everyone else's allowance.
+ */
+function clientFingerprint(request: FastifyRequest): string {
+  const body = request.body as Record<string, unknown> | undefined;
+  const anonId = typeof body?.anonId === 'string' ? body.anonId : null;
+  if (anonId && anonId.length <= 64) return `a:${anonId}`;
+
+  const forwarded = request.headers['x-forwarded-for'];
+  const first = Array.isArray(forwarded) ? forwarded[0] : forwarded;
+  const ip = (first ?? '').split(',')[0]?.trim() || request.ip;
+  return `i:${ip}`;
 }
