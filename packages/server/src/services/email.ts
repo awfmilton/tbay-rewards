@@ -233,12 +233,21 @@ export async function flushEmailQueue(limit = 50, runner: Queryable = db()): Pro
         runner,
       );
 
-      const giveUp = type !== 'soft' || message.attempts >= MAX_SEND_ATTEMPTS;
+      // A transport failure is about us, not the recipient, so it neither
+      // gives up nor spends the attempt budget. Otherwise a relay that is down
+      // for ninety seconds burns all five attempts on every queued message and
+      // a whole broadcast is lost to an outage that fixed itself.
+      const transport = type === 'transport';
+      const giveUp = !transport && (type !== 'soft' || message.attempts >= MAX_SEND_ATTEMPTS);
+
       await runner.query(
         `UPDATE email_messages
-            SET status = $3, error = $2, bounce_type = $4
+            SET status = $3,
+                error = $2,
+                bounce_type = $4,
+                attempts = CASE WHEN $5::boolean THEN GREATEST(attempts - 1, 0) ELSE attempts END
           WHERE id = $1`,
-        [message.id, reason.slice(0, 500), giveUp ? 'failed' : 'queued', type],
+        [message.id, reason.slice(0, 500), giveUp ? 'failed' : 'queued', type, transport],
       );
     }
   }

@@ -1,9 +1,16 @@
 import { db, queryOne, type Queryable } from '../db/pool.js';
+import { unsubscribeRequestUrl } from './newsletter.js';
 import { config } from '../config.js';
 import { ApiError } from '../lib/errors.js';
 import { getTemplate, queueEmail, renderTemplate, senderFor } from './email.js';
 import { shouldTrack } from './email-tracking.js';
-import { advanceRun, resumeDueRuns, waitSeconds, type Step } from './automation-runner.js';
+import {
+  actionsHash,
+  advanceRun,
+  resumeDueRuns,
+  waitSeconds,
+  type Step,
+} from './automation-runner.js';
 import { award } from './points.js';
 import { getTenantById, type Tenant } from './tenants.js';
 import type { Contact } from './contacts.js';
@@ -199,6 +206,8 @@ export async function fire(
           step_index: 0,
           resume_at: null,
           attempts: 0,
+          steps_executed: 0,
+          actions_hash: actionsHash(automation.actions),
           context: ctx.data ?? {},
           error: null,
         },
@@ -207,9 +216,17 @@ export async function fire(
 
       await runner.query(
         `UPDATE automation_runs
-            SET status = $2, step_index = $3, resume_at = $4, updated_at = now()
+            SET status = $2, step_index = $3, resume_at = $4,
+                steps_executed = $5, actions_hash = $6, updated_at = now()
           WHERE id = $1`,
-        [claim.id, result.status, result.stepIndex, result.resumeAt],
+        [
+          claim.id,
+          result.status,
+          result.stepIndex,
+          result.resumeAt,
+          result.stepsExecuted,
+          actionsHash(automation.actions),
+        ],
       );
 
       if (result.status === 'waiting') waiting.push(automation.key);
@@ -316,7 +333,7 @@ async function sendEmailAction(
 
   // Built once and used twice: in the body and in the List-Unsubscribe header,
   // so the mail client's own button and the link in the message agree.
-  const unsubscribeUrl = `${config().publicUrl}/n/unsubscribe-request?t=${tenant.id}&email=${encodeURIComponent(ctx.contact.email)}`;
+  const unsubscribeUrl = unsubscribeRequestUrl(tenant.id, ctx.contact.email);
 
   const rendered = renderTemplate(template, {
     tenant_name: tenant.name,

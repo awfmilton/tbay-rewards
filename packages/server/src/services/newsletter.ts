@@ -1,6 +1,6 @@
 import { db, queryOne, withTransaction, type Queryable } from '../db/pool.js';
 import { config } from '../config.js';
-import { hashPii, hashToken, randomToken } from '../lib/crypto.js';
+import { hashPii, hashToken, randomToken, signPayload, verifyPayload, normaliseEmail } from '../lib/crypto.js';
 import { ApiError } from '../lib/errors.js';
 import { isValidEmail, upsertContact, type Contact } from './contacts.js';
 import { getTemplate, queueEmail, renderTemplate, senderFor } from './email.js';
@@ -487,4 +487,33 @@ async function cancelParkedRuns(runner: Queryable, token: string): Promise<void>
         )`,
     [hashToken(token)],
   );
+}
+
+/**
+ * A signed, self-contained unsubscribe link.
+ *
+ * The unsigned form of this endpoint took a tenant id and an email address
+ * straight from the query string — and the tenant id is printed in the
+ * unsubscribe link of every marketing email we send, so one received message
+ * revealed it. Anyone could then walk a list of addresses and permanently
+ * suppress a competitor's entire audience with a shell loop.
+ *
+ * The signature is an HMAC over exactly the pair being acted on, so a link
+ * only works for the address it was minted for. It does not expire: an
+ * unsubscribe link in a two-year-old email must still work, and there is
+ * nothing to gain by replaying one — unsubscribing twice is unsubscribing.
+ */
+export function unsubscribeRequestUrl(tenantId: string, email: string): string {
+  const token = signPayload({ t: tenantId, e: normaliseEmail(email), k: 'unsub' });
+  return `${config().publicUrl}/n/u/${encodeURIComponent(token)}`;
+}
+
+export function verifyUnsubscribeRequest(
+  token: string,
+): { tenantId: string; email: string } | null {
+  const payload = verifyPayload<{ t?: string; e?: string; k?: string }>(token);
+  // The `k` discriminator stops a signed payload minted for some other purpose
+  // — an attribution cookie, say — from being replayed here.
+  if (!payload || payload.k !== 'unsub' || !payload.t || !payload.e) return null;
+  return { tenantId: payload.t, email: payload.e };
 }

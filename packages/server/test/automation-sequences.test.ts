@@ -277,11 +277,11 @@ describe('safety', () => {
       dedupeKey: `c:${contactId}`,
     });
 
+    const { unsubscribeRequestUrl } = await import('../src/services/newsletter.js');
+    const token = unsubscribeRequestUrl(tenant.id, 'quit@example.com').split('/n/u/')[1]!;
+
     const app = await testApp();
-    await app.inject({
-      method: 'POST',
-      url: `/n/unsubscribe-request?t=${tenant.id}&email=${encodeURIComponent('quit@example.com')}`,
-    });
+    await app.inject({ method: 'POST', url: `/n/u/${token}` });
 
     await fastForward();
     await runDueAutomations();

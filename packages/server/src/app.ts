@@ -26,6 +26,10 @@ export async function buildApp(): Promise<FastifyInstance> {
     logger: { level: cfg.logLevel },
     trustProxy: true,
     bodyLimit: 1_048_576, // 1 MB: a tracker batch is a few KB at most.
+    // Fastify's default is 100 characters, which is shorter than a signed
+    // unsubscribe token — the URL in every marketing email — and a route
+    // parameter over the limit answers 414 rather than matching at all.
+    maxParamLength: 512,
   });
 
   /**

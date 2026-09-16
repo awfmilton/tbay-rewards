@@ -48,7 +48,34 @@ const HARD_BOUNCE = new RegExp(
 
 const COMPLAINT = /\b(?:spam|abuse|complaint|unsolicited)\b/i;
 
-export function classifyFailure(message: string): 'hard' | 'soft' | 'complaint' {
+/**
+ * Failures that are about *us*, not the recipient.
+ *
+ * A relay that is unreachable, a TLS handshake that fails, an authentication
+ * error — none of these say anything about whether a mailbox exists, so they
+ * must never count toward suppressing one. Without this, a seventy-five second
+ * outage retried five times permanently suppressed every recipient queued at
+ * the time, which is the opposite of what a retry limit is for.
+ */
+const TRANSPORT_FAILURE = new RegExp(
+  [
+    'ECONN(?:REFUSED|RESET|ABORTED)',
+    'ETIMEDOUT|ESOCKET|EHOSTUNREACH|ENETUNREACH|ENOTFOUND|EAI_AGAIN|EPIPE',
+    'socket close|connection (?:closed|timeout|refused)',
+    '\\b(?:421|450|451|452)\\b',            // transient SMTP
+    '\\b535\\b|authentication (?:failed|required)|invalid login',
+    'certificate|self.?signed|TLS|SSL',
+    'greylist|try again|too many connections|rate limit',
+  ].join('|'),
+  'i',
+);
+
+export type FailureKind = 'hard' | 'soft' | 'complaint' | 'transport';
+
+export function classifyFailure(message: string): FailureKind {
+  // Checked first: a relay that rejects everything with "spam" in the text is
+  // a transport problem, not four thousand people complaining.
+  if (TRANSPORT_FAILURE.test(message)) return 'transport';
   if (COMPLAINT.test(message) && !/spamassassin/i.test(message)) return 'complaint';
   return HARD_BOUNCE.test(message) ? 'hard' : 'soft';
 }
@@ -56,6 +83,18 @@ export function classifyFailure(message: string): 'hard' | 'soft' | 'complaint' 
 export function normaliseEmail(email: string): string {
   return email.trim().toLowerCase();
 }
+
+/**
+ * How long a suppression lasts.
+ *
+ * A hard bounce and a complaint are permanent: the mailbox does not exist, or
+ * the person said stop. A run of soft failures is a guess — the relay may have
+ * been down — so it lapses, and the address is tried again rather than being
+ * written off forever on the strength of one bad afternoon.
+ */
+const SUPPRESSION_DAYS: Partial<Record<SuppressionReason, number>> = {
+  repeated_failure: 30,
+};
 
 export async function suppress(
   tenantId: string,
@@ -65,20 +104,28 @@ export async function suppress(
   runner: Queryable = db(),
 ): Promise<Suppression> {
   const address = normaliseEmail(email);
+  const days = SUPPRESSION_DAYS[reason] ?? null;
 
   const row = await queryOne<Suppression>(
     runner,
-    `INSERT INTO email_suppressions (tenant_id, email, reason, detail)
-     VALUES ($1, $2, $3, $4)
+    `INSERT INTO email_suppressions (tenant_id, email, reason, detail, expires_at)
+     VALUES ($1, $2, $3, $4,
+             CASE WHEN $5::int IS NULL THEN NULL
+                  ELSE now() + ($5 || ' days')::interval END)
      ON CONFLICT (tenant_id, email) DO UPDATE SET
        -- A complaint outranks a bounce: it is a statement of intent, not a
        -- delivery fact, so it must not be downgraded by a later soft failure.
        reason = CASE WHEN email_suppressions.reason = 'complaint'
                      THEN email_suppressions.reason ELSE EXCLUDED.reason END,
        detail = EXCLUDED.detail,
-       expires_at = NULL
+       -- A permanent reason overrides a lapsing one, never the other way
+       -- round: a hard bounce after a soft run is still a hard bounce.
+       expires_at = CASE
+         WHEN email_suppressions.expires_at IS NULL THEN NULL
+         ELSE EXCLUDED.expires_at
+       END
      RETURNING *`,
-    [tenantId, address, reason, detail.slice(0, 500)],
+    [tenantId, address, reason, detail.slice(0, 500), days],
   );
 
   // Mirror onto the subscription and the consent flag so every other sender
@@ -88,7 +135,10 @@ export async function suppress(
         SET status = $3, unsubscribed_at = COALESCE(s.unsubscribed_at, now())
        FROM contacts c
       WHERE s.contact_id = c.id AND s.tenant_id = $1
-        AND c.email_normalised = $2 AND s.status NOT IN ('bounced', 'complained')`,
+        AND c.email_normalised = $2
+        -- 'unsubscribed' is what the person chose; a delivery fact must not
+        -- overwrite it and turn their decision into a bounce in the stats.
+        AND s.status NOT IN ('bounced', 'complained', 'unsubscribed')`,
     [tenantId, address, reason === 'complaint' ? 'complained' : 'bounced'],
   );
 
@@ -158,14 +208,17 @@ export async function recordFailure(
   attempts: number,
   maxAttempts: number,
   runner: Queryable = db(),
-): Promise<'hard' | 'soft' | 'complaint'> {
+): Promise<FailureKind> {
   const type = classifyFailure(reason);
 
   if (type === 'hard') {
     await suppress(tenantId, email, 'hard_bounce', reason, runner);
   } else if (type === 'complaint') {
     await suppress(tenantId, email, 'complaint', reason, runner);
-  } else if (attempts >= maxAttempts) {
+  } else if (type === 'soft' && attempts >= maxAttempts) {
+    // Only a genuinely unexplained failure counts toward suppression. A
+    // transport failure says nothing about the mailbox, so it never does,
+    // however many times it repeats.
     await suppress(tenantId, email, 'repeated_failure', reason, runner);
   }
 
