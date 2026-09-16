@@ -229,13 +229,36 @@
 
   // ── Heatmap capture ───────────────────────────────────────────────────────
 
+  /**
+   * Document height, cached.
+   *
+   * Every call reads five layout properties, which forces the browser to flush
+   * pending style and layout work synchronously. Uncached this ran on every
+   * pointer sample *and* on every unthrottled scroll event, so scrolling a long
+   * page meant a forced reflow per frame — the classic layout-thrash pattern,
+   * and the one thing a tracker must never do to someone else's page.
+   *
+   * The value only changes when content or the viewport does, so it is
+   * recomputed at most every 500ms and invalidated on resize.
+   */
+  var cachedDocHeight = 0;
+  var docHeightAt = 0;
+
   function docHeight() {
+    var now = Date.now();
+    if (cachedDocHeight && now - docHeightAt < 500) return cachedDocHeight;
     var body = document.body;
     var html = document.documentElement;
-    return Math.max(
+    cachedDocHeight = Math.max(
       body ? body.scrollHeight : 0, body ? body.offsetHeight : 0,
       html ? html.clientHeight : 0, html ? html.scrollHeight : 0, html ? html.offsetHeight : 0
     ) || 1;
+    docHeightAt = now;
+    return cachedDocHeight;
+  }
+
+  function invalidateDocHeight() {
+    cachedDocHeight = 0;
   }
 
   function heatBatch(kind) {
@@ -274,10 +297,20 @@
   }
 
   var maxScroll = 0;
+  var scrollQueued = false;
   function onScroll() {
-    var scrolled = (window.pageYOffset || document.documentElement.scrollTop) + window.innerHeight;
-    var depth = Math.min(1, scrolled / docHeight());
-    if (depth > maxScroll) maxScroll = depth;
+    // Coalesced into one measurement per frame. The listener itself does no
+    // layout reads at all, so a fast scroll cannot pile them up.
+    if (scrollQueued) return;
+    scrollQueued = true;
+    var raf = window.requestAnimationFrame || function (fn) { return setTimeout(fn, 16); };
+    raf(function () {
+      scrollQueued = false;
+      var scrolled =
+        (window.pageYOffset || document.documentElement.scrollTop) + window.innerHeight;
+      var depth = Math.min(1, scrolled / docHeight());
+      if (depth > maxScroll) maxScroll = depth;
+    });
   }
 
   function flushScrollDepth() {
@@ -508,6 +541,10 @@
   document.addEventListener('click', onClick, true);
   document.addEventListener('mousemove', onMove, { passive: true });
   document.addEventListener('scroll', onScroll, { passive: true });
+  // The cached height is only wrong when the page reflows, which a resize
+  // always causes and lazy-loaded content usually does.
+  window.addEventListener('resize', invalidateDocHeight, { passive: true });
+  window.addEventListener('orientationchange', invalidateDocHeight, { passive: true });
 
   document.addEventListener('visibilitychange', function () {
     if (document.visibilityState === 'hidden') { flushScrollDepth(); flush(true); }

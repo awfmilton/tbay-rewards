@@ -39,6 +39,8 @@ export function loadConfig() {
     database: {
       url: str('DATABASE_URL', 'postgres://localhost:5432/tbay_rewards'),
       poolSize: num('DATABASE_POOL_SIZE', 10),
+      connectTimeoutMs: num('DATABASE_CONNECT_TIMEOUT_MS', 2000),
+      idleTxTimeoutMs: num('DATABASE_IDLE_TX_TIMEOUT_MS', 10_000),
       ssl: bool('DATABASE_SSL', false),
     },
 

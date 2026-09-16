@@ -29,6 +29,17 @@ export function db(): pg.Pool {
       max: cfg.database.poolSize,
       ssl: cfg.database.ssl ? { rejectUnauthorized: false } : undefined,
       application_name: 'tbay-rewards',
+      // Without this, callers queue for a connection indefinitely: the pool
+      // never sheds load, it just converts saturation into unbounded latency
+      // while the client has long since given up.
+      connectionTimeoutMillis: cfg.database.connectTimeoutMs,
+      // A transaction left open by a crashed handler holds its row locks until
+      // the connection dies. Ten seconds is far longer than any path here
+      // legitimately needs between statements.
+      options: `-c idle_in_transaction_session_timeout=${cfg.database.idleTxTimeoutMs}`,
+      // Recycle connections so a long-lived process cannot accumulate
+      // per-connection state or a stale plan cache.
+      maxLifetimeSeconds: 1800,
     });
     pool.on('error', (err) => {
       // An idle client failing must not take the process down.
@@ -53,17 +64,26 @@ export async function withTransaction<T>(fn: (client: pg.PoolClient) => Promise<
     await client.query('BEGIN');
     const result = await fn(client);
     await client.query('COMMIT');
+    client.release();
     return result;
   } catch (err) {
+    let broken = false;
     try {
       await client.query('ROLLBACK');
-    } catch {
-      // The connection is already broken; releasing it is all we can do.
+    } catch (rollbackError) {
+      // A failed ROLLBACK means the connection is not in a known state. Handing
+      // it back as healthy puts the next caller on a session that may still be
+      // inside an aborted transaction; `release(err)` destroys it instead.
+      broken = true;
+      client.release(rollbackError instanceof Error ? rollbackError : new Error('rollback failed'));
     }
+    if (!broken) client.release();
     throw err;
-  } finally {
-    client.release();
   }
+
+  // Note: no `finally`. The success path releases below, and the catch path
+  // above decides between a clean release and destroying the connection — a
+  // `finally` would double-release whichever branch already ran.
 }
 
 export async function queryOne<R extends pg.QueryResultRow = pg.QueryResultRow>(

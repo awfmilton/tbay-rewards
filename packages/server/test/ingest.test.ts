@@ -13,6 +13,7 @@ import {
   truncateAll,
   type TestTenant,
 } from './helpers.js';
+import { binSamples } from '../src/services/heatmap.js';
 
 let tenant: TestTenant;
 
@@ -360,5 +361,74 @@ describe('cart tracking', () => {
       tenant.id,
     ]));
     expect(rows[0]).toMatchObject({ status: 'expired', item_count: 0 });
+  });
+});
+
+/**
+ * Lock ordering on a hot page.
+ *
+ * A load review measured 48 of 300 concurrent product batches and 291 of 300
+ * heatmap batches aborting with 40P01 on a page every visitor was viewing.
+ * Both came from taking row locks in whatever order the visitor happened to
+ * browse or move their pointer, then holding them to COMMIT.
+ *
+ * Confirmed independently: two writers issuing the same 40-row `ON CONFLICT DO
+ * UPDATE` in opposite orders deadlock within a handful of rounds.
+ *
+ * Two tests, on purpose. The product one drives real concurrent requests and
+ * fails without the fix. The heatmap one asserts the ordering contract
+ * directly, because reproducing its deadlock needs more parallel writers than
+ * the connection pool will give a single test — and a deadlock test that only
+ * sometimes reproduces is worse than none.
+ */
+describe('concurrent ingest on a hot page', () => {
+  it('bins heatmap samples into a canonical order whatever order they arrive in', () => {
+    const cells = [
+      { x: 0.9, y: 0.9 }, { x: 0.1, y: 0.5 }, { x: 0.5, y: 0.1 },
+      { x: 0.3, y: 0.9 }, { x: 0.7, y: 0.1 },
+    ];
+
+    const forward = binSamples(cells);
+    const backward = binSamples([...cells].reverse());
+
+    // Same cells, identical order — which is what stops two visitors tracing
+    // the same page in opposite directions from locking each other's rows.
+    expect(backward).toEqual(forward);
+
+    const ordered = forward.map((cell) => [cell.y, cell.x]);
+    expect(ordered).toEqual([...ordered].sort((a, b) => a[0]! - b[0]! || a[1]! - b[1]!));
+  });
+
+  it('does not deadlock when visitors view the same products in different orders', async () => {
+    const products = ['canoe', 'paddle', 'lifejacket'];
+
+    const batches = Array.from({ length: 24 }, (_, index) => {
+      const { visitor, session } = ids();
+      const order = index % 2 === 0 ? products : [...products].reverse();
+      return post({
+        visitor,
+        session,
+        url: 'https://shop.example.com/shop',
+        events: order.map((ref) => ({
+          type: 'product_view',
+          url: `https://shop.example.com/product/${ref}`,
+          productRef: ref,
+        })),
+      });
+    });
+
+    const results = await Promise.all(batches);
+    expect(results.map((response) => response.statusCode)).toEqual(
+      results.map(() => 204),
+    );
+
+    // And the counts are right: 24 batches x one view each per product.
+    const { rows } = await db().query<{ product_ref: string; views: string }>(
+      `SELECT product_ref, SUM(views)::text AS views
+         FROM product_stats
+        WHERE tenant_id = $1 GROUP BY product_ref ORDER BY product_ref`,
+      [tenant.id],
+    );
+    expect(rows.map((row) => Number(row.views))).toEqual([24, 24, 24]);
   });
 });
