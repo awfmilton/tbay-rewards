@@ -18,6 +18,22 @@
 	var config = window.tbayRewards || {};
 	var i18n = config.i18n || {};
 
+	/**
+	 * Runtime-compiled dynamic import.
+	 *
+	 * `import()` is valid in a classic script in every current browser, but the
+	 * literal syntax is a parse error in older engines — which would take this
+	 * whole file down, not just the wallet path. Building it at runtime keeps the
+	 * failure contained to the one feature that needs it.
+	 */
+	var dynamicImport = (function () {
+		try {
+			return new Function('url', 'return import(url);');
+		} catch (e) {
+			return null;
+		}
+	}());
+
 	function rest(path, body, method) {
 		return fetch(config.restUrl + path, {
 			method: method || 'POST',
@@ -264,35 +280,94 @@
 	 * thirdweb Connect, when the site has a client id.
 	 *
 	 * It brings in-app wallets, social login and smart accounts, which matters
-	 * for customers who have never installed MetaMask. When it is not configured
-	 * we fall back to the injected EIP-1193 provider, so the flow still works.
+	 * for customers who have never installed MetaMask. Without a client id we
+	 * fall back to the injected EIP-1193 provider, so the flow still works.
+	 *
+	 * thirdweb v5 ships ESM only — there is no UMD bundle to drop in a <script>
+	 * tag — so it is pulled in with a dynamic import from an ESM CDN.
 	 */
 	function thirdwebEnabled() {
 		return Boolean(config.thirdweb && config.thirdweb.clientId);
 	}
 
+	var thirdwebModule = null;
+
 	function loadThirdweb() {
-		if (window.thirdweb) return Promise.resolve(window.thirdweb);
-		return loadScript('https://cdn.jsdelivr.net/npm/thirdweb@5/dist/thirdweb.umd.min.js')
-			.then(function () { return window.thirdweb; });
+		if (thirdwebModule) return Promise.resolve(thirdwebModule);
+		if (!dynamicImport) return Promise.reject(new Error(i18n.noWallet));
+		return dynamicImport('https://esm.sh/thirdweb@5').then(function (mod) {
+			thirdwebModule = mod;
+			return mod;
+		});
 	}
 
-	/** An EIP-1193 provider, from thirdweb when available and injected otherwise. */
+	/**
+	 * Connect an in-app wallet and hand back an EIP-1193 provider.
+	 *
+	 * `strategy` is required by v5 — omitting it rejects — and the provider comes
+	 * from the EIP1193 adapter rather than any method on the wallet itself.
+	 */
+	function thirdwebProvider() {
+		return loadThirdweb().then(function (sdk) {
+			if (!sdk || !sdk.createThirdwebClient || !sdk.inAppWallet) {
+				throw new Error(i18n.noWallet);
+			}
+
+			var client = sdk.createThirdwebClient({ clientId: config.thirdweb.clientId });
+			var chainId = (config.chain && config.chain.l2ChainId) || 300;
+			var chain = sdk.defineChain(chainId);
+			var wallet = sdk.inAppWallet();
+
+			return wallet
+				.connect({ client: client, chain: chain, strategy: 'google' })
+				.then(function () {
+					return dynamicImport('https://esm.sh/thirdweb@5/wallets/eip1193');
+				})
+				.then(function (eip1193) {
+					return eip1193.toProvider({ wallet: wallet, chain: chain, client: client });
+				});
+		});
+	}
+
+	/**
+	 * An EIP-1193 provider.
+	 *
+	 * An injected wallet wins when present. Otherwise thirdweb, if configured.
+	 * Otherwise, on a phone, a deep link into the MetaMask browser — which is
+	 * the difference between "install MetaMask" as a dead end and a route that
+	 * actually gets a customer to their tokens.
+	 */
 	function getProvider() {
 		if (window.ethereum) return Promise.resolve(window.ethereum);
 
 		if (thirdwebEnabled()) {
-			return loadThirdweb().then(function (sdk) {
-				if (!sdk || !sdk.createThirdwebClient) throw new Error(i18n.noWallet);
-				var client = sdk.createThirdwebClient({ clientId: config.thirdweb.clientId });
-				var wallet = sdk.inAppWallet ? sdk.inAppWallet() : null;
-				if (!wallet) throw new Error(i18n.noWallet);
-				return wallet.connect({ client: client, chain: { id: config.chain.l2ChainId } })
-					.then(function () { return wallet.getProvider ? wallet.getProvider() : window.ethereum; });
+			return thirdwebProvider()['catch'](function () {
+				return Promise.reject(new Error(mobileHint()));
 			});
 		}
 
-		return Promise.reject(new Error(i18n.noWallet));
+		return Promise.reject(new Error(mobileHint()));
+	}
+
+	function isMobile() {
+		return /android|iphone|ipad|ipod/i.test(navigator.userAgent || '');
+	}
+
+	function mobileHint() {
+		return isMobile() ? i18n.noWalletMobile : i18n.noWallet;
+	}
+
+	/** Offer a deep link into a wallet browser when there is no provider here. */
+	function renderWalletHelp(panel) {
+		var host = panel.querySelector('[data-tbay-wallet-help]');
+		if (!host || window.ethereum || !isMobile()) return;
+
+		var target = location.host + location.pathname + location.search;
+		host.hidden = false;
+		host.innerHTML =
+			'<p class="tbay-bridge__warning">' + escapeHtml(i18n.noWalletMobile) +
+			' <a class="tbay-button tbay-button--sm" href="https://metamask.app.link/dapp/' +
+			escapeHtml(target) + '">' + escapeHtml(i18n.openInWallet) + '</a></p>';
 	}
 
 	/** Switch the wallet to TBAY's L2, adding the network if it is unknown. */
@@ -436,6 +511,7 @@
 		// Anything left over from a previous visit is offered again rather than
 		// silently lost.
 		renderPending(panel, recall('voucher'));
+		renderWalletHelp(panel);
 
 		var bridge = panel.querySelector('[data-tbay-bridge]');
 		if (bridge) initBridge(bridge, currentAddress);

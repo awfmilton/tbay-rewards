@@ -55,6 +55,26 @@ class TBAY_Rewards_Newsletter {
 
 		$current = wp_get_current_user();
 
+		// Feedback for the no-JavaScript path, which posts to admin-post.php and
+		// redirects back here. Without this the page silently reloaded and the
+		// subscriber had no idea whether it had worked.
+		$notice = '';
+		if ( isset( $_GET['tbay_subscribed'] ) ) {
+			switch ( sanitize_key( wp_unslash( $_GET['tbay_subscribed'] ) ) ) {
+				case 'pending':
+					$notice = __( 'Almost there — check your inbox to confirm.', 'tbay-rewards' );
+					break;
+				case 'subscribed':
+					$notice = __( 'You are subscribed. Welcome aboard.', 'tbay-rewards' );
+					break;
+				case 'already_subscribed':
+					$notice = __( 'You are already subscribed.', 'tbay-rewards' );
+					break;
+				default:
+					$notice = __( 'Something went wrong. Please try again.', 'tbay-rewards' );
+			}
+		}
+
 		ob_start();
 		?>
 		<form class="tbay-newsletter"
@@ -106,7 +126,9 @@ class TBAY_Rewards_Newsletter {
 				</label>
 			</div>
 
-			<p class="tbay-newsletter__status" role="status" aria-live="polite"></p>
+			<p class="tbay-newsletter__status" role="status" aria-live="polite">
+				<?php echo esc_html( $notice ); ?>
+			</p>
 		</form>
 		<?php
 		return (string) ob_get_clean();
@@ -117,13 +139,25 @@ class TBAY_Rewards_Newsletter {
 			return;
 		}
 
+		// Registering the editor script is what puts the block in the inserter.
+		// Server-side registration alone makes it renderable but unreachable.
+		wp_register_script(
+			'tbay-newsletter-block',
+			TBAY_REWARDS_URL . 'assets/tbay-block.js',
+			array( 'wp-blocks', 'wp-element', 'wp-i18n', 'wp-block-editor', 'wp-components' ),
+			TBAY_REWARDS_VERSION,
+			true
+		);
+
 		register_block_type(
 			'tbay/newsletter',
 			array(
 				'api_version'     => 3,
 				'title'           => __( 'TBAY newsletter signup', 'tbay-rewards' ),
+				'description'     => __( 'A double opt-in signup form that awards reward points.', 'tbay-rewards' ),
 				'category'        => 'widgets',
 				'icon'            => 'email',
+				'editor_script'   => 'tbay-newsletter-block',
 				'attributes'      => array(
 					'list'        => array( 'type' => 'string', 'default' => 'newsletter' ),
 					'title'       => array( 'type' => 'string', 'default' => '' ),
@@ -255,7 +289,12 @@ class TBAY_Rewards_Newsletter {
 		);
 
 		if ( is_wp_error( $response ) ) {
-			return $response;
+			// cURL timeouts and DNS errors are not a message for a customer.
+			$this->api->log( 'Subscribe failed: ' . $response->get_error_message() );
+			return new WP_Error(
+				'tbay_unreachable',
+				__( 'We could not reach the mailing list right now — please try again shortly.', 'tbay-rewards' )
+			);
 		}
 
 		$code    = (int) wp_remote_retrieve_response_code( $response );

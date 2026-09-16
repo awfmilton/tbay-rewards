@@ -346,6 +346,9 @@ class TBAY_Rewards_UI {
 				</button>
 			</div>
 
+			<?php // A route into a wallet browser when this device has no provider. ?>
+			<div data-tbay-wallet-help hidden></div>
+
 			<?php // An unfinished claim from an earlier attempt, with a way to finish it. ?>
 			<div data-tbay-pending hidden></div>
 
