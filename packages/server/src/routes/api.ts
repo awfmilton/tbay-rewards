@@ -82,6 +82,9 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
         fromEmail: z.string().email().max(254).optional(),
         // Member-to-member transfer limits. Unset means unlimited, which is
         // what every tenant has today, so these change nothing until set.
+        // Rewrite links and add an open pixel to marketing email. Never
+        // applied to transactional mail whatever this says.
+        emailTracking: z.boolean().optional(),
         transferMinimum: z.number().int().min(1).max(1_000_000).optional(),
         transferDailyLimit: z.number().int().min(1).max(100_000_000).optional(),
         transferWeeklyLimit: z.number().int().min(1).max(100_000_000).optional(),

@@ -6,6 +6,8 @@ import { parse } from './collect.js';
 import { contactHandleSchema } from './schemas.js';
 import { requireContact } from '../services/contacts.js';
 import { queryLedger, type LedgerQuery } from '../services/points.js';
+import { listSuppressions, suppress, unsuppress } from '../services/deliverability.js';
+import { engagementReport } from '../services/email-tracking.js';
 import {
   DEFAULT_TEMPLATES,
   deleteTemplate,
@@ -150,6 +152,42 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
   app.delete<{ Params: { id: string } }>('/v1/rewards/product-rules/:id', async (request) => {
     const tenant = tenantOf(request);
     return { removed: await deleteProductRule(tenant.id, request.params.id) };
+  });
+
+  // ── Deliverability ─────────────────────────────────────────────────────────
+
+  app.get('/v1/email/suppressions', async (request) => {
+    const tenant = tenantOf(request);
+    return { suppressions: await listSuppressions(tenant.id) };
+  });
+
+  app.post('/v1/email/suppressions', async (request) => {
+    const tenant = tenantOf(request);
+    const schema = z.object({
+      email: z.string().email().max(254),
+      reason: z.enum(['hard_bounce', 'complaint', 'manual', 'repeated_failure']).default('manual'),
+      detail: z.string().max(500).optional(),
+    });
+    const input = parse(schema, request.body);
+    return { suppression: await suppress(tenant.id, input.email, input.reason, input.detail) };
+  });
+
+  /**
+   * Remove an address from suppression.
+   *
+   * Legitimate when a mailbox is fixed or a bounce was misclassified. It does
+   * *not* restore marketing consent — a complaint withdrew that, and only the
+   * person themselves can give it back.
+   */
+  app.delete<{ Params: { email: string } }>('/v1/email/suppressions/:email', async (request) => {
+    const tenant = tenantOf(request);
+    return { removed: await unsuppress(tenant.id, decodeURIComponent(request.params.email)) };
+  });
+
+  app.get<{ Querystring: { days?: string } }>('/v1/email/engagement', async (request) => {
+    const tenant = tenantOf(request);
+    const days = Math.min(Math.max(Number(request.query.days) || 30, 1), 365);
+    return { days, templates: await engagementReport(tenant.id, days) };
   });
 
   // ── Ledger search and export ───────────────────────────────────────────────

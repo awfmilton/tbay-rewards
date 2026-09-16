@@ -29,6 +29,25 @@ export async function buildApp(): Promise<FastifyInstance> {
   });
 
   /**
+   * Form-encoded bodies, for RFC 8058 one-click unsubscribe.
+   *
+   * A mail client's unsubscribe button POSTs
+   * `List-Unsubscribe=One-Click` as `application/x-www-form-urlencoded`.
+   * Without a parser Fastify answers "Unsupported Media Type" and the button
+   * silently does nothing — which is worse than never advertising the header,
+   * because the customer believes they have unsubscribed.
+   *
+   * The body is not read: the token in the URL is the whole request. Parsing
+   * it to an empty object keeps that explicit and means a malformed body from
+   * some client's implementation cannot fail the unsubscribe.
+   */
+  app.addContentTypeParser(
+    'application/x-www-form-urlencoded',
+    { parseAs: 'string', bodyLimit: 4096 },
+    (_request, _body, done) => done(null, {}),
+  );
+
+  /**
    * Ingest has to work from any customer storefront, so it is open CORS by
    * design — the site key is public and only authorises writes. The credentialed
    * APIs are server-to-server and never sent from a browser, so no allowlist here

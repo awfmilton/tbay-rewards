@@ -335,6 +335,9 @@ async function completeSubscription(
       html: rendered.html,
       text: rendered.text,
       dedupeKey: `newsletter_welcome:${subscription.id}`,
+      // A welcome carries the list's real token, which is what makes the mail
+      // client's one-click unsubscribe work for the whole subscription.
+      unsubscribeUrl: unsubToken ? `${base}/n/unsubscribe/${unsubToken}` : null,
       ...senderFor(tenant),
     },
     client,

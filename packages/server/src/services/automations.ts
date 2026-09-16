@@ -1,6 +1,7 @@
 import { db, queryOne, type Queryable } from '../db/pool.js';
 import { config } from '../config.js';
 import { getTemplate, queueEmail, renderTemplate, senderFor } from './email.js';
+import { shouldTrack } from './email-tracking.js';
 import { award } from './points.js';
 import { getTenantById, type Tenant } from './tenants.js';
 import type { Contact } from './contacts.js';
@@ -22,7 +23,11 @@ export type TriggerType =
   | 'order.completed'
   | 'points.awarded'
   | 'share.verified'
-  | 'token.claimed';
+  | 'token.claimed'
+  // Fired only on the first *human* engagement with a tracked message, so a
+  // mail client rendering the pixel repeatedly cannot re-enter a sequence.
+  | 'email.opened'
+  | 'email.clicked';
 
 export interface Condition {
   field: string;
@@ -257,12 +262,16 @@ async function sendEmailAction(
   // want of a marketing opt-in. See `upsertTemplate` for where the line sits.
   if (!template.transactional && !ctx.contact.marketing_consent) return;
 
+  // Built once and used twice: in the body and in the List-Unsubscribe header,
+  // so the mail client's own button and the link in the message agree.
+  const unsubscribeUrl = `${config().publicUrl}/n/unsubscribe-request?t=${tenant.id}&email=${encodeURIComponent(ctx.contact.email)}`;
+
   const rendered = renderTemplate(template, {
     tenant_name: tenant.name,
     name: ctx.contact.name ?? '',
     email: ctx.contact.email,
     rewards_url: (tenant.settings?.siteUrl as string) ?? config().publicUrl,
-    unsubscribe_url: `${config().publicUrl}/n/unsubscribe-request?t=${tenant.id}&email=${encodeURIComponent(ctx.contact.email)}`,
+    unsubscribe_url: unsubscribeUrl,
     ...ctx.data,
   });
 
@@ -276,6 +285,14 @@ async function sendEmailAction(
       html: rendered.html,
       text: rendered.text,
       dedupeKey: action.dedupe ?? `automation:${automation.key}:${ctx.dedupeKey}`,
+      // Marketing mail is tracked; a transactional receipt is not. The same
+      // flag that decides whether consent is required decides this, because
+      // the two questions have the same answer: is this a campaign or a
+      // receipt for something the person just did.
+      track: shouldTrack(tenant, { transactional: template.transactional }),
+      // Transactional mail has nothing to unsubscribe from, so it gets no
+      // header — a receipt offering to stop sending receipts is nonsense.
+      unsubscribeUrl: template.transactional ? null : unsubscribeUrl,
       ...senderFor(tenant),
     },
     runner,

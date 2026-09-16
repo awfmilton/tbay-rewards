@@ -1,6 +1,8 @@
 import nodemailer, { type Transporter } from 'nodemailer';
 import { db, queryOne, type Queryable } from '../db/pool.js';
 import { config } from '../config.js';
+import { planTracking } from './email-tracking.js';
+import { isSuppressed, recordFailure } from './deliverability.js';
 import type { Tenant } from './tenants.js';
 
 export interface OutgoingEmail {
@@ -10,6 +12,13 @@ export interface OutgoingEmail {
   text?: string | null;
   fromName?: string;
   fromAddress?: string;
+  /**
+   * Extra RFC 5322 headers, in practice List-Unsubscribe and
+   * List-Unsubscribe-Post. Gmail and Yahoo require one-click unsubscribe from
+   * bulk senders, and a missing header is a deliverability problem long before
+   * anyone complains about it.
+   */
+  headers?: Record<string, string>;
 }
 
 export interface SentEmail extends OutgoingEmail {
@@ -50,6 +59,7 @@ class SmtpTransport implements EmailTransport {
       subject: message.subject,
       html: message.html,
       text: message.text ?? stripHtml(message.html),
+      headers: message.headers,
     });
     return { providerId: info.messageId };
   }
@@ -87,6 +97,23 @@ export interface QueueInput {
   text?: string | null;
   /** Unique per tenant; a repeat enqueue with the same key is dropped. */
   dedupeKey: string;
+  /**
+   * Rewrite links and add an open pixel.
+   *
+   * Left unset the message is not tracked, so every existing caller keeps its
+   * current behaviour and a transactional receipt never gets a pixel. The
+   * senders that raise it read the tenant's `emailTracking` setting first.
+   */
+  track?: boolean;
+  /**
+   * Where this message's unsubscribe link points.
+   *
+   * Supplied by the caller because the plaintext token exists only there —
+   * subscriptions store a hash. Used for the List-Unsubscribe header, so the
+   * mail client's own button lands in the same place as the link in the body.
+   * Omit for transactional mail, which has nothing to unsubscribe from.
+   */
+  unsubscribeUrl?: string | null;
 }
 
 export interface QueueResult {
@@ -100,11 +127,17 @@ export interface QueueResult {
  * not produce a second copy on its next pass.
  */
 export async function queueEmail(input: QueueInput, runner: Queryable = db()): Promise<QueueResult> {
+  // Rewriting happens at queue time, not at send time: the stored html is what
+  // the recipient received, so a support question about "the link in my email"
+  // can be answered from the row.
+  const plan = input.track ? planTracking(input.html) : null;
+
   const row = await queryOne<{ id: string }>(
     runner,
     `INSERT INTO email_messages (
-       tenant_id, contact_id, template_key, to_email, subject, html, text, dedupe_key
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       tenant_id, contact_id, template_key, to_email, subject, html, text, dedupe_key,
+       tracking_token, tracked_links, unsubscribe_url
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11)
      ON CONFLICT (tenant_id, dedupe_key) DO NOTHING
      RETURNING id`,
     [
@@ -113,9 +146,12 @@ export async function queueEmail(input: QueueInput, runner: Queryable = db()): P
       input.templateKey,
       input.to,
       input.subject,
-      input.html,
+      plan?.html ?? input.html,
       input.text ?? null,
       input.dedupeKey,
+      plan && plan.links.length > 0 ? plan.token : null,
+      JSON.stringify(plan?.links ?? []),
+      input.unsubscribeUrl ?? null,
     ],
   );
   return { id: row?.id ?? null, queued: row !== null };
@@ -130,6 +166,8 @@ export async function flushEmailQueue(limit = 50, runner: Queryable = db()): Pro
     subject: string;
     html: string;
     text: string | null;
+    attempts: number;
+    unsubscribe_url: string | null;
   }>(
     // RETURNING does not inherit the subselect's ORDER BY, so the final SELECT
     // is what actually sends a batch in the order it was queued.
@@ -142,9 +180,11 @@ export async function flushEmailQueue(limit = 50, runner: Queryable = db()): Pro
      ), bumped AS (
        UPDATE email_messages SET attempts = attempts + 1
         WHERE id IN (SELECT id FROM claimed)
-        RETURNING id, tenant_id, to_email, subject, html, text, created_at
+        RETURNING id, tenant_id, to_email, subject, html, text, attempts,
+                  unsubscribe_url, created_at
      )
-     SELECT id, tenant_id, to_email, subject, html, text FROM bumped ORDER BY created_at`,
+     SELECT id, tenant_id, to_email, subject, html, text, attempts, unsubscribe_url
+       FROM bumped ORDER BY created_at`,
     [limit],
   );
 
@@ -152,12 +192,25 @@ export async function flushEmailQueue(limit = 50, runner: Queryable = db()): Pro
   let sent = 0;
 
   for (const message of rows) {
+    // Checked at send time rather than at queue time: an address can be
+    // suppressed between being queued and being sent, and the whole point of
+    // a suppression list is that nothing gets past it.
+    const blocked = await isSuppressed(message.tenant_id, message.to_email, runner);
+    if (blocked) {
+      await runner.query(
+        `UPDATE email_messages SET status = 'suppressed', error = $2 WHERE id = $1`,
+        [message.id, `Address suppressed: ${blocked.reason}`],
+      );
+      continue;
+    }
+
     try {
       const { providerId } = await sender.send({
         to: message.to_email,
         subject: message.subject,
         html: message.html,
         text: message.text,
+        headers: unsubscribeHeaders(message.unsubscribe_url),
       });
       await runner.query(
         `UPDATE email_messages SET status = 'sent', sent_at = now(), provider_id = $2, error = NULL
@@ -167,18 +220,52 @@ export async function flushEmailQueue(limit = 50, runner: Queryable = db()): Pro
       sent += 1;
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
-      // Give up after 5 tries rather than retrying a hard bounce forever.
+
+      // Classify before deciding to retry: a mailbox that does not exist will
+      // not start existing on the fourth attempt, and four more tries at it is
+      // four more bounces against the sending domain's reputation.
+      const type = await recordFailure(
+        message.tenant_id,
+        message.to_email,
+        reason,
+        message.attempts,
+        MAX_SEND_ATTEMPTS,
+        runner,
+      );
+
+      const giveUp = type !== 'soft' || message.attempts >= MAX_SEND_ATTEMPTS;
       await runner.query(
         `UPDATE email_messages
-            SET status = CASE WHEN attempts >= 5 THEN 'failed' ELSE 'queued' END,
-                error = $2
+            SET status = $3, error = $2, bounce_type = $4
           WHERE id = $1`,
-        [message.id, reason.slice(0, 500)],
+        [message.id, reason.slice(0, 500), giveUp ? 'failed' : 'queued', type],
       );
     }
   }
 
   return sent;
+}
+
+const MAX_SEND_ATTEMPTS = 5;
+
+/**
+ * RFC 8058 one-click unsubscribe.
+ *
+ * `List-Unsubscribe-Post` is what makes the mail client's own unsubscribe
+ * button work without the recipient visiting anything, and Gmail and Yahoo
+ * both require it from bulk senders. Sending the header without it is worse
+ * than useless: the client shows the button and the POST it makes is ignored.
+ *
+ * Only added when the message carries an unsubscribe token, which means it
+ * belongs to a list subscription. Transactional mail has nothing to
+ * unsubscribe from.
+ */
+export function unsubscribeHeaders(url: string | null): Record<string, string> | undefined {
+  if (!url) return undefined;
+  return {
+    'List-Unsubscribe': `<${url}>`,
+    'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

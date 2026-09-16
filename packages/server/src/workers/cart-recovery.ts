@@ -7,6 +7,7 @@ import {
   type RecoveryCandidate,
 } from '../services/carts.js';
 import { getTemplate, queueEmail, renderTemplate, senderFor } from '../services/email.js';
+import { shouldTrack } from '../services/email-tracking.js';
 import { fire } from '../services/automations.js';
 import { getTenantById } from '../services/tenants.js';
 import { getContact } from '../services/contacts.js';
@@ -70,13 +71,14 @@ async function queueRecoveryEmail(cart: RecoveryCandidate): Promise<boolean> {
   if (!template) return false;
 
   const base = config().publicUrl;
+  const unsubscribeUrl = `${base}/n/unsubscribe-request?t=${tenant.id}&email=${encodeURIComponent(cart.email)}`;
   const rendered = renderTemplate(template, {
     tenant_name: tenant.name,
     name: cart.contact_name ?? '',
     item_count: cart.item_count,
     subtotal: formatMoney(cart.subtotal_cents, cart.currency),
     recovery_url: `${base}/c/${cart.recovery_token}`,
-    unsubscribe_url: `${base}/n/unsubscribe-request?t=${tenant.id}&email=${encodeURIComponent(cart.email)}`,
+    unsubscribe_url: unsubscribeUrl,
   });
 
   const result = await queueEmail({
@@ -88,6 +90,11 @@ async function queueRecoveryEmail(cart: RecoveryCandidate): Promise<boolean> {
     html: rendered.html,
     text: rendered.text,
     dedupeKey: `cart_recovery:${cart.id}:${stage}`,
+    // Recovery mail is marketing: it gets tracked and it carries a one-click
+    // unsubscribe header, because "stop reminding me about my cart" is exactly
+    // the request the header exists to serve.
+    track: shouldTrack(tenant),
+    unsubscribeUrl,
     ...senderFor(tenant),
   });
 
