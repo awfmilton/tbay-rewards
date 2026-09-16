@@ -228,6 +228,52 @@ export async function redeemPointsForTokens(
 }
 
 /**
+ * Announce a settled claim.
+ *
+ * `token.claimed` was a declared trigger type nothing ever fired, so "email
+ * them when their tokens land" could not be built. Both paths that mark a
+ * claim settled — the treasury transfer and the on-chain nonce sweep — come
+ * through here, so neither can quietly skip it.
+ *
+ * Never allowed to throw: the tokens are already delivered by this point, and
+ * a broken automation must not turn a successful redemption into an error.
+ */
+async function announceClaimed(
+  tenantId: string,
+  claim: Pick<TokenClaim, 'id' | 'contact_id' | 'token_amount_wei'> & { tx_hash?: string | null },
+  runner: Queryable = db(),
+): Promise<void> {
+  try {
+    const { fire } = await import('./automations.js');
+    const { getContact } = await import('./contacts.js');
+    await fire(
+      tenantId,
+      'token.claimed',
+      {
+        contact: claim.contact_id ? await getContact(tenantId, claim.contact_id, runner) : null,
+        data: {
+          claim_id: claim.id,
+          amount_wei: claim.token_amount_wei,
+          amount_tokens: weiToTokenString(BigInt(claim.token_amount_wei)),
+          tx_hash: claim.tx_hash ?? null,
+        },
+        dedupeKey: `claim:${claim.id}`,
+      },
+      runner,
+    );
+  } catch (err) {
+    console.error(
+      JSON.stringify({
+        level: 'error',
+        msg: 'token.claimed automation failed after a successful claim',
+        claim_id: claim.id,
+        err: err instanceof Error ? err.message : String(err),
+      }),
+    );
+  }
+}
+
+/**
  * Send a treasury-funded redemption and settle the record either way.
  *
  * On failure the points are returned and the budget released, so a treasury
@@ -246,6 +292,7 @@ async function deliverFromTreasury(
         WHERE id = $1`,
       [result.claim.id, txHash],
     );
+    await announceClaimed(tenantId, { ...result.claim, tx_hash: txHash });
     return { ...result, txHash, claim: { ...result.claim, status: 'claimed', tx_hash: txHash } };
   } catch (err) {
     await db().query(`UPDATE token_claims SET status = 'cancelled' WHERE id = $1`, [
@@ -466,11 +513,16 @@ export async function reconcileClaims(limit = 100, runner: Queryable = db()): Pr
       continue;
     }
     if (!used) continue;
-    await runner.query(
+    const { rowCount } = await runner.query(
       `UPDATE token_claims SET status = 'claimed', claimed_at = now()
         WHERE id = $1 AND status IN ('signed', 'expired')`,
       [claim.id],
     );
+    // Only announce a claim this pass actually settled, so a repeated sweep
+    // does not re-fire for vouchers already handled.
+    if ((rowCount ?? 0) > 0) {
+      await announceClaimed(claim.tenant_id, claim, runner);
+    }
     settled += 1;
   }
   return settled;

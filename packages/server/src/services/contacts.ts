@@ -283,8 +283,17 @@ function assertIdentityUnchanged(
   }
 }
 
-export async function getContact(tenantId: string, contactId: string): Promise<Contact | null> {
-  return queryOne<Contact>(db(), 'SELECT * FROM contacts WHERE tenant_id = $1 AND id = $2', [
+/**
+ * Takes an optional runner so callers inside a transaction see their own
+ * uncommitted writes — a contact created and awarded in one transaction would
+ * otherwise read back as null from a separate pool connection.
+ */
+export async function getContact(
+  tenantId: string,
+  contactId: string,
+  runner: Queryable = db(),
+): Promise<Contact | null> {
+  return queryOne<Contact>(runner, 'SELECT * FROM contacts WHERE tenant_id = $1 AND id = $2', [
     tenantId,
     contactId,
   ]);

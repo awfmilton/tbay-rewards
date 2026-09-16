@@ -243,29 +243,89 @@ export async function getTemplate(
   tenantId: string,
   key: string,
   runner: Queryable = db(),
-): Promise<{ subject: string; html: string; text: string | null } | null> {
-  const row = await queryOne<{ subject: string; html: string; text: string | null }>(
+): Promise<EmailTemplate | null> {
+  const row = await queryOne<EmailTemplate>(
     runner,
-    'SELECT subject, html, text FROM email_templates WHERE tenant_id = $1 AND key = $2',
+    'SELECT subject, html, text, transactional FROM email_templates WHERE tenant_id = $1 AND key = $2',
     [tenantId, key],
   );
-  return row ?? DEFAULT_TEMPLATES[key] ?? null;
+  if (row) return row;
+  const fallback = DEFAULT_TEMPLATES[key];
+  if (!fallback) return null;
+  return { ...fallback, transactional: fallback.transactional ?? false };
+}
+
+export interface EmailTemplate {
+  subject: string;
+  html: string;
+  text: string | null;
+  /** True means consent is not required; see `upsertTemplate`. */
+  transactional: boolean;
 }
 
 export async function upsertTemplate(
   tenantId: string,
   key: string,
-  template: { subject: string; html: string; text?: string | null },
+  template: {
+    subject: string;
+    html: string;
+    text?: string | null;
+    /**
+     * Send this even to contacts without marketing consent.
+     *
+     * A transactional message is one the person's own action asked for — an
+     * order receipt, the points that order earned. Marketing is anything they
+     * did not ask for, and stays consent-gated. Default false: opting a
+     * template out of consent is a decision the retailer makes on purpose.
+     */
+    transactional?: boolean;
+  },
   runner: Queryable = db(),
 ): Promise<void> {
   await runner.query(
-    `INSERT INTO email_templates (tenant_id, key, subject, html, text)
-     VALUES ($1, $2, $3, $4, $5)
+    `INSERT INTO email_templates (tenant_id, key, subject, html, text, transactional)
+     VALUES ($1, $2, $3, $4, $5, $6)
      ON CONFLICT (tenant_id, key) DO UPDATE SET
        subject = EXCLUDED.subject, html = EXCLUDED.html,
-       text = EXCLUDED.text, updated_at = now()`,
-    [tenantId, key, template.subject, template.html, template.text ?? null],
+       text = EXCLUDED.text, transactional = EXCLUDED.transactional, updated_at = now()`,
+    [tenantId, key, template.subject, template.html, template.text ?? null, template.transactional ?? false],
   );
+}
+
+export async function deleteTemplate(
+  tenantId: string,
+  key: string,
+  runner: Queryable = db(),
+): Promise<boolean> {
+  const { rowCount } = await runner.query(
+    'DELETE FROM email_templates WHERE tenant_id = $1 AND key = $2',
+    [tenantId, key],
+  );
+  return (rowCount ?? 0) > 0;
+}
+
+/** Templates a retailer has overridden, plus the built-in defaults. */
+export async function listTemplates(
+  tenantId: string,
+  runner: Queryable = db(),
+): Promise<Array<{ key: string; subject: string; transactional: boolean; overridden: boolean }>> {
+  const { rows } = await runner.query<{ key: string; subject: string; transactional: boolean }>(
+    'SELECT key, subject, transactional FROM email_templates WHERE tenant_id = $1',
+    [tenantId],
+  );
+  const overrides = new Map(rows.map((row) => [row.key, row]));
+  const keys = new Set([...Object.keys(DEFAULT_TEMPLATES), ...overrides.keys()]);
+
+  return [...keys].sort().map((key) => {
+    const override = overrides.get(key);
+    const fallback = DEFAULT_TEMPLATES[key];
+    return {
+      key,
+      subject: override?.subject ?? fallback?.subject ?? '',
+      transactional: override?.transactional ?? fallback?.transactional ?? false,
+      overridden: override !== undefined,
+    };
+  });
 }
 
 export function senderFor(tenant: Tenant): { fromName: string; fromAddress: string } {
@@ -293,7 +353,10 @@ function layout(body: string): string {
 </body></html>`;
 }
 
-export const DEFAULT_TEMPLATES: Record<string, { subject: string; html: string; text: string | null }> = {
+export const DEFAULT_TEMPLATES: Record<
+  string,
+  { subject: string; html: string; text: string | null; transactional?: boolean }
+> = {
   newsletter_confirm: {
     subject: 'Confirm your subscription to {{tenant_name}}',
     html: layout(`
@@ -368,5 +431,9 @@ export const DEFAULT_TEMPLATES: Record<string, { subject: string; html: string; 
       <p style="margin:0;"><a href="{{rewards_url}}" style="display:inline-block;background:#1d1d1f;
          color:#ffffff;text-decoration:none;padding:12px 22px;border-radius:8px;font-size:15px;">View your rewards</a></p>`),
     text: null,
+    // The points are the receipt for something the person just did, so this
+    // ships transactional by default. A retailer who reads it as marketing can
+    // flip the flag on their own copy of the template.
+    transactional: true,
   },
 };

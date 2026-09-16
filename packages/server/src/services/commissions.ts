@@ -5,6 +5,7 @@ import { getLinkByCode, type Link } from './links.js';
 import { markCartConverted } from './carts.js';
 import { bumpProductStat } from './products.js';
 import { trigger } from './rewards.js';
+import { applyProductOverrides, listProductRules } from './product-rules.js';
 import { upsertContact } from './contacts.js';
 import type { Tenant } from './tenants.js';
 
@@ -16,6 +17,8 @@ export interface OrderItem {
   subtotalCents: number;
   /** Optional per-item override, e.g. a product excluded from commission. */
   commissionRateBps?: number | null;
+  /** Category slugs/ids, so per-category reward overrides can match. */
+  categoryRefs?: string[];
 }
 
 export interface OrderInput {
@@ -162,6 +165,13 @@ export async function recordOrder(
 
     let pointsAwarded = 0;
     if (contactId) {
+      // Per-product and per-category overrides reshape the order before the
+      // rate is applied: a line can be excluded, scaled, or replaced with a
+      // flat per-unit award. With nothing configured this is the subtotal and
+      // zero bonus, i.e. exactly the old behaviour.
+      const overrides = await listProductRules(tenant.id, 'purchase', client);
+      const shaped = applyProductOverrides(input.items ?? [], overrides, subtotal);
+
       const outcome = await trigger(
         tenant.id,
         {
@@ -169,8 +179,15 @@ export async function recordOrder(
           ruleKey: 'purchase',
           refId: input.orderRef,
           refType: 'order',
-          valueCents: subtotal,
-          meta: { order_ref: input.orderRef, currency },
+          valueCents: shaped.eligibleCents,
+          bonusPoints: shaped.fixedPoints,
+          meta: {
+            order_ref: input.orderRef,
+            currency,
+            ...(overrides.length > 0
+              ? { subtotal_cents: subtotal, overrides: shaped.breakdown }
+              : {}),
+          },
         },
         client,
       );

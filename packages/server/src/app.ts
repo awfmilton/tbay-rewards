@@ -10,6 +10,7 @@ import { redirectRoutes } from './routes/redirect.js';
 import { apiRoutes } from './routes/api.js';
 import { reportRoutes } from './routes/reports.js';
 import { gamificationRoutes } from './routes/gamification.js';
+import { registerAdminRoutes } from './routes/admin.js';
 import { healthRoutes } from './routes/health.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -70,6 +71,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(apiRoutes);
   await app.register(reportRoutes);
   await app.register(gamificationRoutes);
+  await app.register(registerAdminRoutes);
 
   // The tracker is served from the API so retailers embed one stable URL and
   // pick up fixes without redeploying their site.

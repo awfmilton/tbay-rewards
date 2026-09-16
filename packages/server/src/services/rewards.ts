@@ -1,6 +1,7 @@
 import { db, queryOne, withTransaction, type Queryable } from '../db/pool.js';
 import { ApiError } from '../lib/errors.js';
 import { award, getBalance, type AwardResult, type Balance } from './points.js';
+import { isExcluded } from './exclusions.js';
 
 export interface RewardRule {
   id: string;
@@ -13,17 +14,44 @@ export interface RewardRule {
   points_per_unit: string;
   cooldown_seconds: number;
   daily_cap: number | null;
+  weekly_cap: number | null;
+  monthly_cap: number | null;
   lifetime_cap: number | null;
+  /** Clamp on a single award, however the amount was calculated. */
+  max_per_award: number | null;
   hold_seconds: number;
   requires_verification: boolean;
+  /** Admin-editable ledger wording; falls back to the rule name. */
+  log_template: string | null;
   config: Record<string, unknown>;
   enabled: boolean;
 }
 
-/** The reward rules every new retailer starts with. */
+/** Cap windows, in the order they are checked. */
+const CAP_WINDOWS = [
+  { column: 'daily_cap', unit: 'day', reason: 'daily_cap' },
+  { column: 'weekly_cap', unit: 'week', reason: 'weekly_cap' },
+  { column: 'monthly_cap', unit: 'month', reason: 'monthly_cap' },
+] as const;
+
+/**
+ * The reward rules every new retailer starts with.
+ *
+ * The optional controls (the wider cap windows, the per-award clamp, the log
+ * template) are left unset here on purpose: a fresh tenant should behave
+ * exactly as the defaults read, and an admin opts into each knob.
+ */
 export const DEFAULT_RULES: Array<Omit<RewardRule,
   'id' | 'tenant_id' | 'points_per_unit' | 'config' | 'enabled'
-> & { points_per_unit?: number; config?: Record<string, unknown> }> = [
+  | 'weekly_cap' | 'monthly_cap' | 'max_per_award' | 'log_template'
+> & {
+  points_per_unit?: number;
+  config?: Record<string, unknown>;
+  weekly_cap?: number | null;
+  monthly_cap?: number | null;
+  max_per_award?: number | null;
+  log_template?: string | null;
+}> = [
   {
     key: 'newsletter_signup',
     name: 'Confirmed newsletter signup',
@@ -169,9 +197,10 @@ export async function upsertRule(
     runner,
     `INSERT INTO reward_rules (
        tenant_id, key, name, event_key, mode, points, points_per_unit,
-       cooldown_seconds, daily_cap, lifetime_cap, hold_seconds,
+       cooldown_seconds, daily_cap, weekly_cap, monthly_cap, lifetime_cap,
+       max_per_award, log_template, hold_seconds,
        requires_verification, config, enabled
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14)
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17::jsonb, $18)
      ON CONFLICT (tenant_id, key) DO UPDATE SET
        name = COALESCE(EXCLUDED.name, reward_rules.name),
        event_key = COALESCE(EXCLUDED.event_key, reward_rules.event_key),
@@ -179,8 +208,14 @@ export async function upsertRule(
        points = COALESCE(EXCLUDED.points, reward_rules.points),
        points_per_unit = COALESCE(EXCLUDED.points_per_unit, reward_rules.points_per_unit),
        cooldown_seconds = COALESCE(EXCLUDED.cooldown_seconds, reward_rules.cooldown_seconds),
+       -- Caps are nullable by design: passing null is how an admin *removes*
+       -- a cap, so these cannot use COALESCE like the others.
        daily_cap = EXCLUDED.daily_cap,
+       weekly_cap = EXCLUDED.weekly_cap,
+       monthly_cap = EXCLUDED.monthly_cap,
        lifetime_cap = EXCLUDED.lifetime_cap,
+       max_per_award = EXCLUDED.max_per_award,
+       log_template = EXCLUDED.log_template,
        hold_seconds = COALESCE(EXCLUDED.hold_seconds, reward_rules.hold_seconds),
        requires_verification = COALESCE(EXCLUDED.requires_verification, reward_rules.requires_verification),
        config = COALESCE(EXCLUDED.config, reward_rules.config),
@@ -197,7 +232,11 @@ export async function upsertRule(
       rule.points_per_unit ?? 0,
       rule.cooldown_seconds ?? 0,
       rule.daily_cap ?? null,
+      rule.weekly_cap ?? null,
+      rule.monthly_cap ?? null,
       rule.lifetime_cap ?? null,
+      rule.max_per_award ?? null,
+      rule.log_template ?? null,
       rule.hold_seconds ?? 0,
       rule.requires_verification ?? false,
       JSON.stringify(rule.config ?? {}),
@@ -215,6 +254,8 @@ export interface TriggerInput {
   refType?: string;
   /** For per_currency_unit rules: the order value in cents. */
   valueCents?: number;
+  /** Points from `fixed` per-product overrides, added on top of the rate. */
+  bonusPoints?: number;
   meta?: Record<string, unknown>;
 }
 
@@ -222,9 +263,73 @@ export type TriggerOutcome =
   | { awarded: true; points: number; result: AwardResult; balance: Balance }
   | {
       awarded: false;
-      reason: 'rule_missing' | 'rule_disabled' | 'cooldown' | 'daily_cap' | 'lifetime_cap' | 'zero_points';
+      reason:
+        | 'rule_missing'
+        | 'rule_disabled'
+        | 'cooldown'
+        | 'daily_cap'
+        | 'weekly_cap'
+        | 'monthly_cap'
+        | 'lifetime_cap'
+        | 'zero_points'
+        | 'excluded';
+      /** Which exclusion matched, for the admin who has to explain it. */
+      detail?: string | null;
       balance: Balance;
     };
+
+/** Cache tenant timezones: `trigger` runs on every order and every share. */
+const timezoneCache = new Map<string, { zone: string; at: number }>();
+const TIMEZONE_TTL_MS = 60_000;
+
+async function tenantTimezone(tenantId: string, runner: Queryable): Promise<string> {
+  const hit = timezoneCache.get(tenantId);
+  if (hit && Date.now() - hit.at < TIMEZONE_TTL_MS) return hit.zone;
+
+  const row = await queryOne<{ timezone: string | null }>(
+    runner,
+    'SELECT timezone FROM tenants WHERE id = $1',
+    [tenantId],
+  );
+  // Postgres rejects an unknown zone name at query time, which would turn a
+  // typo in a settings field into a failed award. Verify once, here.
+  let zone = row?.timezone?.trim() || 'UTC';
+  try {
+    await runner.query('SELECT now() AT TIME ZONE $1', [zone]);
+  } catch {
+    zone = 'UTC';
+  }
+  timezoneCache.set(tenantId, { zone, at: Date.now() });
+  return zone;
+}
+
+/** Exposed so a tenant's timezone change takes effect without a restart. */
+export function forgetTimezone(tenantId?: string): void {
+  if (tenantId) timezoneCache.delete(tenantId);
+  else timezoneCache.clear();
+}
+
+/**
+ * The wording that lands in the customer's history.
+ *
+ * myCred lets an admin write this per hook with %amount% style tags, which is
+ * how a store makes its history read like its own voice rather than ours.
+ */
+export function renderLogTemplate(
+  rule: RewardRule,
+  points: number,
+  input: Pick<TriggerInput, 'refId' | 'refType' | 'valueCents'>,
+): string {
+  const template = rule.log_template?.trim();
+  if (!template) return rule.name;
+  return template
+    .replace(/%amount%/g, String(points))
+    .replace(/%rule%/g, rule.name)
+    .replace(/%ref%/g, input.refId ?? '')
+    .replace(/%ref_type%/g, input.refType ?? '')
+    .replace(/%value%/g, ((input.valueCents ?? 0) / 100).toFixed(2))
+    .slice(0, 300);
+}
 
 /**
  * Apply one reward rule to one contact.
@@ -242,7 +347,26 @@ export async function trigger(
     if (!rule) return { awarded: false, reason: 'rule_missing', balance: await getBalance(tenantId, input.contactId, client) };
     if (!rule.enabled) return { awarded: false, reason: 'rule_disabled', balance: await getBalance(tenantId, input.contactId, client) };
 
-    const points = pointsFor(rule, input.valueCents);
+    // Excluded before anything else is computed: staff and test accounts
+    // should not appear in cooldown state, cap totals or the ledger at all.
+    const exclusion = await isExcluded(tenantId, input.contactId, client);
+    if (exclusion.excluded) {
+      return {
+        awarded: false,
+        reason: 'excluded',
+        detail: exclusion.reason,
+        balance: await getBalance(tenantId, input.contactId, client),
+      };
+    }
+
+    let points = pointsFor(rule, input.valueCents) + Math.max(0, input.bonusPoints ?? 0);
+
+    // myCred's enforce_max(): clamp the award however the amount arrived, so a
+    // mis-keyed order total cannot hand someone the whole budget.
+    if (rule.max_per_award !== null && rule.max_per_award !== undefined) {
+      points = Math.min(points, rule.max_per_award);
+    }
+
     if (points <= 0) {
       return { awarded: false, reason: 'zero_points', balance: await getBalance(tenantId, input.contactId, client) };
     }
@@ -268,17 +392,28 @@ export async function trigger(
       }
     }
 
-    if (rule.daily_cap !== null) {
-      const today = await queryOne<{ total: string }>(
+    // Day, week and month boundaries are the retailer's, not the server's.
+    // A shop in Thunder Bay rolling over its daily cap at 20:00 local because
+    // the database runs UTC is a support ticket every single evening.
+    const zone = await tenantTimezone(tenantId, client);
+
+    for (const window of CAP_WINDOWS) {
+      const cap = rule[window.column];
+      if (cap === null || cap === undefined) continue;
+      const used = await queryOne<{ total: string }>(
         client,
         `SELECT COALESCE(SUM(delta_points), 0) AS total FROM points_ledger
           WHERE tenant_id = $1 AND contact_id = $2 AND rule_key = $3
             AND status <> 'reversed'
-            AND created_at >= date_trunc('day', now())`,
-        [tenantId, input.contactId, rule.key],
+            AND created_at >= (date_trunc($4, now() AT TIME ZONE $5) AT TIME ZONE $5)`,
+        [tenantId, input.contactId, rule.key, window.unit, zone],
       );
-      if (Number(today?.total ?? 0) + points > rule.daily_cap) {
-        return { awarded: false, reason: 'daily_cap', balance: await getBalance(tenantId, input.contactId, client) };
+      if (Number(used?.total ?? 0) + points > cap) {
+        return {
+          awarded: false,
+          reason: window.reason,
+          balance: await getBalance(tenantId, input.contactId, client),
+        };
       }
     }
 
@@ -299,7 +434,7 @@ export async function trigger(
       {
         contactId: input.contactId,
         points,
-        reason: rule.name,
+        reason: renderLogTemplate(rule, points, input),
         ruleKey: rule.key,
         refType: input.refType ?? 'reward_rule',
         refId: input.refId,
@@ -317,6 +452,34 @@ export async function trigger(
       const gamification = await import('./gamification.js');
       await gamification.evaluateBadges(tenantId, input.contactId, client);
       await gamification.evaluateRank(tenantId, input.contactId, client);
+
+      // `points.awarded` used to fire only from the /v1/rewards/trigger route,
+      // so an automation on it never saw points from an order, an opt-in, a
+      // share or a referral — which is nearly all of them. Firing here covers
+      // every path that awards through a rule.
+      //
+      // No recursion: the `award_points` action calls `award()` directly, not
+      // this function, so an automation cannot re-enter its own trigger.
+      const automations = await import('./automations.js');
+      const contacts = await import('./contacts.js');
+      await automations.fire(
+        tenantId,
+        'points.awarded',
+        {
+          contact: await contacts.getContact(tenantId, input.contactId, client),
+          data: {
+            points,
+            rule_key: rule.key,
+            reason: rule.name,
+            balance: result.balance.balance,
+            lifetime_earned: result.balance.lifetime_earned,
+            ref_id: input.refId,
+            ref_type: input.refType ?? 'reward_rule',
+          },
+          dedupeKey: `rule:${rule.key}:${input.refId}`,
+        },
+        client,
+      );
     }
 
     return { awarded: true, points, result, balance: result.balance };
