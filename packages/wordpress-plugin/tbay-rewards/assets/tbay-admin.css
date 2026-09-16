@@ -1,0 +1,118 @@
+/*
+ * Admin screens.
+ *
+ * Deliberately plain: these sit inside wp-admin, so they inherit its type and
+ * colour and only add what WordPress has no class for. A storefront-styled
+ * admin page looks broken next to every other screen the shop owner uses.
+ */
+
+.tbay-manage h2 {
+	margin-top: 2em;
+}
+
+.tbay-search,
+.tbay-filters,
+.tbay-inline-form {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: .5rem;
+	margin: 1em 0;
+}
+
+.tbay-inline-form .description,
+.tbay-filters .description {
+	/* Full width under the controls rather than squeezed between them. */
+	flex-basis: 100%;
+	margin: .25rem 0 0;
+}
+
+.tbay-row-form {
+	display: flex;
+	align-items: center;
+	gap: .35rem;
+	margin: 0;
+}
+
+.tbay-cards {
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr));
+	gap: .75rem;
+	margin: 1.5em 0;
+}
+
+.tbay-card {
+	display: flex;
+	flex-direction: column;
+	gap: .15rem;
+	padding: .9rem 1rem;
+	background: #fff;
+	border: 1px solid #c3c4c7;
+	border-radius: 4px;
+}
+
+.tbay-card__value {
+	font-size: 1.4rem;
+	font-weight: 600;
+	line-height: 1.2;
+}
+
+.tbay-card__label {
+	font-size: .8rem;
+	color: #50575e;
+}
+
+.tbay-num {
+	text-align: right;
+	/* Tabular figures so a column of numbers lines up on the decimal. */
+	font-variant-numeric: tabular-nums;
+}
+
+.tbay-negative {
+	color: #b32d2e;
+}
+
+.tbay-error {
+	color: #b32d2e;
+	font-size: .85em;
+}
+
+.tbay-kind {
+	display: inline-block;
+	margin-right: .4rem;
+	padding: .1rem .4rem;
+	border-radius: 3px;
+	background: #f0f0f1;
+	color: #50575e;
+	font-size: .75rem;
+	text-transform: uppercase;
+	letter-spacing: .02em;
+}
+
+.tbay-kind--order          { background: #d5f5e3; color: #14532d; }
+.tbay-kind--points         { background: #dbeafe; color: #1e3a8a; }
+.tbay-kind--cart_abandoned { background: #fef3c7; color: #78350f; }
+.tbay-kind--email_sent,
+.tbay-kind--email_opened,
+.tbay-kind--email_clicked  { background: #ede9fe; color: #4c1d95; }
+.tbay-kind--badge,
+.tbay-kind--rank           { background: #fce7f3; color: #831843; }
+
+.tbay-timeline td {
+	vertical-align: top;
+}
+
+/* The tables carry a lot of columns; let them scroll rather than crush. */
+@media (max-width: 782px) {
+	.tbay-manage .widefat {
+		display: block;
+		overflow-x: auto;
+	}
+
+	.tbay-search input[type="search"],
+	.tbay-filters input,
+	.tbay-inline-form input[type="text"],
+	.tbay-inline-form input[type="email"] {
+		flex: 1 1 100%;
+	}
+}
