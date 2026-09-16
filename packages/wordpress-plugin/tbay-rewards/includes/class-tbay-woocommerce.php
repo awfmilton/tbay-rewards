@@ -54,6 +54,14 @@ class TBAY_Rewards_WooCommerce {
 		add_action( 'user_register', array( $this, 'sync_new_user' ) );
 		add_action( 'woocommerce_created_customer', array( $this, 'sync_new_user' ) );
 
+		// Product reviews. The `review` reward rule shipped from day one and
+		// nothing ever fired it, so a store that advertised points for reviews
+		// awarded none. Both hooks matter: comment_post covers a review posted
+		// straight through, transition_comment_status covers one held for
+		// moderation and approved later.
+		add_action( 'comment_post', array( $this, 'maybe_reward_review' ), 20, 3 );
+		add_action( 'transition_comment_status', array( $this, 'reward_review_on_approval' ), 20, 3 );
+
 		// Product markup the tracker reads for click attribution.
 		add_action( 'woocommerce_before_shop_loop_item', array( $this, 'open_product_wrapper' ), 5 );
 		add_action( 'woocommerce_after_shop_loop_item', array( $this, 'close_product_wrapper' ), 100 );
@@ -510,6 +518,87 @@ class TBAY_Rewards_WooCommerce {
 	 */
 	public function sync_new_user( int $user_id ): void {
 		$this->api->sync_user( $user_id );
+	}
+
+	/**
+	 * Award review points when a review is posted already approved.
+	 *
+	 * @param int        $comment_id  The new comment.
+	 * @param int|string $approved    1, 0 or 'spam'.
+	 * @param array      $commentdata Raw comment data.
+	 */
+	public function maybe_reward_review( int $comment_id, $approved, array $commentdata ): void {
+		if ( 1 !== (int) $approved ) {
+			return; // Held for moderation; the transition hook picks it up.
+		}
+		$this->reward_review( $comment_id );
+	}
+
+	/**
+	 * Award review points when a held review is approved.
+	 *
+	 * @param string     $new_status New comment status.
+	 * @param string     $old_status Previous comment status.
+	 * @param WP_Comment $comment    The comment.
+	 */
+	public function reward_review_on_approval( $new_status, $old_status, $comment ): void {
+		if ( 'approved' !== $new_status || 'approved' === $old_status ) {
+			return;
+		}
+		if ( ! $comment instanceof WP_Comment ) {
+			return;
+		}
+		$this->reward_review( (int) $comment->comment_ID );
+	}
+
+	/**
+	 * Fire the `review` rule for one approved product review.
+	 *
+	 * Only genuine product reviews count — a blog comment is not a review —
+	 * and only from a logged-in customer, because an anonymous review has no
+	 * account to credit. The comment id is the reference, so the platform's
+	 * idempotency key makes an approve/unapprove/re-approve cycle award once.
+	 * Caps and cooldowns are the rule's business, not this hook's.
+	 */
+	private function reward_review( int $comment_id ): void {
+		$comment = get_comment( $comment_id );
+		if ( ! $comment instanceof WP_Comment ) {
+			return;
+		}
+
+		// WooCommerce stores reviews as comments on a product post.
+		if ( 'review' !== $comment->comment_type && 'product' !== get_post_type( $comment->comment_post_ID ) ) {
+			return;
+		}
+
+		// A reply to a review is not a review.
+		if ( (int) $comment->comment_parent > 0 ) {
+			return;
+		}
+
+		$user_id = (int) $comment->user_id;
+		if ( $user_id <= 0 ) {
+			return;
+		}
+
+		$contact_id = $this->api->contact_id_for_user( $user_id );
+		if ( null === $contact_id ) {
+			return;
+		}
+
+		$this->api->post(
+			'/v1/rewards/trigger',
+			array(
+				'contactId' => $contact_id,
+				'ruleKey'   => 'review',
+				'refId'     => 'review-' . $comment_id,
+				'meta'      => array(
+					'comment_id' => $comment_id,
+					'product_id' => (int) $comment->comment_post_ID,
+					'rating'     => (int) get_comment_meta( $comment_id, 'rating', true ),
+				),
+			)
+		);
 	}
 
 	public function open_product_wrapper(): void {

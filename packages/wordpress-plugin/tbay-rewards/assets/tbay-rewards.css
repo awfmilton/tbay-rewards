@@ -740,3 +740,104 @@
 	.tbay-stat,
 	.tbay-badge { border: 1px solid CanvasText; }
 }
+
+/* ── Notification toasts ────────────────────────────────────────────────────
+ *
+ * Badge and rank notifications the platform has always recorded and the
+ * storefront never showed. Fixed to the corner on a desktop, full width along
+ * the bottom on a phone where a corner card would cover the thumb reach.
+ */
+
+.tbay-toasts {
+	position: fixed;
+	/* Above the theme's sticky header (z-index 100) but below any modal. */
+	z-index: 900;
+	right: 1rem;
+	bottom: 1rem;
+	display: flex;
+	flex-direction: column;
+	gap: .5rem;
+	width: min(22rem, calc(100vw - 2rem));
+	/* The strip itself must never intercept clicks on the page behind it. */
+	pointer-events: none;
+	transition: opacity .35s ease, transform .35s ease;
+}
+
+.tbay-toasts--out {
+	opacity: 0;
+	transform: translateY(.5rem);
+}
+
+.tbay-toast {
+	pointer-events: auto;
+	position: relative;
+	display: flex;
+	flex-direction: column;
+	gap: .15rem;
+	padding: .8rem 2.2rem .8rem .9rem;
+	border: 1px solid var(--tbay-border);
+	border-left: 3px solid var(--tbay-primary);
+	border-radius: .6rem;
+	background: var(--tbay-surface-2);
+	box-shadow: 0 8px 30px rgba(0, 0, 0, .45);
+	color: var(--tbay-text);
+	animation: tbay-toast-in .35s ease both;
+}
+
+.tbay-toast--rank_up   { border-left-color: var(--tbay-gold); }
+.tbay-toast--badge_earned { border-left-color: var(--tbay-primary); }
+
+.tbay-toast__title {
+	font-family: var(--tbay-font-display);
+	font-size: .95rem;
+	line-height: 1.3;
+}
+
+.tbay-toast__body {
+	font-size: .85rem;
+	line-height: 1.45;
+	color: var(--tbay-text-muted);
+}
+
+.tbay-toast__close {
+	position: absolute;
+	top: .35rem;
+	right: .35rem;
+	/* 44px target even though the glyph is small — this is a dismiss control
+	 * sitting next to nothing else, and a near-miss re-reads as a page tap. */
+	width: 2.75rem;
+	height: 2.75rem;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	border: 0;
+	background: none;
+	color: var(--tbay-text-muted);
+	font-size: 1.25rem;
+	line-height: 1;
+	cursor: pointer;
+}
+
+.tbay-toast__close:hover,
+.tbay-toast__close:focus-visible {
+	color: var(--tbay-text);
+}
+
+@keyframes tbay-toast-in {
+	from { opacity: 0; transform: translateY(.75rem); }
+	to   { opacity: 1; transform: none; }
+}
+
+@media (max-width: 480px) {
+	.tbay-toasts {
+		right: .75rem;
+		left: .75rem;
+		bottom: .75rem;
+		width: auto;
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.tbay-toast { animation: none; }
+	.tbay-toasts { transition: none; }
+}

@@ -502,13 +502,10 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
       meta: input.meta,
     });
 
-    if (outcome.awarded) {
-      await fire(tenant.id, 'points.awarded', {
-        contact,
-        data: { points: outcome.points, reason: input.ruleKey, balance: outcome.balance.balance },
-        dedupeKey: `points:${input.ruleKey}:${input.refId}`,
-      });
-    }
+    // No fire() here: `trigger()` raises points.awarded itself for every path
+    // that awards through a rule. Doing it again would run each automation
+    // twice for this route's awards — the two dedupe keys differ, so the
+    // automation_runs unique index would not catch it.
 
     return outcome.awarded
       ? { awarded: true, points: outcome.points, balance: outcome.balance }
