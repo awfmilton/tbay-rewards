@@ -7,6 +7,7 @@ import { expireStaleShares } from '../services/shares.js';
 import { expireStaleClaims, reconcileClaims } from '../services/token.js';
 import { purgeExpiredChallenges } from '../services/wallets.js';
 import { buildAllSegments } from '../services/segments.js';
+import { runDueBroadcasts } from '../services/broadcasts.js';
 
 /**
  * Background jobs.
@@ -43,6 +44,9 @@ export const JOBS: Job[] = [
   // contacts per segment. Anything needing to act the moment a contact changes
   // should be an automation trigger instead.
   { name: 'segment_build', intervalMs: 600_000, run: () => buildAllSegments() },
+  // Every 30 seconds: a scheduled broadcast should go out close to its time,
+  // and a send in progress should keep moving.
+  { name: 'broadcast_send', intervalMs: 30_000, run: () => runDueBroadcasts() },
 ];
 
 const timers: NodeJS.Timeout[] = [];
