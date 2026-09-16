@@ -411,3 +411,149 @@ timezone, not the server's. `logTemplate` substitutes `%amount%`, `%rule%`,
 
 `PUT /v1/settings` accepts `transferMinimum`, `transferDailyLimit`,
 `transferWeeklyLimit` and `transferMonthlyLimit`. Unset means unlimited.
+
+---
+
+## Marketing
+
+### Segments
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/v1/segments/fields` | The field catalogue, for building a filter UI |
+| `GET` | `/v1/segments` | List |
+| `GET` | `/v1/segments/:key` | One segment with its definition |
+| `PUT` | `/v1/segments/:key` | Create or update |
+| `DELETE` | `/v1/segments/:key` | Remove |
+| `POST` | `/v1/segments/preview` | Count and sample a definition without saving it |
+| `POST` | `/v1/segments/:key/build` | Recompute membership now |
+| `GET` | `/v1/segments/:key/audience` | How many could actually be mailed |
+
+A definition is a filter group:
+
+```jsonc
+{
+  "match": "all",                 // or "any"
+  "filters": [
+    { "field": "order_count",  "operator": "gte",              "value": 1 },
+    { "field": "last_order_at","operator": "not_in_last_days", "value": 90 },
+    { "field": "tags",         "operator": "not_contains",     "value": ["vip"] }
+  ],
+  "groups": []                    // nested groups, up to 4 deep
+}
+```
+
+`GET /v1/segments/fields` is the authoritative list of what `field` and
+`operator` may be — the compiler rejects anything outside it, so read the
+catalogue rather than guessing. Relative dates resolve in the tenant's
+timezone.
+
+**Preview before you save.** A count alone does not catch "I meant *not*
+tagged vip", which is why the preview endpoint returns a sample of real
+contacts alongside the number.
+
+Consent and suppression are *not* part of a definition. They are applied when
+an audience is read, so a segment cannot be built that forgets them.
+
+### Broadcasts
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/v1/broadcasts` | List |
+| `GET` | `/v1/broadcasts/:key` | Delivery report, including why anyone was skipped |
+| `PUT` | `/v1/broadcasts/:key` | Create or update a draft |
+| `POST` | `/v1/broadcasts/:key/send` | Arm it; a worker walks the audience |
+| `POST` | `/v1/broadcasts/:key/cancel` | Stop the walk |
+
+Sending is a separate call from saving on purpose: mailing a whole segment is
+not something to do by accident while editing a subject line.
+
+A send resumes from a cursor if a worker dies, and every message carries the
+dedupe key `broadcast:<id>:<contact>`, so even an overlapping resume cannot
+produce a second copy. `maxMarketingPerDay` and `maxMarketingPerWeek` in
+settings cap how much marketing one contact receives; a capped contact is
+recorded as skipped with a reason rather than silently dropped.
+
+A **sent** broadcast cannot be edited. It is the record of what went out.
+
+### Automations
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/v1/automations` | List |
+| `PUT` | `/v1/automations/:key` | Create or update |
+| `DELETE` | `/v1/automations/:key` | Remove |
+| `GET` | `/v1/automations/runs?key=` | Runs, including sequences currently parked |
+
+`actions` is a step list. An action step is one of `send_email`,
+`award_points`, `add_tag`, `remove_tag`, `webhook`. A control step is one of:
+
+```jsonc
+{ "type": "wait", "days": 1 }                       // or hours/minutes/seconds
+{ "type": "if", "filter": { … }, "else": "stop" }   // or "continue" / {"goto": N}
+{ "type": "goto", "step": 0 }
+{ "type": "stop" }
+```
+
+An `if` filter uses the same shape and field catalogue as a segment, evaluated
+against that one contact **at the moment the step runs** — which is the point
+of putting one after a wait.
+
+A cart-recovery sequence, expressed properly:
+
+```jsonc
+{
+  "triggerType": "cart.abandoned",
+  "actions": [
+    { "type": "send_email", "template": "cart_recovery_1" },
+    { "type": "wait", "days": 1 },
+    { "type": "if",
+      "filter": { "match": "all",
+                  "filters": [{ "field": "last_order_at",
+                                "operator": "not_in_last_days", "value": 1 }] },
+      "else": "stop" },
+    { "type": "send_email", "template": "cart_recovery_2" }
+  ]
+}
+```
+
+Parked runs are cancelled when the contact unsubscribes and when the automation
+is disabled. Waits are capped at two years, sequences at 100 executed steps, and
+a `goto` outside the sequence is rejected when the automation is *saved* rather
+than when a customer triggers it at two in the morning.
+
+### Email engagement
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/v1/email/engagement?days=30` | Sent, open rate and click rate per template |
+| `GET` | `/v1/email/suppressions` | Addresses that will not be mailed |
+| `POST` | `/v1/email/suppressions` | Suppress one |
+| `DELETE` | `/v1/email/suppressions/:email` | Allow it again |
+
+Marketing mail is tracked; transactional mail never is. Scanner and
+privacy-proxy hits are counted separately, so an open rate here is not the
+inflated number most tools report. Un-suppressing does **not** restore
+marketing consent — only the person can give that back.
+
+Turn tracking off entirely with `emailTracking: false` in settings.
+
+### Contact timeline
+
+`GET /v1/contacts/timeline?email=…&limit=50&kinds=order,points&before=…`
+
+Everything that happened to one contact, newest first, merged from sessions,
+orders, carts, points, email sends, opens and clicks, badges, ranks, shares,
+token claims and automation runs. `kinds` filters to a comma-separated subset.
+
+### Spending points
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/v1/credit/quote?points=500` | What those points are worth, before spending |
+| `POST` | `/v1/credit/redeem` | Spend them for a store credit code |
+
+The short path to money off an order: no wallet, no chain, no gas. The rate is
+the same one TBAY converts at, including any retailer bonus, so neither route
+can be arbitraged against the other. Points convert in whole blocks of
+`pointsPerToken`; the quote reports how many of the points supplied are usable.
