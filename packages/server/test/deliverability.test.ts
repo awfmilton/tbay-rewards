@@ -50,17 +50,28 @@ describe('classifying a delivery failure', () => {
     }
   });
 
-  it('treats anything ambiguous as soft', () => {
-    // A false hard bounce silently stops mailing a real customer forever,
-    // which is much worse than four more retries at a dead address.
+  it('treats a failure about us as transport, not the recipient', () => {
+    // These say nothing about whether a mailbox exists, so they must never
+    // count toward suppressing one — a relay down for ninety seconds used to
+    // suppress every recipient queued at the time.
     for (const message of [
       '451 4.3.0 Temporary server error',
-      'Connection timed out',
       'ECONNREFUSED',
       '452 4.2.2 Mailbox full',
       'greylisted, try again later',
     ]) {
-      expect(classifyFailure(message)).toBe('soft');
+      expect(classifyFailure(message), message).toBe('transport');
+    }
+  });
+
+  it('treats anything genuinely ambiguous as soft', () => {
+    // A false hard bounce silently stops mailing a real customer forever,
+    // which is much worse than four more retries at a dead address.
+    for (const message of [
+      'Message could not be delivered',
+      'Unknown failure from the relay',
+    ]) {
+      expect(classifyFailure(message), message).toBe('soft');
     }
   });
 
@@ -165,11 +176,11 @@ describe('List-Unsubscribe', () => {
   it('suppresses the address on a one-click request unsubscribe', async () => {
     await authed('POST', '/v1/contacts', { email: 'bye@example.com', marketingConsent: true });
 
+    const { unsubscribeRequestUrl } = await import('../src/services/newsletter.js');
+    const token = unsubscribeRequestUrl(tenant.id, 'bye@example.com').split('/n/u/')[1]!;
+
     const app = await testApp();
-    await app.inject({
-      method: 'POST',
-      url: `/n/unsubscribe-request?t=${tenant.id}&email=${encodeURIComponent('bye@example.com')}`,
-    });
+    await app.inject({ method: 'POST', url: `/n/u/${token}` });
 
     expect(await isSuppressed(tenant.id, 'bye@example.com')).not.toBeNull();
     const { rows } = await db().query<{ marketing_consent: boolean }>(

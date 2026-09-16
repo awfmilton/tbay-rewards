@@ -421,7 +421,9 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
    */
   app.delete<{ Params: { email: string } }>('/v1/email/suppressions/:email', async (request) => {
     const tenant = tenantOf(request);
-    return { removed: await unsuppress(tenant.id, decodeURIComponent(request.params.email)) };
+    // Fastify has already decoded the path parameter. Decoding again turns a
+    // literal `%` in an address into a URIError and a 500.
+    return { removed: await unsuppress(tenant.id, request.params.email) };
   });
 
   app.get<{ Querystring: { days?: string } }>('/v1/email/engagement', async (request) => {
@@ -684,7 +686,13 @@ function parseLedgerQuery(
  */
 function csvCell(value: string): string {
   const text = String(value ?? '');
-  const guarded = /^[=+\-@\t\r]/.test(text) ? `'${text}` : text;
+
+  // A plain number is left alone. Guarding `-50` turned every debit in the
+  // ledger into the text `'-50`, which is not a number in any spreadsheet and
+  // makes the export useless for the one thing it is for — adding up points.
+  const isNumber = /^-?\d+(?:\.\d+)?$/.test(text);
+
+  const guarded = !isNumber && /^[=+\-@\t\r]/.test(text) ? `'${text}` : text;
   return /[",\r\n]/.test(guarded) ? `"${guarded.replace(/"/g, '""')}"` : guarded;
 }
 

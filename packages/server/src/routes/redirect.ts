@@ -6,7 +6,12 @@ import { config } from '../config.js';
 import { getLinkByCode, issueAttributionCookie, recordClick } from '../services/links.js';
 import { creditShareClick } from '../services/shares.js';
 import { getTenantById } from '../services/tenants.js';
-import { confirmSubscription, unsubscribeByEmail, unsubscribeByToken } from '../services/newsletter.js';
+import {
+  confirmSubscription,
+  unsubscribeByEmail,
+  unsubscribeByToken,
+  verifyUnsubscribeRequest,
+} from '../services/newsletter.js';
 import { getCartByRecoveryToken } from '../services/carts.js';
 import { messageByToken, recordEngagement } from '../services/email-tracking.js';
 import { fire } from '../services/automations.js';
@@ -157,29 +162,85 @@ export async function redirectRoutes(app: FastifyInstance): Promise<void> {
    * Answers identically whether or not the address exists, so it cannot be used
    * to test which addresses are on file.
    */
-  app.route<{ Querystring: { email?: string; t?: string } }>({
+  /**
+   * Unsubscribe from a signed link.
+   *
+   * The signature covers exactly the (tenant, address) pair being acted on.
+   * The previous form took both from the query string with no authentication
+   * at all — and the tenant id is printed in the unsubscribe link of every
+   * marketing email, so one received message revealed it and anyone could walk
+   * a list and suppress a competitor's whole audience with a shell loop.
+   *
+   * GET asks; POST acts. That split is not decoration either: corporate link
+   * scanners (Safe Links, Proofpoint and the rest) fetch every URL in every
+   * message, so a destructive GET unsubscribes precisely the recipients whose
+   * employer scans their mail. RFC 8058 one-click sends POST, so the mail
+   * client's own unsubscribe button still works in one step.
+   */
+  app.route<{ Params: { token: string } }>({
     method: ['GET', 'POST'],
-    url: '/n/unsubscribe-request',
+    url: '/n/u/:token',
     handler: async (request, reply) => {
-      const email = String(request.query.email ?? '').trim();
-      const tenantId = String(request.query.t ?? '').trim();
+      const verified = verifyUnsubscribeRequest(request.params.token);
+      if (!verified) {
+        return reply
+          .type('text/html')
+          .code(400)
+          .send(
+            page(
+              'Link not valid',
+              'That unsubscribe link is not one we recognise. If you received email you did not ask for, reply to it and we will remove you.',
+            ),
+          );
+      }
 
-      if (email !== '' && tenantId !== '') {
-        await unsubscribeByEmail(tenantId, email).catch(() => false);
-        // Suppress the address as well, so the decision survives a later
-        // re-import of the contact or a second subscription row.
-        await suppress(tenantId, email, 'manual', 'Unsubscribed from an email link').catch(
-          () => null,
+      if (request.method === 'GET') {
+        return reply.type('text/html').send(
+          confirmPage(
+            'Unsubscribe?',
+            `This will stop all marketing email to ${escapeHtml(verified.email)}.`,
+            `${config().publicUrl}/n/u/${encodeURIComponent(request.params.token)}`,
+          ),
         );
       }
 
-      if (request.method === 'POST') {
-        return reply.code(200).send();
-      }
+      await unsubscribeByEmail(verified.tenantId, verified.email).catch(() => false);
+      // Suppressed as well, so the decision survives a later re-import of the
+      // contact or a second subscription row.
+      await suppress(
+        verified.tenantId,
+        verified.email,
+        'manual',
+        'Unsubscribed from an email link',
+      ).catch(() => null);
+
       return reply
         .type('text/html')
         .send(page('Unsubscribed', 'You will not receive any further marketing email from us.'));
     },
+  });
+
+  /**
+   * The old unsigned endpoint, kept only to answer links already in inboxes.
+   *
+   * It no longer unsubscribes anyone: it cannot, because it has no way to tell
+   * the person who received the email from anyone else who guessed the tenant
+   * id. It explains itself and points at the signed link in a newer message.
+   */
+  app.route<{ Querystring: { email?: string; t?: string } }>({
+    method: ['GET', 'POST'],
+    url: '/n/unsubscribe-request',
+    handler: async (_request, reply) =>
+      reply
+        .type('text/html')
+        .code(410)
+        .send(
+          page(
+            'This link has been replaced',
+            'Unsubscribe links are now signed, so this older one no longer works. ' +
+              'Use the link in any more recent email from us, or reply to one and we will remove you.',
+          ),
+        ),
   });
 
   app.get<{ Params: { token: string } }>('/c/:token', async (request, reply) => {
@@ -252,6 +313,29 @@ function page(title: string, body: string): string {
   }
 </style></head>
 <body><main><h1>${esc(title)}</h1><p>${esc(body)}</p></main></body></html>`;
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/**
+ * The same page with a single button that POSTs.
+ *
+ * One extra click, and it buys two things: a link scanner fetching every URL
+ * in a message cannot unsubscribe the recipient, and somebody who clicked by
+ * accident can back out. The body is pre-escaped by the caller so it may carry
+ * the address being unsubscribed.
+ */
+function confirmPage(title: string, bodyHtml: string, action: string): string {
+  const base = page(title, '');
+  const form =
+    `<p>${bodyHtml}</p>` +
+    `<form method="post" action="${escapeHtml(action)}" style="margin-top:24px">` +
+    `<button type="submit" style="font:inherit;font-weight:600;padding:12px 24px;` +
+    `border:0;border-radius:8px;background:#1d1d1f;color:#fff;cursor:pointer">` +
+    `Yes, unsubscribe me</button></form>`;
+  return base.replace('<p></p>', form);
 }
 
 /** 1x1 transparent GIF, the smallest thing that renders in every mail client. */

@@ -178,6 +178,15 @@ const MAX_DEPTH = 4;
 const MAX_FILTERS = 50;
 
 /**
+ * Total filters in one definition, across every nested group.
+ *
+ * The per-group limit alone allowed tens of thousands once nested, and every
+ * filter is a correlated subquery re-evaluated over the whole contacts table
+ * on each rebuild — a cost that lands on the database every tenant shares.
+ */
+const MAX_TOTAL_FILTERS = 200;
+
+/**
  * Compile a filter group into a WHERE fragment for a query aliased `c`.
  *
  * `startIndex` is the number of parameters the caller has already bound, so
@@ -188,6 +197,7 @@ export function compileGroup(
   timezone: string,
   startIndex = 0,
   depth = 0,
+  budget: { remaining: number } = { remaining: MAX_TOTAL_FILTERS },
 ): CompiledFilter {
   if (depth > MAX_DEPTH) {
     throw ApiError.badRequest(`Segment filters may not nest more than ${MAX_DEPTH} deep`);
@@ -205,6 +215,13 @@ export function compileGroup(
     throw ApiError.badRequest(`A filter group may hold at most ${MAX_FILTERS} entries`);
   }
 
+  budget.remaining -= filters.length;
+  if (budget.remaining < 0) {
+    throw ApiError.badRequest(
+      `A segment may hold at most ${MAX_TOTAL_FILTERS} filters in total`,
+    );
+  }
+
   for (const filter of filters) {
     const compiled = compileFilter(filter, timezone, index);
     parts.push(compiled.sql);
@@ -213,7 +230,7 @@ export function compileGroup(
   }
 
   for (const nested of groups) {
-    const compiled = compileGroup(nested, timezone, index, depth + 1);
+    const compiled = compileGroup(nested, timezone, index, depth + 1, budget);
     parts.push(`(${compiled.sql})`);
     params.push(...compiled.params);
     index += compiled.params.length;
@@ -228,7 +245,12 @@ export function compileGroup(
 }
 
 function compileFilter(filter: Filter, timezone: string, startIndex: number): CompiledFilter {
-  const field = FIELDS[filter.field];
+  // `Object.hasOwn`, not a truthiness check: `FIELDS['__proto__']`,
+  // `['constructor']` and `['toString']` all return inherited values, so a
+  // plain lookup passes and then `field.kind` is undefined — a TypeError and a
+  // 500 out of the one function whose whole job is rejecting bad definitions
+  // with a 400.
+  const field = Object.hasOwn(FIELDS, filter.field) ? FIELDS[filter.field] : undefined;
   if (!field) {
     throw ApiError.badRequest(`Unknown segment field "${String(filter.field)}"`);
   }

@@ -591,17 +591,46 @@ class TBAY_Rewards_UI {
 	 */
 	public function render_leaderboard( $atts = array() ): string {
 		$atts = shortcode_atts(
-			array( 'limit' => '10' ),
+			array( 'limit' => '10', 'window' => 'all' ),
 			is_array( $atts ) ? $atts : array(),
 			'tbay_leaderboard'
 		);
 
-		$result = $this->api->get_cached( '/v1/rewards/leaderboard', array(), 300 );
+		// A board nobody can still win is a board nobody looks at twice, so the
+		// timeframe is a shortcode attribute rather than a fixed all-time list.
+		if ( ! in_array( $atts['window'], array( 'all', 'day', 'week', 'month', 'year' ), true ) ) {
+			$atts['window'] = 'all';
+		}
+
+		// The viewer's own contact, so the board can show where they stand. A
+		// board of strangers tells somebody in 400th place nothing.
+		$contact_id = is_user_logged_in()
+			? $this->api->contact_id_for_user( get_current_user_id() )
+			: null;
+
+		$result = $this->api->get_cached(
+			'/v1/rewards/leaderboard',
+			array_filter(
+				array(
+					'limit'     => max( 1, (int) $atts['limit'] ),
+					'window'    => $atts['window'],
+					'contactId' => $contact_id,
+				)
+			),
+			// Short for a signed-in viewer, because their own position moves;
+			// longer for the anonymous board, which is the same for everyone.
+			null === $contact_id ? 300 : 60
+		);
+
 		if ( is_wp_error( $result ) || empty( $result['leaders'] ) ) {
 			return '';
 		}
 
-		$leaders = array_slice( (array) $result['leaders'], 0, max( 1, (int) $atts['limit'] ) );
+		$leaders = (array) $result['leaders'];
+		$you     = is_array( $result['you'] ?? null ) ? $result['you'] : null;
+
+		// Only show the viewer's own row separately when they are below the cut.
+		$in_board = null !== $you && (int) ( $you['rank'] ?? 0 ) <= count( $leaders );
 
 		ob_start();
 		?>
@@ -613,23 +642,46 @@ class TBAY_Rewards_UI {
 						<thead>
 							<tr>
 								<th scope="col"><?php esc_html_e( 'Member', 'tbay-rewards' ); ?></th>
-								<th scope="col" class="tbay-num"><?php esc_html_e( 'Lifetime points', 'tbay-rewards' ); ?></th>
+								<th scope="col" class="tbay-num">
+									<?php
+									echo esc_html(
+										'all' === $atts['window']
+											? __( 'Lifetime points', 'tbay-rewards' )
+											: __( 'Points', 'tbay-rewards' )
+									);
+									?>
+								</th>
 							</tr>
 						</thead>
 						<tbody>
 						<?php foreach ( $leaders as $index => $leader ) : ?>
-							<tr>
+							<?php $is_you = null !== $you && ( $leader['contact_id'] ?? '' ) === ( $you['contact_id'] ?? null ); ?>
+							<tr<?php echo $is_you ? ' class="tbay-you"' : ''; ?>>
 								<td>
-									<?php echo esc_html( (string) ( $index + 1 ) ); ?>.
+									<?php echo esc_html( (string) ( $leader['rank'] ?? $index + 1 ) ); ?>.
 									<?php
 									// Only a display name is ever shown — never an email address.
 									$name = (string) ( $leader['name'] ?? '' );
 									echo esc_html( '' !== $name ? $name : __( 'Anonymous', 'tbay-rewards' ) );
+									echo $is_you ? ' ' . esc_html__( '(you)', 'tbay-rewards' ) : '';
 									?>
 								</td>
-								<td class="tbay-num"><?php echo esc_html( number_format_i18n( (int) ( $leader['lifetime_earned'] ?? 0 ) ) ); ?></td>
+								<td class="tbay-num"><?php echo esc_html( number_format_i18n( (int) ( $leader['points'] ?? 0 ) ) ); ?></td>
 							</tr>
 						<?php endforeach; ?>
+						<?php if ( null !== $you && ! $in_board ) : ?>
+							<tr class="tbay-you">
+								<td>
+									<?php echo esc_html( (string) ( $you['rank'] ?? 0 ) ); ?>.
+									<?php
+									$your_name = (string) ( $you['name'] ?? '' );
+									echo esc_html( '' !== $your_name ? $your_name : __( 'You', 'tbay-rewards' ) );
+									echo ' ' . esc_html__( '(you)', 'tbay-rewards' );
+									?>
+								</td>
+								<td class="tbay-num"><?php echo esc_html( number_format_i18n( (int) ( $you['points'] ?? 0 ) ) ); ?></td>
+							</tr>
+						<?php endif; ?>
 						</tbody>
 					</table>
 				</div>

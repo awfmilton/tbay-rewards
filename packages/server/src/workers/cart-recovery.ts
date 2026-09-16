@@ -1,4 +1,5 @@
 import { db } from '../db/pool.js';
+import { unsubscribeRequestUrl } from '../services/newsletter.js';
 import { config } from '../config.js';
 import {
   advanceRecoveryStage,
@@ -71,7 +72,7 @@ async function queueRecoveryEmail(cart: RecoveryCandidate): Promise<boolean> {
   if (!template) return false;
 
   const base = config().publicUrl;
-  const unsubscribeUrl = `${base}/n/unsubscribe-request?t=${tenant.id}&email=${encodeURIComponent(cart.email)}`;
+  const unsubscribeUrl = unsubscribeRequestUrl(tenant.id, cart.email);
   const rendered = renderTemplate(template, {
     tenant_name: tenant.name,
     name: cart.contact_name ?? '',

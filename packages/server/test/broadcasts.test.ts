@@ -194,7 +194,9 @@ describe('sending a broadcast', () => {
     }>(`SELECT unsubscribe_url, tracking_token, html FROM email_messages
          WHERE dedupe_key LIKE 'broadcast:%'`);
 
-    expect(rows[0]!.unsubscribe_url).toContain('/n/unsubscribe-request');
+    // Signed now: the address is inside an HMAC, so the link only works for
+    // the person it was minted for.
+    expect(rows[0]!.unsubscribe_url).toContain('/n/u/');
     expect(rows[0]!.tracking_token).not.toBeNull();
     expect(rows[0]!.html).toContain('/c/0');
   });

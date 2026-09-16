@@ -466,7 +466,11 @@ export async function queryLedger(
   query: LedgerQuery = {},
   runner: Queryable = db(),
 ): Promise<{ rows: LedgerRow[]; total: number }> {
-  const limit = limitOf(query.limit, 50, 1000);
+  // 50,000 rather than 1,000: the CSV export asks for up to 50,000 and refuses
+  // above that. Clamping to 1,000 here made a 20,000-row export return 1,000
+  // rows and look complete — exactly the silent truncation the export was
+  // written to avoid. The JSON endpoint still passes its own smaller limit.
+  const limit = limitOf(query.limit, 50, 50_000);
   const offset = offsetOf(query.offset);
 
   const where: string[] = ['l.tenant_id = $1'];

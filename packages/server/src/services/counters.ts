@@ -124,7 +124,32 @@ export async function stopCounterBuffer(): Promise<void> {
     clearInterval(timer);
     timer = null;
   }
+  // Twice: the first call may find a flush already in flight and return
+  // immediately, leaving whatever accumulated during it unwritten. A clean
+  // shutdown losing three seconds of counters is avoidable.
   await flushCounters();
+  await flushCounters();
+}
+
+/**
+ * A hard ceiling, enforced here rather than only advised by `shouldFlushNow`.
+ *
+ * `flushCounters` returns immediately when a flush is already in flight, so
+ * while one large upsert runs the maps keep growing. With ingest reachable
+ * using nothing but the public site key — which is in every page's source —
+ * that was a path from "post to /collect in a loop" to exhausting the heap of
+ * the process serving every tenant.
+ *
+ * Dropping counters at the ceiling is the right failure: they are approximate
+ * analytics by design, and the alternative is the API falling over.
+ */
+const HARD_CEILING = MAX_BUFFERED * 4;
+
+let dropped = 0;
+
+/** Counters discarded at the ceiling, so the loss is visible rather than silent. */
+export function droppedCounters(): number {
+  return dropped;
 }
 
 export function bufferCells(
@@ -134,6 +159,11 @@ export function bufferCells(
   kind: string,
   binned: Array<{ x: number; y: number; weight: number }>,
 ): void {
+  if (cells.size >= HARD_CEILING) {
+    dropped += binned.length;
+    return;
+  }
+
   for (const cell of binned) {
     const key = keyOf([tenantId, pageKey, deviceClass, kind, cell.x, cell.y]);
     const existing = cells.get(key);
@@ -159,6 +189,10 @@ export function bufferPage(
 ): void {
   const key = keyOf([tenantId, pageKey, deviceClass]);
   const existing = pages.get(key);
+  if (!existing && pages.size >= HARD_CEILING) {
+    dropped += 1;
+    return;
+  }
   if (existing) {
     existing.points += input.points ?? 0;
     existing.sessions += input.sessions ?? 0;
@@ -190,6 +224,10 @@ export function bufferProduct(
   const statDate = at.toISOString().slice(0, 10);
   const key = keyOf([tenantId, productRef, statDate, metric]);
   const existing = products.get(key);
+  if (!existing && products.size >= HARD_CEILING) {
+    dropped += 1;
+    return;
+  }
   if (existing) {
     existing.amount += amount;
     existing.revenueCents += revenueCents;
@@ -227,17 +265,25 @@ export async function flushCounters(runner: Queryable = db()): Promise<CounterSt
   }
 
   const work = (async () => {
+    // Each leg is retried independently. They are three separate autocommit
+    // statements, so re-buffering the whole batch when the second one fails
+    // would write the first one twice — and `product_stats.revenue_cents` is
+    // among the figures that would double, which is business-facing.
+    const failures: unknown[] = [];
+
     try {
       await flushCells(runner, cellBatch);
-      await flushPages(runner, pageBatch);
-      await flushProducts(runner, productBatch);
     } catch (err) {
-      // Put the work back so the next tick retries it. Re-buffering rather
-      // than dropping means a transient database blip costs latency on a
-      // counter, not the counter itself.
+      failures.push(err);
       for (const cell of cellBatch) {
         bufferCells(cell.tenantId, cell.pageKey, cell.deviceClass, cell.kind, [cell]);
       }
+    }
+
+    try {
+      await flushPages(runner, pageBatch);
+    } catch (err) {
+      failures.push(err);
       for (const page of pageBatch) {
         bufferPage(page.tenantId, page.pageKey, page.deviceClass, {
           points: page.points,
@@ -246,6 +292,12 @@ export async function flushCounters(runner: Queryable = db()): Promise<CounterSt
           viewportWidth: page.viewportWidth,
         });
       }
+    }
+
+    try {
+      await flushProducts(runner, productBatch);
+    } catch (err) {
+      failures.push(err);
       for (const product of productBatch) {
         bufferProduct(
           product.tenantId,
@@ -256,8 +308,9 @@ export async function flushCounters(runner: Queryable = db()): Promise<CounterSt
           new Date(`${product.statDate}T00:00:00Z`),
         );
       }
-      throw err;
     }
+
+    if (failures.length > 0) throw failures[0];
   })();
 
   flushing = work.then(

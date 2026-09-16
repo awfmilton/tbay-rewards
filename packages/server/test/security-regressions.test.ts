@@ -1,0 +1,266 @@
+import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
+import {
+  closeApp,
+  closeDb,
+  db,
+  makeTenant,
+  setupDatabase,
+  testApp,
+  truncateAll,
+  type TestTenant,
+} from './helpers.js';
+import { classifyFailure, isSuppressed, suppress } from '../src/services/deliverability.js';
+import { compileGroup } from '../src/services/segment-filters.js';
+import {
+  unsubscribeRequestUrl,
+  verifyUnsubscribeRequest,
+} from '../src/services/newsletter.js';
+import { bufferCells, bufferedCounts, droppedCounters, flushCounters } from '../src/services/counters.js';
+
+/**
+ * Regression tests for an adversarial review of the surface added after the
+ * original security audit. Each one reproduces a specific finding.
+ */
+
+let tenant: TestTenant;
+
+beforeAll(async () => {
+  await setupDatabase();
+});
+
+beforeEach(async () => {
+  await truncateAll();
+  tenant = await makeTenant();
+});
+
+afterAll(async () => {
+  await closeApp();
+  await closeDb();
+});
+
+async function authed(method: 'GET' | 'POST' | 'PUT', url: string, payload?: unknown) {
+  const app = await testApp();
+  return app.inject({
+    method,
+    url,
+    headers: { authorization: `Bearer ${tenant.secretKey}` },
+    ...(payload === undefined ? {} : { payload }),
+  });
+}
+
+describe('unsubscribe links are signed (HIGH)', () => {
+  it('will not suppress an address from a guessed tenant id', async () => {
+    await authed('POST', '/v1/contacts', { email: 'victim@example.com', marketingConsent: true });
+    const app = await testApp();
+
+    // The tenant id is printed in the unsubscribe link of every marketing
+    // email, so treating it as a secret was the whole vulnerability: anyone
+    // with one received message could walk a list and suppress an entire
+    // audience.
+    const response = await app.inject({
+      method: 'POST',
+      url: `/n/unsubscribe-request?t=${tenant.id}&email=${encodeURIComponent('victim@example.com')}`,
+    });
+    expect(response.statusCode).toBe(410);
+
+    const { rows } = await db().query<{ marketing_consent: boolean }>(
+      'SELECT marketing_consent FROM contacts WHERE email_normalised = $1',
+      ['victim@example.com'],
+    );
+    expect(rows[0]!.marketing_consent).toBe(true);
+    expect(await isSuppressed(tenant.id, 'victim@example.com')).toBeNull();
+  });
+
+  it('honours a properly signed link', async () => {
+    await authed('POST', '/v1/contacts', { email: 'real@example.com', marketingConsent: true });
+    const url = unsubscribeRequestUrl(tenant.id, 'real@example.com');
+    const token = url.split('/n/u/')[1]!;
+
+    const app = await testApp();
+    const response = await app.inject({ method: 'POST', url: `/n/u/${token}` });
+    expect(response.statusCode).toBe(200);
+
+    const { rows } = await db().query<{ marketing_consent: boolean }>(
+      'SELECT marketing_consent FROM contacts WHERE email_normalised = $1',
+      ['real@example.com'],
+    );
+    expect(rows[0]!.marketing_consent).toBe(false);
+  });
+
+  it('asks before acting on a GET, so a link scanner cannot unsubscribe anyone', async () => {
+    await authed('POST', '/v1/contacts', { email: 'scanned@example.com', marketingConsent: true });
+    const token = unsubscribeRequestUrl(tenant.id, 'scanned@example.com').split('/n/u/')[1]!;
+
+    const app = await testApp();
+    // Safe Links, Proofpoint and the rest fetch every URL in every message.
+    const response = await app.inject({ method: 'GET', url: `/n/u/${token}` });
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toContain('<form method="post"');
+
+    const { rows } = await db().query<{ marketing_consent: boolean }>(
+      'SELECT marketing_consent FROM contacts WHERE email_normalised = $1',
+      ['scanned@example.com'],
+    );
+    expect(rows[0]!.marketing_consent).toBe(true);
+  });
+
+  it('rejects a tampered or foreign token', async () => {
+    const token = unsubscribeRequestUrl(tenant.id, 'a@example.com').split('/n/u/')[1]!;
+    const decoded = decodeURIComponent(token);
+    const [body, sig] = decoded.split('.');
+
+    // Swapping the address inside the payload invalidates the signature.
+    const forged = Buffer.from(
+      JSON.stringify({ t: tenant.id, e: 'someone-else@example.com', k: 'unsub' }),
+    ).toString('base64url');
+
+    expect(verifyUnsubscribeRequest(`${forged}.${sig}`)).toBeNull();
+    expect(verifyUnsubscribeRequest(`${body}.deadbeef`)).toBeNull();
+    expect(verifyUnsubscribeRequest('nonsense')).toBeNull();
+  });
+
+  it('will not accept a signed payload minted for another purpose', async () => {
+    // A discriminator in the payload, so an attribution cookie or any other
+    // signed envelope cannot be replayed at the unsubscribe endpoint.
+    const { signPayload } = await import('../src/lib/crypto.js');
+    const other = signPayload({ t: tenant.id, e: 'a@example.com', k: 'attribution' });
+    expect(verifyUnsubscribeRequest(other)).toBeNull();
+  });
+});
+
+describe('an outage does not suppress everyone (MEDIUM)', () => {
+  it('classifies transport failures apart from bounces', () => {
+    for (const message of [
+      'connect ECONNREFUSED 10.0.0.5:587',
+      'Error: getaddrinfo EAI_AGAIN smtp.example.com',
+      '421 4.7.0 Try again later',
+      '535 5.7.8 Authentication failed',
+      'self-signed certificate in certificate chain',
+    ]) {
+      expect(classifyFailure(message), message).toBe('transport');
+    }
+  });
+
+  it('still spots a real hard bounce and a real complaint', () => {
+    expect(classifyFailure('550 5.1.1 User unknown')).toBe('hard');
+    expect(classifyFailure('Message refused: recipient reported as spam')).toBe('complaint');
+  });
+
+  it('lets a repeated-failure suppression lapse rather than lasting forever', async () => {
+    await suppress(tenant.id, 'flaky@example.com', 'repeated_failure', 'timeouts');
+    const row = await isSuppressed(tenant.id, 'flaky@example.com');
+    // A run of soft failures is a guess about a mailbox, not a fact.
+    expect(row?.expires_at).not.toBeNull();
+  });
+
+  it('keeps a hard bounce permanent', async () => {
+    await suppress(tenant.id, 'gone@example.com', 'hard_bounce', 'user unknown');
+    expect((await isSuppressed(tenant.id, 'gone@example.com'))?.expires_at).toBeNull();
+  });
+
+  it('does not let a lapsing reason downgrade a permanent one', async () => {
+    await suppress(tenant.id, 'both@example.com', 'hard_bounce', 'user unknown');
+    await suppress(tenant.id, 'both@example.com', 'repeated_failure', 'timeouts');
+    expect((await isSuppressed(tenant.id, 'both@example.com'))?.expires_at).toBeNull();
+  });
+});
+
+describe('segment filters reject rather than crash (LOW)', () => {
+  it('answers 400 for a prototype-named field', async () => {
+    for (const field of ['__proto__', 'constructor', 'toString', 'hasOwnProperty']) {
+      expect(() =>
+        compileGroup({ match: 'all', filters: [{ field, operator: 'eq', value: 1 }] }, 'UTC'),
+      ).toThrow(/Unknown segment field/);
+    }
+  });
+
+  it('caps the total number of filters across nested groups', () => {
+    const group = {
+      match: 'all',
+      groups: Array.from({ length: 10 }, () => ({
+        match: 'all',
+        filters: Array.from({ length: 40 }, () => ({
+          field: 'session_count',
+          operator: 'is_set',
+        })),
+      })),
+    };
+    // Each filter is a correlated subquery re-evaluated over the whole contact
+    // table on every rebuild, so the cost lands on the shared database.
+    expect(() => compileGroup(group as never, 'UTC')).toThrow(/at most 200 filters/);
+  });
+});
+
+describe('the counter buffer has a ceiling (MEDIUM)', () => {
+  it('drops rather than growing without bound', async () => {
+    // Ingest is reachable with the public site key, which is in every page's
+    // source, so unbounded growth was a path from a loop to heap exhaustion in
+    // the process serving every tenant.
+    for (let page = 0; page < 900; page += 1) {
+      bufferCells(
+        tenant.id,
+        `/page-${page}`,
+        'desktop',
+        'move',
+        Array.from({ length: 100 }, (_, i) => ({ x: i % 100, y: page % 200, weight: 1 })),
+      );
+    }
+
+    expect(bufferedCounts().cells).toBeLessThanOrEqual(80_000);
+    expect(droppedCounters()).toBeGreaterThan(0);
+
+    await flushCounters();
+  });
+});
+
+describe('the ledger CSV is honest (LOW)', () => {
+  it('exports more than a thousand rows rather than truncating silently', async () => {
+    const contact = JSON.parse(
+      (await authed('POST', '/v1/contacts', { email: 'many@example.com' })).body,
+    ).contact_id;
+
+    // 1,200 entries: the old clamp returned exactly 1,000 and looked complete.
+    const values = Array.from({ length: 1_200 }, (_, i) =>
+      `('${tenant.id}','${contact}',1,'entry ${i}','bulk-${i}','cleared',now(),'{}'::jsonb)`,
+    ).join(',');
+    await db().query(
+      `INSERT INTO points_ledger
+         (tenant_id, contact_id, delta_points, reason, idempotency_key, status, available_at, meta)
+       VALUES ${values}`,
+    );
+
+    const response = await authed('GET', '/v1/rewards/ledger.csv');
+    expect(response.statusCode).toBe(200);
+    // Header plus every row.
+    expect(response.body.trim().split('\r\n')).toHaveLength(1_201);
+  });
+
+  it('leaves a negative number as a number', async () => {
+    const contact = JSON.parse(
+      (await authed('POST', '/v1/contacts', { email: 'debit@example.com' })).body,
+    ).contact_id;
+    await authed('POST', '/v1/rewards/adjust', {
+      contactId: contact, points: 500, reason: 'seed', idempotencyKey: 'seed-one',
+    });
+    await authed('POST', '/v1/rewards/adjust', {
+      contactId: contact, points: -50, reason: 'correction', idempotencyKey: 'correction-1',
+    });
+
+    const body = (await authed('GET', '/v1/rewards/ledger.csv')).body;
+    // `'-50` is not a number in any spreadsheet, which defeats the one thing
+    // the export is for.
+    expect(body).toContain(',-50,');
+    expect(body).not.toContain("'-50");
+  });
+
+  it('still neutralises a real formula', async () => {
+    const contact = JSON.parse(
+      (await authed('POST', '/v1/contacts', { email: 'formula@example.com' })).body,
+    ).contact_id;
+    await authed('POST', '/v1/rewards/adjust', {
+      contactId: contact, points: 10, reason: '=1+1', idempotencyKey: 'formula-1',
+    });
+
+    expect((await authed('GET', '/v1/rewards/ledger.csv')).body).toContain("'=1+1");
+  });
+});

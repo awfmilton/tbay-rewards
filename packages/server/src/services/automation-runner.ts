@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { db, queryOne, withTransaction, type Queryable } from '../db/pool.js';
 import { ApiError } from '../lib/errors.js';
 import { compileGroup, type FilterGroup } from './segment-filters.js';
@@ -44,6 +45,10 @@ export interface AutomationRun {
   step_index: number;
   resume_at: Date | null;
   attempts: number;
+  /** Steps executed across every resumption, not just this one. */
+  steps_executed: number;
+  /** Digest of the action list this run started under. */
+  actions_hash: string | null;
   context: Record<string, unknown>;
   error: string | null;
 }
@@ -117,6 +122,21 @@ export interface StepOutcome {
   status: RunStatus;
   stepIndex: number;
   resumeAt: Date | null;
+  /** Total steps this run has executed, to persist on the row. */
+  stepsExecuted: number;
+}
+
+/**
+ * A digest of the action list.
+ *
+ * A run stores an integer index against a live action list, so editing the
+ * list while runs are parked shifts what that index points at. Because
+ * idempotency keys embed the index, an `award_points` step could land at a
+ * position that had already run, under a new key, and hand out points nobody
+ * earned. Comparing this on resume is how a run notices.
+ */
+export function actionsHash(actions: unknown): string {
+  return createHash('sha256').update(JSON.stringify(actions ?? [])).digest('hex').slice(0, 32);
 }
 
 export type ActionRunner = (
@@ -152,7 +172,10 @@ export async function advanceRun(
 ): Promise<StepOutcome> {
   const steps = (automation.actions ?? []) as Step[];
   let index = run.step_index;
-  let executed = 0;
+  // Carried on the row, not reset per resumption. A `wait 1s` + `goto 0` cycle
+  // would otherwise re-park forever and monopolise the shared worker across
+  // every tenant on the platform.
+  let executed = run.steps_executed ?? 0;
 
   // The contact is re-read on every resumption, never taken from the stored
   // context: a sequence that waits a week and then mails a name from a week
@@ -185,7 +208,7 @@ export async function advanceRun(
 
     switch (step.type) {
       case 'stop':
-        return { status: 'completed', stepIndex: index, resumeAt: null };
+        return { status: 'completed', stepIndex: index, resumeAt: null, stepsExecuted: executed };
 
       case 'goto': {
         const target = Number(step.step);
@@ -200,7 +223,7 @@ export async function advanceRun(
         const seconds = waitSeconds(step);
         const resumeAt = new Date(Date.now() + seconds * 1000);
         // Park *after* the wait step, so resuming does not wait again.
-        return { status: 'waiting', stepIndex: index + 1, resumeAt };
+        return { status: 'waiting', stepIndex: index + 1, resumeAt, stepsExecuted: executed };
       }
 
       case 'if': {
@@ -208,7 +231,7 @@ export async function advanceRun(
           // Nothing to evaluate against. Treating an absent contact as "does
           // not match" is the conservative reading: the branch exists to gate
           // a further message, and we do not send it on a guess.
-          return { status: 'completed', stepIndex: index, resumeAt: null };
+          return { status: 'completed', stepIndex: index, resumeAt: null, stepsExecuted: executed };
         }
 
         const matched = await contactMatches(runner, tenant.id, contact.id, step.filter);
@@ -219,7 +242,7 @@ export async function advanceRun(
 
         const fallback = step.else ?? 'stop';
         if (fallback === 'stop') {
-          return { status: 'completed', stepIndex: index, resumeAt: null };
+          return { status: 'completed', stepIndex: index, resumeAt: null, stepsExecuted: executed };
         }
         if (fallback === 'continue') {
           index += 1;
@@ -235,7 +258,7 @@ export async function advanceRun(
     }
   }
 
-  return { status: 'completed', stepIndex: index, resumeAt: null };
+  return { status: 'completed', stepIndex: index, resumeAt: null, stepsExecuted: executed };
 }
 
 export interface ResumeResult {
@@ -273,10 +296,20 @@ export async function resumeDueRuns(
   for (const { id } of rows) {
     try {
       const outcome = await withTransaction(async (client) => {
+        // `resume_at <= now()` is re-checked *inside* the lock, not just in
+        // the selection above. The selection runs on the pool in autocommit,
+        // so its row locks are released the moment it returns — two workers
+        // can both select the same run. Without this clause the second one
+        // would acquire the lock after the first had just parked the run on a
+        // fresh wait, see status 'waiting', and execute the post-wait steps
+        // immediately: every delay in a sequence silently skipped.
         const run = await queryOne<AutomationRun>(
           client,
-          `SELECT * FROM automation_runs WHERE id = $1
-            AND status IN ('waiting', 'running') FOR UPDATE`,
+          `SELECT * FROM automation_runs
+            WHERE id = $1
+              AND status IN ('waiting', 'running')
+              AND resume_at IS NOT NULL AND resume_at <= now()
+            FOR UPDATE`,
           [id],
         );
         if (!run) return null;
@@ -298,6 +331,26 @@ export async function resumeDueRuns(
           return 'cancelled' as const;
         }
 
+        // The sequence was edited while this run was parked. `step_index` is
+        // an integer into a list that has changed shape, so resuming would run
+        // whatever now sits at that position — and because idempotency keys
+        // embed the index, an `award_points` step landing there would execute
+        // again under a fresh key and hand out points nobody earned.
+        //
+        // Cancelling is the conservative choice: a half-finished sequence that
+        // stops is recoverable, points issued twice are not.
+        if (run.actions_hash && run.actions_hash !== actionsHash(automation.actions)) {
+          await client.query(
+            `UPDATE automation_runs
+                SET status = 'cancelled', resume_at = NULL,
+                    error = 'The sequence was edited while this run was waiting',
+                    updated_at = now()
+              WHERE id = $1`,
+            [run.id],
+          );
+          return 'cancelled' as const;
+        }
+
         const tenant = await getTenantById(run.tenant_id);
         if (!tenant) return null;
 
@@ -311,9 +364,10 @@ export async function resumeDueRuns(
 
         await client.query(
           `UPDATE automation_runs
-              SET status = $2, step_index = $3, resume_at = $4, error = NULL, updated_at = now()
+              SET status = $2, step_index = $3, resume_at = $4,
+                  steps_executed = $5, error = NULL, updated_at = now()
             WHERE id = $1`,
-          [run.id, result.status, result.stepIndex, result.resumeAt],
+          [run.id, result.status, result.stepIndex, result.resumeAt, result.stepsExecuted],
         );
 
         return result.status;

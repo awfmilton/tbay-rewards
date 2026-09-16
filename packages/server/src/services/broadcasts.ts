@@ -1,4 +1,5 @@
 import { db, queryOne, withTransaction, type Queryable } from '../db/pool.js';
+import { unsubscribeRequestUrl } from './newsletter.js';
 import { config } from '../config.js';
 import { ApiError } from '../lib/errors.js';
 import { limitOf } from '../lib/paging.js';
@@ -300,8 +301,7 @@ export async function sendBroadcastBatch(
       continue;
     }
 
-    const unsubscribeUrl =
-      `${base}/n/unsubscribe-request?t=${tenantId}&email=${encodeURIComponent(contact.email)}`;
+    const unsubscribeUrl = unsubscribeRequestUrl(tenantId, contact.email);
 
     const rendered = renderTemplate(
       broadcast.subject ? { ...template, subject: broadcast.subject } : template,
