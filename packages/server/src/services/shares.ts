@@ -209,6 +209,16 @@ export async function creditShareClick(
     [share.id, outcome.awarded ? outcome.points : 0],
   );
 
+  // Social Butterfly counts verified shares, not points, so it has to be
+  // re-evaluated here. `trigger` only evaluates badges when it actually
+  // awarded, so a share that hit a cap or a cooldown -- or a retailer with no
+  // social_share rule at all -- verified the share and left the badge behind
+  // until some unrelated action happened to move it.
+  if (share.contact_id) {
+    const gamification = await import('./gamification.js');
+    await gamification.evaluateBadges(tenantId, share.contact_id, runner);
+  }
+
   // `share.verified` was declared and never fired, so "thank someone whose
   // share brought a real visitor" was unbuildable. Fired even when the rule
   // declined to award (cap, cooldown): the share was still verified, and an

@@ -2,7 +2,13 @@ import { db, withTransaction } from '../db/pool.js';
 import { upsertContact } from '../services/contacts.js';
 import { createLink } from '../services/links.js';
 import { parseCsvTable, pick } from './csv.js';
-import { emptyReport, recordError, type ImportOptions, type ImportReport } from './types.js';
+import {
+  emptyReport,
+  recordError,
+  warnIfTruncated,
+  type ImportOptions,
+  type ImportReport,
+} from './types.js';
 
 /**
  * Import writer links and commission history from the flagswag theme.
@@ -26,6 +32,7 @@ export async function importFlagswagLinks(
 ): Promise<ImportReport> {
   const report = emptyReport('flagswag_links', options.dryRun === true);
   const table = parseCsvTable(input.csv);
+  warnIfTruncated(report, table);
 
   if (!table.headers.includes('code')) {
     report.warnings.push('No code column found — export wp_flagswag_links with its code column.');
@@ -121,6 +128,7 @@ export async function importFlagswagCommissions(
 ): Promise<ImportReport> {
   const report = emptyReport('flagswag_commissions', options.dryRun === true);
   const table = parseCsvTable(input.csv);
+  warnIfTruncated(report, table);
 
   if (!table.headers.includes('order_ref') && !table.headers.includes('order_id')) {
     report.warnings.push('No order reference column found.');

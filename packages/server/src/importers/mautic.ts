@@ -3,7 +3,13 @@ import { upsertContact } from '../services/contacts.js';
 import { ensureList } from '../services/newsletter.js';
 import { hashToken, randomToken } from '../lib/crypto.js';
 import { parseCsvTable, pick } from './csv.js';
-import { emptyReport, recordError, type ImportOptions, type ImportReport } from './types.js';
+import {
+  emptyReport,
+  recordError,
+  warnIfTruncated,
+  type ImportOptions,
+  type ImportReport,
+} from './types.js';
 
 /**
  * Import contacts out of Mautic.
@@ -34,6 +40,7 @@ export async function importMauticContacts(
 ): Promise<ImportReport> {
   const report = emptyReport('mautic', options.dryRun === true);
   const table = parseCsvTable(input.csv);
+  warnIfTruncated(report, table);
 
   if (table.headers.length === 0) {
     report.warnings.push('The file appears to be empty.');

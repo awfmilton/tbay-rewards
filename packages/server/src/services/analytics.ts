@@ -151,13 +151,20 @@ export async function topPages(
   runner: Queryable = db(),
 ): Promise<PageRow[]> {
   const { rows } = await runner.query<PageRow>(
-    `SELECT path,
-            COUNT(*)::bigint                   AS pageviews,
-            COUNT(DISTINCT visitor_id)::bigint AS visitors
-       FROM events
-      WHERE tenant_id = $1 AND type = 'pageview' AND path IS NOT NULL
-        AND occurred_at >= $2 AND occurred_at <= $3
-      GROUP BY path
+    `SELECT e.path,
+            COUNT(*)::bigint                     AS pageviews,
+            COUNT(DISTINCT e.visitor_id)::bigint AS visitors
+       FROM events e
+       -- is_bot lives on the session, not the event, which is why this was
+       -- the one figure on the dashboard that still counted crawlers: the
+       -- pages a merchandiser reorders the shop around were whichever ones a
+       -- bot happened to like. A LEFT JOIN, because a server-side event
+       -- carries no session and is not a crawler.
+       LEFT JOIN sessions s ON s.id = e.session_id
+      WHERE e.tenant_id = $1 AND e.type = 'pageview' AND e.path IS NOT NULL
+        AND COALESCE(s.is_bot, false) = false
+        AND e.occurred_at >= $2 AND e.occurred_at <= $3
+      GROUP BY e.path
       ORDER BY COUNT(*) DESC
       LIMIT $4`,
     [tenantId, from, to, Math.min(limit, 200)],

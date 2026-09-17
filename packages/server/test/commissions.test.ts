@@ -383,11 +383,23 @@ describe('social shares', () => {
       },
     });
 
-    expect((await getBalance(tenant.id, sharer.id)).balance).toBe(25);
+    // 25 for the share rule, and 25 for the Social Butterfly badge it earns.
+    // The badge counts verified shares rather than points, so it is evaluated
+    // when the share verifies -- before, it only moved if the rule happened to
+    // award, and a capped or cooled-down share left it behind.
+    expect((await getBalance(tenant.id, sharer.id)).balance).toBe(50);
     const { rows } = await db().query('SELECT status, points_awarded FROM share_events WHERE id = $1', [
       share.share.id,
     ]);
     expect(rows[0]).toMatchObject({ status: 'verified', points_awarded: 25 });
+
+    const badges = await db().query<{ key: string }>(
+      `SELECT b.key FROM badge_awards a
+         JOIN badges b ON b.id = a.badge_id
+        WHERE a.tenant_id = $1 AND a.contact_id = $2`,
+      [tenant.id, sharer.id],
+    );
+    expect(badges.rows.map((row) => row.key)).toContain('social_butterfly');
   });
 
   it('does not pay for a bot click on a shared link', async () => {
@@ -429,7 +441,9 @@ describe('social shares', () => {
       });
     }
 
-    expect((await getBalance(tenant.id, sharer.id)).balance).toBe(25);
+    // Paid once: 25 for the share, 25 for the badge it earned, and nothing
+    // more however many people click.
+    expect((await getBalance(tenant.id, sharer.id)).balance).toBe(50);
   });
 
   it('rejects an unsupported network', async () => {
@@ -518,3 +532,61 @@ describe('a refund takes back what the order paid out (MEDIUM)', () => {
     expect(rows[0]!.status).toBe('qualified');
   });
 });
+
+describe('a refunded order stops counting as a sale (LOW)', () => {
+  it('unwinds the product figures on the day the order was placed', async () => {
+    // A refunded order kept its purchase and its revenue in product_stats, so
+    // a product with a heavy return rate read as a bestseller on the very
+    // screen buyers restock from.
+    const tenantRow = await tenantObject();
+    await recordOrder(tenantRow, {
+      orderRef: 'returned-1',
+      totalCents: 5_000,
+      email: 'returner@example.com',
+      items: [{ productRef: 'flag-9', quantity: 2, subtotalCents: 5_000 }],
+    });
+
+    const sold = await productStats('flag-9');
+    expect(sold).toMatchObject({ purchases: '2', revenue_cents: '5000' });
+
+    await refundOrder(tenantRow, 'returned-1');
+
+    // Netted out on the original day, not pushed into a week nobody is
+    // looking at.
+    const after = await productStats('flag-9');
+    expect(after).toMatchObject({ purchases: '0', revenue_cents: '0' });
+    const { rows } = await db().query<{ n: string }>(
+      'SELECT count(*) AS n FROM product_stats WHERE tenant_id = $1 AND product_ref = $2',
+      [tenant.id, 'flag-9'],
+    );
+    expect(Number(rows[0]!.n)).toBe(1);
+  });
+
+  it('does not push a count below zero', async () => {
+    const tenantRow = await tenantObject();
+    await recordOrder(tenantRow, {
+      orderRef: 'returned-2',
+      totalCents: 1_000,
+      email: 'returner2@example.com',
+      items: [{ productRef: 'flag-8', quantity: 1, subtotalCents: 1_000 }],
+    });
+    // Somebody refunds twice, or the stats were reset in between.
+    await db().query(
+      'UPDATE product_stats SET purchases = 0, revenue_cents = 0 WHERE tenant_id = $1',
+      [tenant.id],
+    );
+
+    await refundOrder(tenantRow, 'returned-2');
+
+    expect(await productStats('flag-8')).toMatchObject({ purchases: '0', revenue_cents: '0' });
+  });
+});
+
+async function productStats(productRef: string) {
+  const { rows } = await db().query<{ purchases: string; revenue_cents: string }>(
+    `SELECT SUM(purchases)::text AS purchases, SUM(revenue_cents)::text AS revenue_cents
+       FROM product_stats WHERE tenant_id = $1 AND product_ref = $2`,
+    [tenant.id, productRef],
+  );
+  return rows[0]!;
+}

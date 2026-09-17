@@ -42,6 +42,21 @@ export function emptyReport(source: string, dryRun: boolean): ImportReport {
   };
 }
 
+/**
+ * Say when a file was cut short by a quote that was never closed.
+ *
+ * Everything after it collapses into one value, so most of the rows simply are
+ * not there. Importing 40 of 4,000 contacts and reporting success is the worst
+ * possible outcome -- the retailer moves on believing the list came across.
+ */
+export function warnIfTruncated(report: ImportReport, table: { unterminatedQuote: boolean }): void {
+  if (!table.unterminatedQuote) return;
+  report.warnings.push(
+    'The file ends inside a quoted value, so rows after that point were not read. ' +
+      'Check for a stray " and export again.',
+  );
+}
+
 /** Keep the error list bounded so one broken export cannot exhaust memory. */
 export function recordError(report: ImportReport, row: number, reason: string): void {
   report.failed += 1;
