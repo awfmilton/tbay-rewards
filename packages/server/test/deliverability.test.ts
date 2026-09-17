@@ -704,6 +704,114 @@ describe('classifying a delivery failure', () => {
     expect(await isSuppressed(tenant.id, unexplained)).not.toBeNull();
   });
 
+  it('writes off a permanently full mailbox, and only on the lapsing suppression (HIGH)', async () => {
+    // The sibling test above said in its comment that a full mailbox is
+    // "written off after six tries, and suppressed for thirty days" and
+    // asserted neither half. It was not true: `capacity` was `counts: false`,
+    // so six failures suppressed nothing and the next broadcast started the
+    // whole seventeen-hour ladder again, forever, against a mailbox nobody
+    // had emptied in a month.
+    //
+    // Both halves, then. Written off -- and written off *lapsing*, because a
+    // mailbox can be emptied and a permanent suppression could never find out.
+    const address = `full-${Math.random().toString(36).slice(2)}@example.com`;
+    expect(
+      await recordFailure(
+        tenant.id,
+        address,
+        "552 5.2.2 <them@example.com>: Recipient address rejected: User's mailbox is full",
+        6,
+        6,
+      ),
+    ).toBe('soft');
+
+    const row = await isSuppressed(tenant.id, address);
+    expect(row).not.toBeNull();
+    expect(row!.reason).toBe('repeated_failure');
+    expect(row!.expires_at).not.toBeNull();
+
+    // And the transient form of the same reply still suppresses nobody: the
+    // ladder has not run out, and 4xx is never a verdict.
+    const early = `full-early-${Math.random().toString(36).slice(2)}@example.com`;
+    await recordFailure(tenant.id, early, '452 4.2.2 mailbox is full', 6, 6);
+    expect(await isSuppressed(tenant.id, early)).toBeNull();
+  });
+
+  it('will not write off an audience one unexplained address at a time (HIGH)', async () => {
+    // The backstop for the wording nobody has written down yet.
+    //
+    // Every other defence here is a table row, and a row only helps for a
+    // reply somebody has already seen. A provider that starts refusing us
+    // tomorrow in unfamiliar words produces `unknown`, which counts -- by
+    // design, because six unexplained failures really is when giving up on
+    // one address is honest. Six unexplained failures for the whole list in
+    // the same hour is not a list of dead mailboxes, and no single reply
+    // carries the information needed to tell the difference. So it is counted
+    // instead of classified.
+    // Its own tenant: the guard counts an hour of this tenant's unexplained
+    // write-offs, so a shared fixture would let the tests before this one
+    // decide its answer.
+    const own = await makeTenant();
+
+    // A reply nothing in the table recognises. The first draft of this test
+    // used "A problem occurred", which the block wordings added in the same
+    // round classify as a reputation block -- so nothing counted, nothing was
+    // suppressed, and the test passed with the guard deleted. Mutation
+    // testing is the only reason that is not still true.
+    const reply = '550 Delivery to the recipient failed';
+    expect(saysSomethingAboutTheMailbox(reply)).toBe(true);
+
+    const addresses = Array.from(
+      { length: 40 },
+      (_, i) => `blast-${i}-${Math.random().toString(36).slice(2)}@example.com`,
+    );
+    for (const address of addresses) {
+      await recordFailure(own.id, address, reply, 6, 6);
+    }
+
+    const suppressed = [];
+    for (const address of addresses) {
+      if (await isSuppressed(own.id, address)) suppressed.push(address);
+    }
+    // Live -- the reply really does count, so the budget really did run out
+    // for the addresses ahead of the threshold ...
+    expect(suppressed.length).toBeGreaterThan(0);
+    // ... and bounded, which is the whole finding.
+    expect(suppressed.length).toBeLessThan(addresses.length);
+    expect(suppressed.length).toBeLessThanOrEqual(25);
+
+    // A hard bounce is a fact about a mailbox, not a guess, and a broadcast
+    // into a stale list genuinely does produce thousands at once. The guard
+    // must not touch those.
+    const dead = `dead-${Math.random().toString(36).slice(2)}@example.com`;
+    expect(await recordFailure(own.id, dead, '550 5.1.1 User unknown', 1, 6)).toBe('hard');
+    expect(await isSuppressed(own.id, dead)).not.toBeNull();
+  });
+
+  it('does not read a complaint address as the recipient it names (HIGH)', () => {
+    // Providers put a complaint address inside the block itself, and whether
+    // the reply quotes *a mailbox* is what separates AOL's dead account from a
+    // relay refusing our own -- word for word the same reply. Stripping
+    // postmaster@ alongside real recipients made every policy block look like
+    // it named somebody, so a reputation block became a hard bounce at the
+    // provider that had just told us the problem was ours.
+    for (const message of [
+      '550 5.7.1 Service unavailable; this account has been disabled. Contact postmaster@outlook.com',
+      '550 5.7.1 This account has been discontinued; see abuse@amazonaws.com',
+      '554 Your account has been deactivated. Write to support@relay.example if in error.',
+    ]) {
+      expect(classifyFailure(message), message).not.toBe('hard');
+      expect(saysSomethingAboutTheMailbox(message), message).toBe(false);
+    }
+
+    // And the reply that does name a mailbox still bounces.
+    expect(
+      classifyFailure(
+        '550 5.7.1 <them@aol.com>: Recipient address rejected: This account has been disabled or discontinued',
+      ),
+    ).toBe('hard');
+  });
+
   it('does not read a protocol name inside the recipient address (MEDIUM)', () => {
     // Word boundaries fixed Kessler and not <ssl@example.com>, because `<`,
     // `@` and `.` are all non-word characters. The addresses are stripped

@@ -196,6 +196,24 @@ export function rateLimit(key: string, limit: number, windowMs = 60_000): RateLi
       // rather than after two turns of the map.
       klass.live = unexpired(klass.live, now);
       klass.old = unexpired(klass.old, now);
+      // And the floor comes down with it. `floor` is the carry size, and the
+      // rotation trigger is `live.size >= floor + ceiling`, so a floor left
+      // behind by a sweep is a permanent tax on the class: sweep 900 of 1,000
+      // carried windows and the class then needs 1,000 + ceiling live keys
+      // before it will rotate again, holding the 900 it just freed. It
+      // ratchets, because only a rotation ever wrote it. Clamping to the
+      // surviving size can only ever lower it, which is the only direction
+      // that is safe -- raising it would delay a rotation.
+      if (klass.floor > klass.live.size) klass.floor = klass.live.size;
+      // And the floor comes down with it. `floor` is the carry size, and the
+      // rotation trigger is `live.size >= floor + ceiling`, so a floor left
+      // behind by a sweep is a permanent tax on the class: sweep 900 of 1,000
+      // carried windows and the class then needs 1,000 + ceiling live keys
+      // before it will rotate again, holding the 900 it just freed. It
+      // ratchets, because only a rotation ever wrote it. Clamping to the
+      // surviving size can only ever lower it, which is the only direction
+      // that is safe -- raising it would delay a rotation.
+      if (klass.floor > klass.live.size) klass.floor = klass.live.size;
     }
     lastSweep = now;
   }

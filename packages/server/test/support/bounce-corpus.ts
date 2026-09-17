@@ -327,15 +327,16 @@ export const BOUNCE_CORPUS: readonly BounceCase[] = [
     reply: '552 5.2.2 <them@example.com>: Recipient address rejected: Over quota',
     subject: 'capacity',
     kind: 'soft',
-    counts: false,
-    because: 'Permanently over quota is still not a dead mailbox.',
+    counts: true,
+    because:
+      'Permanently over quota is not a dead mailbox, so not a hard bounce -- but a mailbox nobody empties across the whole seventeen-hour ladder is abandoned, and with `counts: false` it was retried in full on every broadcast forever. It ends on the lapsing thirty-day suppression, which is what "come back and check" looks like.',
   },
   {
     provider: 'qmail',
     reply: '552 Requested mail action aborted: exceeded storage allocation',
     subject: 'capacity',
     kind: 'soft',
-    counts: false,
+    counts: true,
     because: 'Same, worded without a status.',
   },
   {
@@ -371,11 +372,11 @@ export const BOUNCE_CORPUS: readonly BounceCase[] = [
     provider: 'Gmail',
     reply:
       '450-4.2.1 The user you are trying to contact is receiving mail at a rate that\n450-4.2.1 prevents additional messages from being delivered.',
-    subject: 'mailbox',
+    subject: 'deferral',
     kind: 'soft',
     counts: false,
     because:
-      'The status says mailbox and the mailbox is fine -- which is why severity decides before subject does.',
+      'The status says mailbox and the mailbox is fine: this is a live customer with a busy inbox. Reading it as a deferral rather than leaning on the severity is what makes the *permanent* form of the same wording -- Google sends it at 550 5.2.1 too -- safe as well.',
   },
   {
     provider: 'Postfix',
@@ -438,5 +439,211 @@ export const BOUNCE_CORPUS: readonly BounceCase[] = [
     counts: true,
     because:
       '"535" after a colon and a space is in reply-code position. Only the code a reply *opens* with may be read as an authentication refusal.',
+  },
+
+  // ── One row per table entry, so no row of the table is unexercised ───────
+  //
+  // Added because the corpus covered nine of twenty-six rows: every status
+  // the table can be asked about had a documented answer and no witness, and
+  // three of the rows that had no witness were wrong.
+  {
+    provider: 'Gmail',
+    reply:
+      '550 5.2.1 The user you are trying to contact is receiving email at a rate that prevents additional messages from being delivered.',
+    subject: 'deferral',
+    kind: 'soft',
+    counts: false,
+    because:
+      'Google documents two 550 5.2.1 replies -- an inactive account, and this one. `decide: mailbox` suppressed a live customer permanently on the first attempt with no wording able to say otherwise.',
+  },
+  {
+    provider: 'Gmail',
+    reply: '550 5.2.1 <them@gmail.com>: The email account that you tried to reach is disabled.',
+    subject: 'mailbox',
+    kind: 'hard',
+    counts: true,
+    because: 'The other documented 5.2.1: this one really is gone.',
+  },
+  {
+    provider: 'Exchange Online',
+    reply: '#550 5.1.0 smtp;550 5.1.0 RESOLVER.ADR.RecipNotFound; not found ##',
+    subject: 'mailbox',
+    kind: 'hard',
+    counts: true,
+    because:
+      '5.1.0 is "other address status" and settles nothing, which is the point of its row: without it the 1.x catch-all would call every unrecognised 1.x status a dead mailbox. Exchange\'s own RESOLVER marker is what settles this one.',
+  },
+  {
+    provider: 'Postfix',
+    reply: '501 5.1.3 Bad recipient address syntax',
+    subject: 'mailbox',
+    kind: 'hard',
+    counts: true,
+    because: 'An address that is not an address will never be one.',
+  },
+  {
+    provider: 'Exchange',
+    reply: '550 5.1.4 Destination mailbox address ambiguous',
+    subject: 'unknown',
+    kind: 'soft',
+    counts: true,
+    because:
+      'Two mailboxes match and the server will not choose. Not a dead mailbox -- the 1.x catch-all would have called it one -- but nothing else explains it either, so the attempt budget applies.',
+  },
+  {
+    provider: 'Exim',
+    reply: '550 5.1.5 <them@example.com>: Recipient address rejected: User unknown in local recipient table',
+    subject: 'mailbox',
+    kind: 'hard',
+    counts: true,
+    because:
+      '5.1.5 means "destination address valid" in the registry, so its row exists to keep the 1.x catch-all off it. The wording is what makes this one a dead mailbox.',
+  },
+  {
+    provider: 'Postfix',
+    reply: '550 5.1.6 Mailbox has moved to a new address',
+    subject: 'mailbox',
+    kind: 'hard',
+    counts: true,
+    because: 'Moved with no forwarding address is gone.',
+  },
+  {
+    provider: 'Postfix',
+    reply: '501 5.1.7 Bad sender address syntax',
+    subject: 'sender',
+    kind: 'soft',
+    counts: false,
+    because: 'Our address, not theirs. It arrives for every recipient of the broadcast.',
+  },
+  {
+    provider: 'Exim',
+    reply: '550 5.1.8 Sender domain must exist',
+    subject: 'sender',
+    kind: 'soft',
+    counts: false,
+    because: 'Our domain, not theirs.',
+  },
+  {
+    provider: 'Sendmail',
+    reply: '550 5.1.9 Message relayed to non-compliant mailer',
+    subject: 'unknown',
+    kind: 'soft',
+    counts: true,
+    because:
+      'A statement about a relay in the middle. Its row exists only to keep the 1.x catch-all from reading it as a dead mailbox.',
+  },
+  {
+    provider: 'Postfix',
+    reply: '556 5.1.10 <them@nomx.example>: Recipient address rejected: Domain has null MX',
+    subject: 'mailbox',
+    kind: 'hard',
+    counts: true,
+    because: 'A null MX is the domain saying, in DNS, that it accepts no mail. RFC 7505.',
+  },
+  {
+    provider: 'a relay with an unregistered 1.x detail',
+    reply: '550 5.1.42 Unknown address error',
+    subject: 'mailbox',
+    kind: 'hard',
+    counts: true,
+    because:
+      'The 1.x catch-all. Every registered 1.x detail that is *not* about the destination mailbox has its own row above, so what is left is addressing.',
+  },
+  {
+    provider: 'a relay with an undefined mailbox status',
+    reply: '550 5.2.0 Other or undefined mailbox status',
+    subject: 'unknown',
+    kind: 'soft',
+    counts: true,
+    because:
+      '2.0 says "something about the mailbox" and nothing more. Its row keeps the 2.x catch-all off it; unexplained is what the attempt budget is for.',
+  },
+  {
+    provider: 'Postfix',
+    reply: '552 5.2.3 Message length exceeds administrative limit',
+    subject: 'message',
+    kind: 'soft',
+    counts: false,
+    because: 'This message, at this size, for everybody. Never a fact about a mailbox.',
+  },
+  {
+    provider: 'Sendmail',
+    reply: '450 5.2.4 Mailing list expansion problem',
+    subject: 'unknown',
+    kind: 'soft',
+    counts: true,
+    because: 'An alias expanded badly somewhere downstream. Not the mailbox we addressed.',
+  },
+  {
+    provider: 'a relay with an unregistered 2.x detail',
+    reply: '550 5.2.7 Delivery failed',
+    subject: 'mailbox',
+    kind: 'hard',
+    counts: true,
+    because: 'The 2.x catch-all: the status class is mailbox status, and nothing narrows it.',
+  },
+  {
+    provider: 'AT&T',
+    reply: '553 5.3.0 flph844 DNSBL:RBL 521< 203.0.113.7 >_is_blocked. For assistance forward this to abuse_rbl@abuse-att.net',
+    subject: 'sender',
+    kind: 'soft',
+    counts: false,
+    because:
+      'A permanent 3.x is not the receiving system having a moment. Read as a connection fault it was retried every sixty seconds for three days -- about 4,320 attempts -- at the provider that had just blocklisted us. The abuse address in the reply must not make this look like a reply that names a recipient, either.',
+  },
+  {
+    provider: 'Postfix',
+    reply: '552 5.3.4 Message too big for system',
+    subject: 'message',
+    kind: 'soft',
+    counts: false,
+    because:
+      'The one 3.x reply that is about the message. It is also why a named detail has to outrank a class wildcard: consulted after `5.3.*`, this was read as a reputation block.',
+  },
+  {
+    provider: 'Exim',
+    reply: '550 5.4.4 Unable to route: MX lookup failed for example.invalid',
+    subject: 'domain',
+    kind: 'soft',
+    counts: true,
+    because:
+      'The domain does not resolve. Soft and counting, so a genuinely dead domain ends on the lapsing suppression and a provider with a broken DNS record does not lose its whole audience permanently.',
+  },
+  {
+    provider: 'Zoho',
+    reply: '550 5.4.6 Unusual sending activity detected. Please try after sometime.',
+    subject: 'sender',
+    kind: 'soft',
+    counts: false,
+    because:
+      'Zoho sends the registry\'s "routing loop" code to the *sending* client: a block on our own account that lifts within the hour. Its old `decide: domain` row counted, so one hour of throttling suppressed every recipient for thirty days.',
+  },
+  {
+    provider: 'Postfix',
+    reply: '450 4.4.1 Host or domain name not found. Name service error for name=example.com',
+    subject: 'domain',
+    kind: 'soft',
+    counts: false,
+    because:
+      'DNS is unreachable, which is about the domain and not about anybody\'s mailbox. It reached this row through `*.4.*`, because 5.4.1 -- Exchange\'s dead recipient -- is keyed to its own class: when that row was keyed `*.4.1` this reply fell back to `mailbox`, which severity happened to make harmless here and would have hard-bounced at 5xx.',
+  },
+  {
+    provider: 'Postfix',
+    reply: '454 4.7.0 Temporary authentication failure',
+    subject: 'credentials',
+    kind: 'transport',
+    counts: false,
+    because:
+      'Our own relay\'s SASL backend having a moment. Classified soft it spent an attempt per recipient, so five minutes of our own outage burned five of every recipient\'s six attempts on a fault that was not theirs.',
+  },
+  {
+    provider: 'Outlook, citing a complaint address',
+    reply:
+      '550 5.7.1 Service unavailable; this account has been disabled. Please contact postmaster@outlook.com if you believe this is in error.',
+    subject: 'sender',
+    kind: 'soft',
+    counts: false,
+    because:
+      'A role address is not a named recipient. "This account has been disabled" is a wording that only means a dead mailbox when the reply quotes the mailbox -- and stripping postmaster@ alongside real addresses made every policy block look like it did.',
   },
 ];

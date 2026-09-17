@@ -6,6 +6,7 @@ import {
   statusEntry,
   verdictFor,
   type FailureSubject,
+  type Verdict,
 } from './bounce-table.js';
 
 /**
@@ -151,9 +152,28 @@ function parseReply(said: string): Reply {
  */
 function readReply(message: string): { said: string; named: boolean } {
   const bounded = message.slice(0, 65_536);
-  const deAddressed = bounded.replace(EMAIL_SHAPED, ' ');
-  return { said: deAddressed.replace(/<[^<>\s]*>/g, ' '), named: deAddressed !== bounded };
+  // Role addresses first, and they do not count as naming anybody. Providers
+  // put a complaint address in the block itself -- Outlook cites
+  // "postmaster@outlook.com", SES cites "abuse@amazonaws.com", Gmail's
+  // unsolicited-mail refusal cites a support address -- and `named` is what
+  // gates the wordings that are identical whether they are about a recipient
+  // or about our own account. A reputation block reading "This account has
+  // been disabled" alongside a postmaster address satisfied
+  // `needsNamedAddress` and was written off as a dead mailbox, at a provider
+  // that had just told us the problem was ours.
+  const impersonal = bounded.replace(POLICY_CONTACT, ' ');
+  const deAddressed = impersonal.replace(EMAIL_SHAPED, ' ');
+  return { said: deAddressed.replace(/<[^<>\s]*>/g, ' '), named: deAddressed !== impersonal };
 }
+
+/**
+ * Addresses that tell us where to complain rather than who we were writing to.
+ *
+ * Same linear shape as EMAIL_SHAPED -- a bounded alternation behind a
+ * lookbehind -- because it reads the same remote-chosen text.
+ */
+const POLICY_CONTACT =
+  /(?<![A-Za-z0-9._%+-])(?:postmaster|abuse|mailer-daemon|mailerdaemon|mailer_daemon|support|helpdesk|noreply|no-reply|no_reply|donotreply|do-not-reply|bounce[sd]?)@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/gi;
 
 /**
  * Address-shaped, not merely "has an @ in it".
@@ -174,8 +194,26 @@ const EMAIL_SHAPED =
  * two separately, which is the whole reason they are separate.
  */
 export function subjectOf(message: string): FailureSubject {
+  return read(message).subject;
+}
+
+/**
+ * Both halves of the answer, from one parse.
+ *
+ * `subjectOf` and `severityOf` each read the reply from scratch, and
+ * `recordFailure` asked for the classification and then asked separately
+ * whether it counted -- four full passes over a reply the remote MTA chose the
+ * length of, per failure, where two of the four were byte-identical work. The
+ * ceiling is 64 KB and the regexes are linear, so this was never a hang; it
+ * was four times the CPU for one answer, on the path every send failure takes.
+ */
+export function read(message: string): { subject: FailureSubject; severity: 4 | 5 | null } {
   const { said, named } = readReply(message);
   const reply = parseReply(said);
+  return { subject: subjectFrom(reply, said, named), severity: reply.severity };
+}
+
+function subjectFrom(reply: Reply, said: string, named: boolean): FailureSubject {
 
   // A reply that never reached a mailbox, or that refused us, outranks
   // everything -- including the enhanced status, because providers put both
@@ -197,7 +235,13 @@ export function subjectOf(message: string): FailureSubject {
   if (reply.severity === 4 && reply.closing) return 'connection';
 
   // The status, where it settles the question outright.
-  const entry = reply.subject === null ? null : statusEntry(reply.subject, reply.detail ?? 0);
+  // The class matters as much as the subject: 4.3.x is the receiving server
+  // having a moment, 5.3.x is where AT&T puts an RBL block. `severity` is the
+  // class the reply settled on, which is the most severe one it mentioned.
+  const entry =
+    reply.subject === null
+      ? null
+      : statusEntry(reply.severity ?? 5, reply.subject, reply.detail ?? 0);
   if (entry && 'decide' in entry) return entry.decide;
 
   // Otherwise the wording, and then whatever the status leans toward. A 5.7.x
@@ -217,8 +261,14 @@ export function severityOf(message: string): 4 | 5 | null {
   return parseReply(readReply(message).said).severity;
 }
 
+/** The verdict, from one parse. */
+export function verdictOf(message: string): Verdict {
+  const { subject, severity } = read(message);
+  return verdictFor(subject, severity);
+}
+
 export function classifyFailure(message: string): FailureKind {
-  return verdictFor(subjectOf(message), severityOf(message)).kind;
+  return verdictOf(message).kind;
 }
 
 /**
@@ -233,7 +283,7 @@ export function classifyFailure(message: string): FailureKind {
  * days. One source of truth cannot drift from itself.
  */
 export function saysSomethingAboutTheMailbox(message: string): boolean {
-  return verdictFor(subjectOf(message), severityOf(message)).counts;
+  return verdictOf(message).counts;
 }
 
 export function normaliseEmail(email: string): string {
@@ -365,13 +415,19 @@ export async function recordFailure(
   maxAttempts: number,
   runner: Queryable = db(),
 ): Promise<FailureKind> {
-  const type = classifyFailure(reason);
+  const verdict = verdictOf(reason);
+  const type = verdict.kind;
 
   if (type === 'hard') {
     await suppress(tenantId, email, 'hard_bounce', reason, runner);
   } else if (type === 'complaint') {
     await suppress(tenantId, email, 'complaint', reason, runner);
-  } else if (type === 'soft' && attempts >= maxAttempts && saysSomethingAboutTheMailbox(reason)) {
+  } else if (
+    type === 'soft' &&
+    attempts >= maxAttempts &&
+    verdict.counts &&
+    !(await tooManyAtOnce(tenantId, runner))
+  ) {
     // Only a genuinely unexplained failure counts toward suppression. A
     // transport failure says nothing about the mailbox, so it never does,
     // however many times it repeats -- and neither does a reputation or
@@ -384,4 +440,46 @@ export async function recordFailure(
   }
 
   return type;
+}
+
+/**
+ * How many unexplained write-offs in an hour stop being a coincidence.
+ *
+ * `repeated_failure` is the only suppression reason that is a guess rather
+ * than a fact: six failures nobody could explain. One tenant reaching this
+ * many distinct addresses in an hour is not unlucky, it is one cause -- and
+ * the whole point of reading the subject is that a cause about us must not be
+ * charged to recipients.
+ */
+const UNEXPLAINED_PER_HOUR = 25;
+
+/**
+ * The blast-radius guard: the backstop for wording nobody has written down yet.
+ *
+ * Every other defence in this file is a table row, and a table row only helps
+ * for a reply somebody has already seen. A provider that starts refusing us
+ * tomorrow, in words no row matches, produces `unknown` -- which counts, by
+ * design, because six unexplained failures really is when giving up on one
+ * address is honest. Six unexplained failures for *ten thousand* addresses in
+ * the same hour is not ten thousand dead mailboxes, and the classifier cannot
+ * tell the difference from inside one reply.
+ *
+ * So it is counted instead of classified. Above the threshold the suppression
+ * is declined and the address stays on the list; the sends still fail and the
+ * retry ladder still gives up on each message, which is the correct outcome
+ * for an outage. Hard bounces and complaints are unaffected -- those are facts
+ * about a mailbox, and a broadcast into a stale list genuinely does produce
+ * thousands at once.
+ */
+async function tooManyAtOnce(tenantId: string, runner: Queryable): Promise<boolean> {
+  const row = await queryOne<{ over: boolean }>(
+    runner,
+    `SELECT count(*) >= $2::int AS over
+       FROM email_suppressions
+      WHERE tenant_id = $1
+        AND reason = 'repeated_failure'
+        AND created_at > now() - interval '1 hour'`,
+    [tenantId, UNEXPLAINED_PER_HOUR],
+  );
+  return row?.over ?? false;
 }
