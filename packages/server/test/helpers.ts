@@ -21,7 +21,7 @@ process.env.MIGRATE_ON_BOOT = 'false';
 process.env.TBAY_CLAIM_SIGNER_KEY =
   '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d';
 
-const { migrate, resetDatabase } = await import('../src/db/migrate.js');
+const { resetAndMigrate } = await import('../src/db/migrate.js');
 const { db, closeDb } = await import('../src/db/pool.js');
 const { provisionTenant } = await import('../src/services/provision.js');
 const { clearTenantCache } = await import('../src/services/tenants.js');
@@ -41,8 +41,9 @@ let migrated = false;
 /** Drop and re-migrate once per test process. */
 export async function setupDatabase(): Promise<void> {
   if (migrated) return;
-  await resetDatabase();
-  await migrate();
+  // One lock, held across the drop and all the migrations, so a second vitest
+  // process cannot drop the schema out from under this one's migrations.
+  await resetAndMigrate();
   migrated = true;
 }
 

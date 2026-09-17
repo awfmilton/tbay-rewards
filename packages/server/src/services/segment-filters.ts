@@ -62,6 +62,33 @@ interface FieldDef {
  * settings screen becomes an arbitrary-read primitive over the whole schema —
  * including other tenants' rows, pii salts and key hashes.
  */
+/**
+ * The tenant's default currency, as a correlated subquery.
+ *
+ * `points_balances` has been keyed `(tenant_id, contact_id, point_type)` since
+ * migration 0013, and these three fields were still written as if one contact
+ * had one balance. A scalar subquery that returns two rows does not return the
+ * first one -- Postgres raises "more than one row returned by a subquery used
+ * as an expression" -- so the moment a retailer created a second currency and
+ * one customer earned in both, `GET /v1/segments/:key` (count), the preview
+ * and every rebuild failed with a 500. Multi-currency is the feature these
+ * three fields were never taught about.
+ *
+ * The default type is the one an award with no type named goes to, so it is
+ * what "points balance" has always meant. `point_types` carries a unique
+ * partial index on `(tenant_id) WHERE is_default`, so this is single-valued by
+ * construction; the COALESCE covers a tenant provisioned before 0013 ran,
+ * where every row is implicitly 'points'.
+ *
+ * Segmenting on a *named* currency is a separate field shape and a separate
+ * change -- it needs the tenant's type list passed to the compiler the way
+ * custom fields are, because a currency key is data and must be bound, never
+ * interpolated.
+ */
+const DEFAULT_POINT_TYPE = `COALESCE(
+  (SELECT pt.key FROM point_types pt
+     WHERE pt.tenant_id = c.tenant_id AND pt.is_default LIMIT 1), 'points')`;
+
 export const FIELDS: Record<string, FieldDef> = {
   email:            { kind: 'text',   sql: 'c.email',              label: 'Email' },
   name:             { kind: 'text',   sql: 'c.name',               label: 'Name' },
@@ -78,19 +105,22 @@ export const FIELDS: Record<string, FieldDef> = {
   points_balance: {
     kind: 'number',
     sql: `(SELECT COALESCE(b.balance, 0) FROM points_balances b
-            WHERE b.tenant_id = c.tenant_id AND b.contact_id = c.id)`,
+            WHERE b.tenant_id = c.tenant_id AND b.contact_id = c.id
+              AND b.point_type = ${DEFAULT_POINT_TYPE})`,
     label: 'Points balance',
   },
   lifetime_points: {
     kind: 'number',
     sql: `(SELECT COALESCE(b.lifetime_earned, 0) FROM points_balances b
-            WHERE b.tenant_id = c.tenant_id AND b.contact_id = c.id)`,
+            WHERE b.tenant_id = c.tenant_id AND b.contact_id = c.id
+              AND b.point_type = ${DEFAULT_POINT_TYPE})`,
     label: 'Points earned, all time',
   },
   rank_key: {
     kind: 'text',
     sql: `(SELECT r.key FROM points_balances b JOIN ranks r ON r.id = b.current_rank_id
-            WHERE b.tenant_id = c.tenant_id AND b.contact_id = c.id)`,
+            WHERE b.tenant_id = c.tenant_id AND b.contact_id = c.id
+              AND b.point_type = ${DEFAULT_POINT_TYPE})`,
     label: 'Rank',
   },
   order_count: {
