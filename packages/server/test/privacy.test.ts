@@ -955,7 +955,7 @@ describe('erasure never destroys money in flight (HIGH)', () => {
     const contact = await withSpendIntent('spender@example.com', 'pending');
 
     await expect(eraseContact(tenant.id, contact.id)).rejects.toThrow(
-      /unsettled on-chain transaction/i,
+      /checkout in progress/i,
     );
 
     // Nothing was touched, so the intent can still settle.
@@ -999,19 +999,36 @@ describe('erasure never destroys money in flight (HIGH)', () => {
     return contact;
   }
 
-  it('refuses between the burn and the release', async () => {
+  it('keeps the payout wallet between the burn and the release (HIGH)', async () => {
     // The worst moment to lose the recipient: the L2 tokens are gone and the
     // L1 payout has not happened yet.
+    //
+    // Round five answered this by refusing the erasure, and the refusal named
+    // "releasing or rejecting" as the remedy -- both operator-only routes that
+    // answer 503 unless BRIDGE_OPERATOR_TOKEN is set, which ships empty. So
+    // the erasure could not be carried out by the retailer at all, with no
+    // TTL and no worker to end it. Refusing forever is not a safer answer than
+    // destroying the record; it is a different way of not doing the job.
+    //
+    // The row is two things: a link to a person and a debt to a wallet. The
+    // link goes, the debt stays payable, and the erasure reports it.
     const contact = await withWithdrawal('bridging@example.com', 'burn_verified');
 
-    await expect(eraseContact(tenant.id, contact.id)).rejects.toThrow(
-      /unsettled on-chain transaction/i,
-    );
-    const { rows } = await db().query<{ l1_recipient: string }>(
-      'SELECT l1_recipient FROM bridge_withdrawals WHERE contact_id = $1',
+    const result = await eraseContact(tenant.id, contact.id);
+    expect(result.obligations_kept).toBe(1);
+
+    const { rows } = await db().query<{
+      l1_recipient: string; from_address: string; member_id: string | null; status: string;
+    }>(
+      'SELECT l1_recipient, from_address, member_id, status FROM bridge_withdrawals WHERE contact_id = $1',
       [contact.id],
     );
+    // Still payable, to the wallet that actually burned the tokens.
     expect(rows[0]!.l1_recipient).toBe(WALLET);
+    expect(rows[0]!.from_address).toBe(WALLET);
+    expect(rows[0]!.status).toBe('burn_verified');
+    // And no longer joinable to this person across tenants.
+    expect(rows[0]!.member_id).toBeNull();
   });
 
   it('erases a released withdrawal, and not at the burn address', async () => {
@@ -1029,6 +1046,60 @@ describe('erasure never destroys money in flight (HIGH)', () => {
     // sentinel that must not be used to mean "erased".
     expect(rows[0]!.l1_recipient).not.toBe(BURN_ADDRESS);
     expect(rows[0]!.from_address).not.toBe(BURN_ADDRESS);
+  });
+
+  it('keeps the wallet on an intent that could still be settled (HIGH)', async () => {
+    // SPEND_TTL_MINUTES is sixty, so "expired" is the ordinary state of an
+    // intent an hour after checkout -- including one where the customer really
+    // did send their TBAY and the verification simply did not land. Treating
+    // expiry as "settled by abandonment" and scrubbing `from_address` there is
+    // the round-four money-destroying bug in a narrower window: `from_address`
+    // is the only field a hand-settlement can match on, and the tokens are
+    // already at the retailer's payout wallet.
+    const recent = await withSpendIntent('recently-lapsed@example.com', 'expired');
+    await db().query(
+      `UPDATE token_spend_intents SET expires_at = now() - interval '2 hours'
+        WHERE contact_id = $1`,
+      [recent.id],
+    );
+    await eraseContact(tenant.id, recent.id);
+    const kept = await db().query<{ from_address: string; member_id: string | null }>(
+      'SELECT from_address, member_id FROM token_spend_intents WHERE contact_id = $1',
+      [recent.id],
+    );
+    expect(kept.rows[0]!.from_address).toBe(WALLET);
+    // Still unlinked from the person across tenants, which is what identifies.
+    expect(kept.rows[0]!.member_id).toBeNull();
+
+    // Past the window nobody can act on it any more, so the wallet goes.
+    const ancient = await withSpendIntent('long-lapsed@example.com', 'expired');
+    await db().query(
+      `UPDATE token_spend_intents SET expires_at = now() - interval '400 days'
+        WHERE contact_id = $1`,
+      [ancient.id],
+    );
+    await eraseContact(tenant.id, ancient.id);
+    const scrubbed = await db().query<{ from_address: string }>(
+      'SELECT from_address FROM token_spend_intents WHERE contact_id = $1',
+      [ancient.id],
+    );
+    expect(scrubbed.rows[0]!.from_address).not.toBe(WALLET);
+
+    // And a retailer who has settled it by hand says so, which closes the
+    // question immediately rather than in thirty days.
+    const cancelled = await withSpendIntent('handled@example.com', 'expired');
+    const { cancelSpendIntent } = await import('../src/services/token.js');
+    const { rows: intentRows } = await db().query<{ id: string }>(
+      'SELECT id FROM token_spend_intents WHERE contact_id = $1',
+      [cancelled.id],
+    );
+    expect(await cancelSpendIntent(tenant.id, intentRows[0]!.id)).not.toBeNull();
+    await eraseContact(tenant.id, cancelled.id);
+    const closed = await db().query<{ from_address: string }>(
+      'SELECT from_address FROM token_spend_intents WHERE contact_id = $1',
+      [cancelled.id],
+    );
+    expect(closed.rows[0]!.from_address).not.toBe(WALLET);
   });
 
   it('breaks the cross-tenant identity link', async () => {
@@ -1118,20 +1189,46 @@ describe('an abandoned checkout does not block an erasure forever (HIGH)', () =>
     expect(rows[0]!.status).toBe('expired');
   });
 
-  it('still refuses while the intent is genuinely live', async () => {
-    const contact = await upsertContact(tenant.id, { email: 'paying@example.com' });
-    await db().query(
-      `INSERT INTO token_spend_intents (
-         tenant_id, contact_id, member_id, token_amount_wei, from_address, to_address,
-         chain_id, contract_address, credit_cents, currency, status, expires_at
-       )
-       SELECT $1, $2, c.member_id, 1, $3, $3, 300,
-              '0x74eb73aca939fc911f79d9589e808f0207684d09', 100, 'USD', 'pending',
-              now() + interval '20 minutes'
-         FROM contacts c WHERE c.id = $2`,
-      [tenant.id, contact.id, '0x14dc79964da2c08b23698b3d3cc7ca32193d9955'],
-    );
+  it('refuses on a live intent and not on a lapsed one (HIGH)', async () => {
+    // Both arms, deliberately. On its own, "a pending intent twenty minutes in
+    // the future is refused" is passed by `status = 'pending'` and by
+    // `status = 'pending' AND expires_at > now()` alike, so it pins neither --
+    // it cannot tell the fix from the bug it replaced. The pair does: drop the
+    // expiry clause and the lapsed arm starts refusing; drop the predicate
+    // altogether and the live arm stops.
+    async function intentFor(email: string, expiresAt: string) {
+      const contact = await upsertContact(tenant.id, { email });
+      await db().query(
+        `INSERT INTO token_spend_intents (
+           tenant_id, contact_id, member_id, token_amount_wei, from_address, to_address,
+           chain_id, contract_address, credit_cents, currency, status, expires_at
+         )
+         SELECT $1, $2, c.member_id, 1, $3, $3, 300,
+                '0x74eb73aca939fc911f79d9589e808f0207684d09', 100, 'USD', 'pending',
+                now() + $4::interval
+           FROM contacts c WHERE c.id = $2`,
+        [tenant.id, contact.id, '0x14dc79964da2c08b23698b3d3cc7ca32193d9955', expiresAt],
+      );
+      return contact;
+    }
 
-    await expect(eraseContact(tenant.id, contact.id)).rejects.toThrow(/in flight/i);
+    const paying = await intentFor('paying@example.com', '20 minutes');
+    await expect(eraseContact(tenant.id, paying.id)).rejects.toThrow(/checkout in progress/i);
+
+    const lapsed = await intentFor('lapsed@example.com', '-20 minutes');
+    await expect(eraseContact(tenant.id, lapsed.id)).resolves.toMatchObject({
+      contact_id: lapsed.id,
+    });
+
+    // And a verification actually in flight is refused however long ago the
+    // quote lapsed: the chain has already been asked, and the answer is about
+    // to write a store credit against this contact.
+    const verifying = await intentFor('verifying@example.com', '-2 days');
+    await db().query(
+      `UPDATE token_spend_intents SET status = 'verifying', verify_claimed_at = now()
+        WHERE contact_id = $1`,
+      [verifying.id],
+    );
+    await expect(eraseContact(tenant.id, verifying.id)).rejects.toThrow(/checkout in progress/i);
   });
 });

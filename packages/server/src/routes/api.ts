@@ -25,6 +25,7 @@ import { leaderboard, listRules, trigger, upsertRule, assertRuleKey } from '../s
 import { createShare, listShares } from '../services/shares.js';
 import {
   attachClaimTx,
+  cancelSpendIntent,
   createSpendIntent,
   listClaims,
   redeemPointsForTokens,
@@ -836,6 +837,24 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
       status: result.intent.status,
       credit: result.credit,
     };
+  });
+
+  /**
+   * Close an intent the retailer has dealt with by other means.
+   *
+   * 'cancelled' was in the schema from the first migration with nothing able
+   * to reach it, so every message that suggested cancelling was naming a
+   * remedy that did not exist. It is also what tells erasure that the wallet
+   * on the intent is no longer evidence of anything owed, so without it an
+   * abandoned checkout kept a customer's address on file indefinitely.
+   */
+  app.post<{ Params: { intentId: string } }>('/v1/token/spend/:intentId/cancel', async (request) => {
+    const tenant = tenantOf(request);
+    const cancelled = await cancelSpendIntent(tenant.id, uuidOf(request.params.intentId, 'intentId')!);
+    if (!cancelled) {
+      throw ApiError.conflict('That spend intent is not open, so there is nothing to cancel');
+    }
+    return { intent_id: cancelled.id, status: cancelled.status };
   });
 
   /**

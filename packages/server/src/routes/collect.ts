@@ -22,7 +22,7 @@ import { supplyStatus } from '../services/token.js';
 export async function collectRoutes(app: FastifyInstance): Promise<void> {
   // Tracker batch. Responds 204 so sendBeacon never buffers a body.
   app.post('/v1/collect', async (request, reply) => {
-    const tenant = await requirePublicKey(request);
+    const tenant = await requirePublicKey(request, { expectVisitor: true });
     const payload = parse(collectSchema, request.body);
 
     const result = await collect(tenant, payload, {
@@ -36,7 +36,7 @@ export async function collectRoutes(app: FastifyInstance): Promise<void> {
 
   // Same payload over GET for environments that block POST beacons.
   app.get('/v1/collect', async (request, reply) => {
-    const tenant = await requirePublicKey(request);
+    const tenant = await requirePublicKey(request, { expectVisitor: true });
     const raw = (request.query as Record<string, string>).d;
     if (!raw) throw ApiError.badRequest('Missing d parameter');
 

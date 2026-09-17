@@ -23,7 +23,10 @@ function bearer(request: FastifyRequest): string | null {
  * Public-key auth for the browser tracker. The key is visible in page source, so
  * it may only write ingest data — never read reports or move points.
  */
-export async function requirePublicKey(request: FastifyRequest): Promise<Tenant> {
+export async function requirePublicKey(
+  request: FastifyRequest,
+  options: { expectVisitor?: boolean } = {},
+): Promise<Tenant> {
   const key =
     (request.headers['x-tbay-key'] as string | undefined) ??
     (request.query as Record<string, string> | undefined)?.key ??
@@ -56,7 +59,23 @@ export async function requirePublicKey(request: FastifyRequest): Promise<Tenant>
   );
   if (!addressLimit.allowed) throw ApiError.tooManyRequests();
 
-  const visitor = visitorKey(request);
+  // On the ingest routes, a request with no readable visitor id still gets a
+  // visitor-sized bucket rather than no bucket at all.
+  //
+  // Skipping it made "send nothing the limiter can read" a way out of the
+  // subdivision: the request then answered only to the per-address ceiling,
+  // which is five times a visitor's share. Padding the GET beacon's `d` with
+  // trailing whitespace -- legal JSON, decodes fine, and the handler accepts it
+  // -- did exactly that on every request, and so did any tracker batch over
+  // 8 KB. The cost is not extra throughput (rotating the id reaches the same
+  // ceiling) but the fairness the subdivision exists for: on one shared
+  // address, the caller with no id could spend every colleague's allowance.
+  //
+  // Only where a visitor is expected. `/v1/config` and the subscribe endpoints
+  // are page-level calls with nobody to identify, and pooling every browser
+  // behind one egress address into a single visitor-sized bucket would be a
+  // limit on the storefront rather than on an abuser.
+  const visitor = visitorKey(request) ?? (options.expectVisitor ? '-' : null);
   if (visitor !== null) {
     const visitorLimit = rateLimit(
       `ingest:${tenant.id}:i:${address}:a:${visitor}`,
@@ -158,7 +177,22 @@ function visitorFromQuery(request: FastifyRequest): string | null {
   // a line meant as a convenience.
   const query = request.query as Record<string, unknown> | undefined;
   const packed = query?.d;
-  if (typeof packed !== 'string' || packed === '' || packed.length > 8192) return null;
+  // Sized so it never fires on anything that can actually arrive, rather than
+  // on anything anyone would send.
+  //
+  // At 8192 it fired constantly and in both directions. An attacker padded `d`
+  // with trailing whitespace past the cap -- still valid JSON, still accepted
+  // by the handler -- and bought themselves the whole per-address ceiling; and
+  // a legitimate full batch of 200 events encodes to 16,247 characters, so the
+  // tracker's own large flushes lost their bucket too. A cap that the honest
+  // path trips over is not a defence, it is the bypass with extra steps.
+  //
+  // Node caps a request line and its headers at 16 KB by default, so 64 KB is
+  // past anything a GET can carry; the decode below is a few microseconds on
+  // input that size and the handler is about to do exactly the same one. If a
+  // deployment does raise that limit, an oversized `d` falls through to the
+  // anonymous bucket rather than to no bucket at all.
+  if (typeof packed !== 'string' || packed === '' || packed.length > 65_536) return null;
   try {
     const decoded: unknown = JSON.parse(Buffer.from(packed, 'base64url').toString('utf8'));
     const visitor = (decoded as Record<string, unknown> | null)?.visitor;

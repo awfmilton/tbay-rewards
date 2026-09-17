@@ -238,6 +238,7 @@ In treasury mode `delivery` is `treasury_transfer`, `transaction` is `null` and
 | `GET /v1/token/claims` | A member's claim history |
 | `POST /v1/token/spend` | Open a spend intent; returns the payout wallet |
 | `POST /v1/token/spend/:id/verify` | Verify the transfer, issue store credit |
+| `POST /v1/token/spend/:id/cancel` | Close an intent settled or abandoned another way |
 | `POST /v1/token/credit/redeem` | Burn a store credit against an order |
 
 ---
@@ -892,6 +893,26 @@ gone, so nobody can claim it and nobody can write it off. The forfeit is a
 ledger entry reading "Balance forfeited on erasure", so the history explains
 itself. Pass `false` when the retailer is settling the balance separately —
 and settle it *first*.
+
+#### On-chain obligations outlive the account
+
+A row on the chain tables is two things: a link to a person and a debt to a
+wallet. Erasure removes the link — `member_id`, which is the platform-wide
+identity — and keeps the wallet wherever money is still owed to it.
+
+| State | What happens |
+|---|---|
+| Spend intent `pending`/`verifying`, still live | **Refused**, with the intent named. A checkout is in progress and erasing mid-payment loses the store credit the customer is about to be owed. It clears itself when the intent expires, or `POST /v1/token/spend/{id}/cancel` clears it now. |
+| Spend intent `expired` inside 30 days | Erased, but `from_address` is **kept**. `expires_at` bounds the quote, not the money: a customer who sent their TBAY and lost the tab has tokens at the retailer's payout wallet, and that address is the only thing a hand-settlement can match on. `POST .../verify` still works on it. |
+| Spend intent `verified`, `cancelled`, or expired over 30 days ago | Fully scrubbed. Nothing is owed. |
+| Bridge withdrawal `pending` or `burn_verified` | Erased, addresses **kept**, and counted in `obligations_kept` on the response. The L2 tokens are already burned and the L1 release has to reach the wallet that burned them. |
+| Bridge withdrawal `released` or `rejected` | Fully scrubbed. |
+
+Erasure never refuses indefinitely and never destroys a payout address. An
+earlier version refused on any unsettled withdrawal and named "release or
+reject" as the remedy — both operator-only routes needing
+`BRIDGE_OPERATOR_TOKEN`, which a retailer does not hold, so the erasure could
+not be carried out at all.
 
 An erased address cannot be re-added. `/v1/contacts` and the public
 `/v1/identify` both return **422** for it, matched against a per-tenant salted

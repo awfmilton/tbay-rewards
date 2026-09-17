@@ -887,12 +887,44 @@ describe('ingest rate limiting cannot be rotated away (HIGH)', () => {
   it('does not mint a new bucket per spoofed X-Forwarded-For entry', async () => {
     // Every request claims a different origin address, but the entry the proxy
     // itself appended is the same throughout, and that is the one that counts.
+    //
+    // The visitor id is held constant on purpose: the address is part of the
+    // *visitor* key too, so if the caller's claimed address were the one used,
+    // one steady visitor rotating X-Forwarded-For would open a fresh
+    // per-visitor bucket on every request and all 3,200 would go through. Held
+    // constant, this measures the address and nothing else.
     const spoofing = await countAllowed(3_200, (n) => ({
-      visitor: null,
+      visitor: 'steadfast-visitor',
       forwardedFor: `203.0.113.${n % 250}, 10.0.0.2`,
     }));
 
-    expect(spoofing).toBe(3_000);
+    expect(spoofing).toBe(600);
+  });
+
+  it('gives a caller who sends no visitor one visitor-sized share (HIGH)', async () => {
+    // Sending nothing the limiter can read used to mean no per-visitor bucket
+    // at all, so that caller answered only to the per-address ceiling -- and
+    // on a shared address they could spend every colleague's allowance, which
+    // is precisely what the subdivision exists to stop. Padding the GET
+    // beacon's `d` past its cap reached the same place, as did any honest
+    // tracker batch over 8 KB.
+    const anonymous = await countAllowed(1_200, () => ({
+      visitor: null,
+      forwardedFor: '203.0.113.9, 10.0.0.3',
+    }));
+
+    expect(anonymous).toBe(600);
+
+    // And a colleague on the same address still has their own share, rather
+    // than finding it spent by the caller with no id. (1,200 requests, not
+    // 3,200: the per-address ceiling counts every attempt including the
+    // rejected ones, and exhausting it stops everybody by design -- that is
+    // the ceiling doing its job, not the subdivision failing at it.)
+    const colleague = await countAllowed(650, () => ({
+      visitor: 'colleague-visitor',
+      forwardedFor: '203.0.113.9, 10.0.0.3',
+    }));
+    expect(colleague).toBe(600);
   });
 
   it('keeps genuinely separate addresses on separate buckets', async () => {
@@ -1165,6 +1197,89 @@ describe('the GET beacon gets a per-visitor bucket too (MEDIUM)', () => {
     expect(allowed).toBe(600);
   });
 
+  it('cannot be made anonymous by padding the payload (HIGH)', async () => {
+    // The limiter gave up on `d` past 8,192 characters and then skipped the
+    // per-visitor bucket entirely, so the request answered only to the
+    // per-address ceiling -- five times larger. Trailing whitespace is legal
+    // JSON and the handler accepts it, so one space per request was the whole
+    // attack.
+    const app = await testApp();
+    const payload = {
+      visitor: 'padded-visitor',
+      session: 'padded-session',
+      url: 'https://shop.example/p',
+      events: [{ type: 'pageview', url: 'https://shop.example/p' }],
+    };
+    const padded = Buffer.from(`${JSON.stringify(payload)}${' '.repeat(12_000)}`).toString(
+      'base64url',
+    );
+    expect(padded.length).toBeGreaterThan(8_192);
+
+    let allowed = 0;
+    for (let n = 0; n < 650; n += 1) {
+      const response = await app.inject({
+        method: 'GET',
+        url: `/v1/collect?d=${padded}`,
+        headers: { 'x-tbay-key': tenant.publicKey, 'x-forwarded-for': '198.51.100.22, 10.0.0.5' },
+      });
+      if (response.statusCode !== 429) allowed += 1;
+    }
+
+    expect(allowed).toBe(600);
+  });
+
+  it('still gives an unreadable payload a visitor-sized share (HIGH)', async () => {
+    // Nothing identifiable at all: no body field, nothing decodable in `d`.
+    // Skipping the bucket there is the same bypass by a shorter route, so the
+    // anonymous share is a bucket of its own rather than an exemption.
+    const app = await testApp();
+    let allowed = 0;
+    for (let n = 0; n < 650; n += 1) {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/v1/collect?d=not-valid-base64url-json',
+        headers: { 'x-tbay-key': tenant.publicKey, 'x-forwarded-for': '198.51.100.23, 10.0.0.5' },
+      });
+      if (response.statusCode !== 429) allowed += 1;
+    }
+
+    // Rejected by the handler as a bad payload, but counted all the same --
+    // the limiter runs first and its job is the rate, not the schema.
+    expect(allowed).toBe(600);
+  });
+
+  it('keeps a full-size honest batch inside its own bucket (HIGH)', async () => {
+    // The 8,192 cap fired on the tracker's own traffic, not just on an
+    // attacker's: a full flush of 200 events encodes to 16,247 characters, so
+    // the busiest visitors on a site were exactly the ones with no bucket.
+    const app = await testApp();
+    const events = Array.from({ length: 200 }, (_unused, n) => ({
+      type: 'pageview',
+      url: `https://shop.example/product/${n}?variant=colour-and-size-and-more-padding`,
+    }));
+    const packed = Buffer.from(
+      JSON.stringify({
+        visitor: 'busy-visitor',
+        session: 'busy-session',
+        url: 'https://shop.example/p',
+        events,
+      }),
+    ).toString('base64url');
+    expect(packed.length).toBeGreaterThan(16_000);
+
+    let allowed = 0;
+    for (let n = 0; n < 650; n += 1) {
+      const response = await app.inject({
+        method: 'GET',
+        url: `/v1/collect?d=${packed}`,
+        headers: { 'x-tbay-key': tenant.publicKey, 'x-forwarded-for': '198.51.100.24, 10.0.0.5' },
+      });
+      if (response.statusCode !== 429) allowed += 1;
+    }
+
+    expect(allowed).toBe(600);
+  });
+
   it('ignores a query parameter the handler never reads', async () => {
     // Preferring a plain `?visitor=` made the limiter and the handler disagree
     // about who the visitor was: rotate the parameter and every request opened
@@ -1194,34 +1309,91 @@ describe('the GET beacon gets a per-visitor bucket too (MEDIUM)', () => {
   });
 });
 
-describe('the limiter evicts the flood, not the regulars (HIGH)', () => {
-  it('holds on to a busy bucket when a flood touches each key twice', async () => {
-    // Two wrong answers came before this one. Insertion order took the
-    // longest-lived buckets -- the tenant's admin key, every steady visitor.
-    // Then "count <= 1" was defeated by touching each minted key twice, which
-    // costs an attacker nothing and put every flood key out of reach of the
-    // rule, falling back to insertion order again: admin evicted, 0 of 20
-    // steady visitors kept, 70,000 of 70,000 flood keys kept.
+describe('a key flood cannot buy anybody a fresh window (HIGH)', () => {
+  /**
+   * Three rounds of this were spent hunting for a ranking that would pick the
+   * right key to drop, and the attacker chose every one of them: insertion
+   * order took the longest-lived buckets (the tenant's own), "count <= 1" and
+   * then ranking by count were both beaten by touching each minted key twice,
+   * which costs nothing -- measured at admin evicted in every configuration and
+   * 200,000 of 210,000 flood keys kept.
+   *
+   * These test the two properties a ranking was being asked to provide, which
+   * is what should have been tested all along. Eviction hands out a *fresh*
+   * window, so the harm is never "an idle caller was dropped" -- an idle caller
+   * was not being limited. The harm is a blocked caller getting a free pass, or
+   * a flood reaching a bucket it has no business touching.
+   */
+  it('keeps blocking a caller who is at their limit throughout a flood', async () => {
     const { rateLimit, resetRateLimits } = await import('../src/lib/ratelimit.js');
     resetRateLimits();
 
-    const LIMIT = 1_000_000;
-    // A regular, created first and used steadily.
-    for (let n = 0; n < 40; n += 1) rateLimit('regular', LIMIT);
+    // A caller who has spent their whole allowance.
+    for (let n = 0; n < 12; n += 1) rateLimit('ingest:t1:i:1.2.3.4', 10);
+    expect(rateLimit('ingest:t1:i:1.2.3.4', 10).allowed).toBe(false);
 
-    // A flood that touches each key twice, which is what defeated the last
-    // version of this.
+    // A flood in the same class, well past its ceiling, touching each key
+    // twice. Interleaved, because a flood is concurrent with real traffic --
+    // and because a caller being rejected is a caller still sending.
+    let freePasses = 0;
     for (let n = 0; n < 260_000; n += 1) {
-      rateLimit(`flood:${n}`, LIMIT);
-      rateLimit(`flood:${n}`, LIMIT);
+      rateLimit(`ingest:t1:i:10.0.${n % 256}.${n % 251}:a:v${n}`, 1_000_000);
+      rateLimit(`ingest:t1:i:10.0.${n % 256}.${n % 251}:a:v${n}`, 1_000_000);
+      if (n % 1_000 === 0 && rateLimit('ingest:t1:i:1.2.3.4', 10).allowed) freePasses += 1;
     }
 
-    // Let a size-triggered sweep run.
-    await new Promise((resolve) => setTimeout(resolve, 1_100));
-    rateLimit('tick', LIMIT);
+    expect(freePasses).toBe(0);
+    expect(rateLimit('ingest:t1:i:1.2.3.4', 10).allowed).toBe(false);
+  });
 
-    // A surviving bucket remembers its count; an evicted one starts again.
-    const regular = rateLimit('regular', LIMIT);
-    expect(LIMIT - regular.remaining).toBeGreaterThan(2);
+  it('cannot reach the tenant bucket from the ingest class at all', async () => {
+    const { rateLimit, resetRateLimits, rateLimitSizes } = await import(
+      '../src/lib/ratelimit.js'
+    );
+    resetRateLimits();
+
+    // Every tenant on the box, idle: one admin call each and nothing since.
+    for (let t = 0; t < 20; t += 1) rateLimit(`admin:tenant-${t}`, 10);
+
+    for (let n = 0; n < 260_000; n += 1) {
+      rateLimit(`ingest:t1:i:10.0.0.1:a:v${n}`, 1_000_000);
+      rateLimit(`ingest:t1:i:10.0.0.1:a:v${n}`, 1_000_000);
+    }
+
+    // Not one of them was evicted: a surviving bucket remembers its count, an
+    // evicted one starts again at 1.
+    for (let t = 0; t < 20; t += 1) {
+      const admin = rateLimit(`admin:tenant-${t}`, 10);
+      expect(10 - admin.remaining, `tenant-${t}`).toBe(2);
+    }
+
+    // And the flood is held at its own ceiling rather than growing without
+    // bound: sweeping alone frees nothing while the keys are still live.
+    const sizes = rateLimitSizes();
+    expect(sizes.ingest).toBeLessThanOrEqual(200_000);
+    expect(sizes.admin).toBe(20);
+  });
+
+  it('does not spend the event loop on the flood it is absorbing', async () => {
+    // The size-triggered sweep ran a full walk and then a full sort of the map
+    // whenever it was large, on a path that runs twice per ingest request.
+    // Past the threshold that was one sort of 200,000 entries per second:
+    // 60 ms of blocked event loop per second and 15 MB of garbage per sweep,
+    // which is a worse denial of service than the one it guarded against.
+    const { rateLimit, resetRateLimits } = await import('../src/lib/ratelimit.js');
+    resetRateLimits();
+
+    for (let n = 0; n < 220_000; n += 1) rateLimit(`ingest:t1:i:10.0.0.1:a:v${n}`, 1_000_000);
+
+    // Steady state, over the ceiling, which is where the sort used to live.
+    let worst = 0;
+    for (let n = 0; n < 20_000; n += 1) {
+      const started = performance.now();
+      rateLimit(`ingest:t1:i:10.0.0.2:a:w${n}`, 1_000_000);
+      worst = Math.max(worst, performance.now() - started);
+    }
+    // One insert, one eviction. Anything linear in the map size shows up here
+    // immediately: the sort measured 60 ms on a map this size.
+    expect(worst).toBeLessThan(15);
   });
 });

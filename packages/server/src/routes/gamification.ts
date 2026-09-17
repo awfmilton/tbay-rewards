@@ -384,7 +384,17 @@ export async function gamificationRoutes(app: FastifyInstance): Promise<void> {
 function requireBridgeOperator(presented: string | undefined): void {
   const expected = process.env.BRIDGE_OPERATOR_TOKEN ?? '';
   if ('' === expected) {
-    throw new ApiError(503, 'operator_unavailable', 'No bridge operator token is configured');
+    // Named, because this is the wall a burned withdrawal hits. It ships empty
+    // in .env.docker.example, and these two routes are the only way a
+    // `burn_verified` row is ever closed out -- so an unset token is not a
+    // missing feature, it is somebody's tokens burned on L2 with no path to
+    // L1 and no error that says why.
+    throw new ApiError(
+      503,
+      'operator_unavailable',
+      'BRIDGE_OPERATOR_TOKEN is not set on this deployment, so no L1 release or rejection ' +
+        'can be recorded. Set it (openssl rand -hex 32) and restart before enabling the bridge.',
+    );
   }
   // Hash both sides before comparing, so the comparison time depends on the
   // digest length rather than on how much of the real token was guessed — an
