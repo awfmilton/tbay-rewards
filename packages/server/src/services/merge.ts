@@ -126,11 +126,11 @@ export async function mergeContacts(
 
     // Both contacts' balance rows, exclusively, before anything reads one.
     //
-    // The contact locks above are what award and spend now wait on (see
-    // `holdContact` in points.ts), so this is belt and braces for a row that
-    // exists — but it also means `mergeBalances` reads a balance nothing can
-    // change underneath it, rather than a snapshot it then adds to the
-    // survivor while a spend drains the original.
+    // The contact lock above already holds off anything that writes a ledger
+    // row — see `holdContact` in points.ts for why, including the part the
+    // foreign key does on its own. This covers the rest: `mergeBalances` reads
+    // a balance it then adds to the survivor, and that read has to see a value
+    // nothing can change underneath it, whatever route the change arrives by.
     await client.query(
       `SELECT 1 FROM points_balances
         WHERE tenant_id = $1 AND contact_id = ANY($2::uuid[])

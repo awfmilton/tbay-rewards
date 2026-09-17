@@ -132,8 +132,9 @@ describe('spending points for store credit', () => {
 
     const { redeemStoreCredit } = await import('../src/services/token.js');
     expect(await redeemStoreCredit(tenant.id, code, 'order-1')).not.toBeNull();
-    // Nothing left, so a different order gets nothing.
-    expect(await redeemStoreCredit(tenant.id, code, 'order-2')).toBeNull();
+    // Nothing left, so a different order is refused.
+    await expect(redeemStoreCredit(tenant.id, code, 'order-2'))
+      .rejects.toThrow(/already been used/i);
   });
 
   it('draws the credit down instead of destroying the remainder', async () => {
@@ -152,8 +153,11 @@ describe('spending points for store credit', () => {
     const second = await redeemStoreCredit(tenant.id, code, 'order-b', 450);
     expect(second).toMatchObject({ amount_cents: 450, remaining_cents: 0 });
 
-    // Now it really is spent.
-    expect(await redeemStoreCredit(tenant.id, code, 'order-c', 1)).toBeNull();
+    // Now it really is spent — and says so, rather than "no such code",
+    // which would send a customer to support over a credit they used.
+    await expect(redeemStoreCredit(tenant.id, code, 'order-c', 1))
+      .rejects.toThrow(/already been used/i);
+    expect(await redeemStoreCredit(tenant.id, 'PTS-NOSUCHCODE', 'order-d', 1)).toBeNull();
   });
 
   it('answers a repeated redemption for one order without taking more', async () => {
@@ -203,6 +207,9 @@ describe('spending points for store credit', () => {
 
     const won = results.filter((r) => r.status === 'fulfilled' && r.value !== null);
     expect(won).toHaveLength(1);
+    // The loser is told the credit is spent, not that it never existed.
+    const lost = results.find((r) => r.status === 'rejected');
+    expect(String((lost as PromiseRejectedResult).reason)).toMatch(/already been used/i);
 
     const { rows } = await db().query<{ redeemed_cents: string }>(
       'SELECT redeemed_cents FROM store_credits WHERE tenant_id = $1 AND code = $2',
