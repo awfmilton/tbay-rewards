@@ -1,6 +1,15 @@
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import { getAddress } from 'ethers';
-import { closeApp, closeDb, db, makeTenant, setupDatabase, truncateAll, type TestTenant } from './helpers.js';
+import {
+  closeApp,
+  closeDb,
+  db,
+  makeTenant,
+  setupDatabase,
+  testApp,
+  truncateAll,
+  type TestTenant,
+} from './helpers.js';
 import { upsertContact } from '../src/services/contacts.js';
 import { award } from '../src/services/points.js';
 import { getTenantById } from '../src/services/tenants.js';
@@ -60,6 +69,71 @@ function stubChain(transfers: TokenTransfer[]): ChainClient {
 function burnEvent(from: string, value: bigint): TokenTransfer {
   return { from: getAddress(from), to: getAddress(BURN_ADDRESS), value, blockNumber: 10, confirmations: 5 };
 }
+
+describe('the payout survives an erasure without the wallet doing so (HIGH)', () => {
+  /**
+   * `payable_to` is the only route by which a recipient destroyed by an
+   * erasure can be recovered, and nothing tested it -- the privacy suite
+   * imports recipientFor directly and never goes through the API that the
+   * documentation points operators at. Deleting the field from the route left
+   * every test green while making an outstanding obligation unpayable.
+   */
+  it('gives the operator a payout address and nobody else', async () => {
+    const app = await testApp();
+    const contact = await upsertContact(tenant.id, { email: 'erased-bridge@example.com' });
+    await db().query(
+      `INSERT INTO bridge_withdrawals (
+         tenant_id, contact_id, member_id, from_address, l1_recipient,
+         l2_amount_wei, l1_amount, dust_wei, burn_tx_hash, status, l2_chain_id, l1_chain_id
+       )
+       SELECT $1, $2, c.member_id, $3, $3, 1, 1, 0, $4, 'burn_verified', 300, 1
+         FROM contacts c WHERE c.id = $2`,
+      [tenant.id, contact.id, HOLDER.toLowerCase(), TX],
+    );
+    const { eraseContact } = await import('../src/services/privacy.js');
+    await eraseContact(tenant.id, contact.id);
+
+    const { rows } = await db().query<{ id: string }>(
+      'SELECT id FROM bridge_withdrawals WHERE burn_tx_hash = $1',
+      [TX],
+    );
+    setChainClient({
+      isNonceUsed: async () => false,
+      isPaused: async () => false,
+      balanceOf: async () => 0n,
+      transfersInTx: async () => [
+        { from: HOLDER, to: BURN_ADDRESS, value: 1n, blockNumber: 1, confirmations: 3 },
+      ],
+    });
+
+    const get = (headers: Record<string, string>) =>
+      app.inject({
+        method: 'GET',
+        url: `/v1/bridge/withdrawals/${rows[0]!.id}`,
+        headers: { authorization: `Bearer ${tenant.secretKey}`, ...headers },
+      });
+
+    // The retailer sees the withdrawal but not the wallet: handing an erased
+    // person's address back on request is the erasure undone by its own API.
+    const plain = JSON.parse((await get({})).body);
+    expect(plain.withdrawal.l1_recipient).toMatch(/^erased:/);
+    expect(plain.payable_to).toBeUndefined();
+
+    // The operator, who is the only party that can actually send the L1
+    // release, gets the address -- checked against the commitment, so a node
+    // answering with somebody else's burn cannot redirect it.
+    process.env.BRIDGE_OPERATOR_TOKEN = 'operator-test-token';
+    const operator = JSON.parse(
+      (await get({ 'x-tbay-operator': 'operator-test-token' })).body,
+    );
+    expect(operator.payable_to).toEqual({ address: HOLDER.toLowerCase() });
+
+    const wrong = await get({ 'x-tbay-operator': 'not-the-token' });
+    expect(wrong.statusCode).toBe(403);
+    delete process.env.BRIDGE_OPERATOR_TOKEN;
+    setChainClient(null);
+  });
+});
 
 describe('bridge rate', () => {
   /**

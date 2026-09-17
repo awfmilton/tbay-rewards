@@ -88,6 +88,8 @@ interface Reply {
   detail: number | null;
   /** Whether a 421 appeared in reply position. */
   closing: boolean;
+  /** The first reply code in the text, which is the one this reply opens with. */
+  first: number | null;
 }
 
 /**
@@ -103,8 +105,10 @@ interface Reply {
 function parseReply(said: string): Reply {
   let worst = 0;
   let closing = false;
+  let first: number | null = null;
   for (const match of said.matchAll(REPLY_CODE)) {
     const code = Number(match[1]);
+    if (first === null) first = code;
     if (code === 421) closing = true;
     const klass = Math.floor(code / 100);
     if (klass > worst) worst = klass;
@@ -133,6 +137,7 @@ function parseReply(said: string): Reply {
     subject: status ? status[0] : null,
     detail: status ? status[1] : null,
     closing,
+    first,
   };
 }
 
@@ -176,6 +181,14 @@ const AUTH_FAILURE = new RegExp(
     // 4,320 attempts per recipient, aimed at the provider already refusing us
     // on reputation grounds.
     'authentication (?:failed|required|unsuccessful|not enabled)',
+    // Amazon SES answers "535 Authentication Credentials Invalid", which the
+    // qualified set missed -- so our own SMTP password being wrong came back
+    // soft, spent every attempt, and then suppressed the recipient for thirty
+    // days. That failure hits every address in the queue identically, which is
+    // the worst thing this file can do.
+    'authentication credentials',
+    '\\b(?:invalid|bad|rejected) credentials\\b',
+    '\\bcredentials (?:invalid|rejected|incorrect)\\b',
     'invalid login',
     'username and password not accepted',
     '\\bbad credentials\\b',
@@ -266,6 +279,17 @@ const MAILBOX_GONE = new RegExp(
   ].join('|'),
   'i',
 );
+
+/**
+ * Does the reply quote an address at all?
+ *
+ * The same shapes withoutAddresses removes, tested before it removes them.
+ */
+/** Reply codes that mean the relay refused *our* credentials. */
+const AUTH_CODES = new Set([530, 535, 538]);
+
+const QUOTES_RECIPIENT =
+  /<[^<>\s]*@[^<>\s]*>|(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/;
 
 /**
  * The subset that names the recipient, for overriding a policy status.
@@ -416,6 +440,15 @@ export function saysSomethingAboutTheMailbox(message: string): boolean {
 export function classifyFailure(message: string): FailureKind {
   const said = withoutAddresses(message);
   const reply = parseReply(said);
+  // Whether the reply names a mailbox, read before the addresses are taken
+  // out. The distinction the 5.7.x arm rests on was unobservable at the point
+  // it was applied: AOL's dead-mailbox reply is
+  // "<them@aol.com>: Recipient address rejected: This account has been
+  // disabled", and the relay's refusal of *our own* account is
+  // "This account has been disabled" -- identical once the address is gone.
+  // Which is why the narrow wording set had to drop both, and a dead AOL or
+  // Yahoo mailbox stopped being suppressed by any route at all.
+  const named = QUOTES_RECIPIENT.test(message.slice(0, 65_536));
 
   // Nothing about a mailbox can be read out of a connection that failed, or
   // out of a relay that refused our password.
@@ -427,7 +460,15 @@ export function classifyFailure(message: string): FailureKind {
   // and the attempt refunded, so a dead mailbox was retried for three days.
   // Every real refusal carries wording, and one that somehow does not lands on
   // 5.7.x, which never suppresses anyway.
+  // The wording, or an authentication code the reply *opens* with.
+  //
+  // Position is what makes the code usable again. A bare 530/535/538 anywhere
+  // in the text matched "original message size: 535 KB accepted" and called a
+  // dead mailbox a transport fault; the first code in a reply is the reply's
+  // own, and "535 Authentication Credentials Invalid" needs no wording to be
+  // recognised.
   if (AUTH_FAILURE.test(said)) return 'transport';
+  if (reply.first !== null && AUTH_CODES.has(reply.first)) return 'transport';
 
   // 421 is "service not available, closing transmission channel" -- the one
   // reply code about the connection rather than about anything in the
@@ -483,7 +524,15 @@ export function classifyFailure(message: string): FailureKind {
         // every recipient of a broadcast identically -- the exact batch
         // disaster the gate exists to prevent, arriving through the one verdict
         // that never reaches the gate.
-        return reply.severity === 5 && RECIPIENT_GONE.test(said) ? 'hard' : 'soft';
+        //
+        // Wording that names a recipient on its own, or the broader set when
+        // the reply quotes the mailbox it is about. A block quotes the
+        // recipient too, which is why the wording still has to say the mailbox
+        // is gone -- "Access denied" beside an address is not evidence, and
+        // "Recipient address rejected" is Postfix's wrapper for everything.
+        if (reply.severity !== 5) return 'soft';
+        if (RECIPIENT_GONE.test(said)) return 'hard';
+        return named && MAILBOX_GONE.test(said) ? 'hard' : 'soft';
       default:
         break; // 4, 5 and anything unregistered fall through to the wording.
     }

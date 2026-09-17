@@ -134,6 +134,66 @@ describe('classifying a delivery failure', () => {
     expect(classifyFailure(dead('192.5.7.9'))).toBe('hard');
   });
 
+  it('still suppresses a dead mailbox that arrives with a policy status (HIGH)', async () => {
+    // The narrow wording set dropped everything AOL, Yahoo and Exim actually
+    // say, and 5.7.x is excluded from the suppression gate -- so those
+    // addresses were classified soft AND never counted, i.e. never suppressed
+    // by any route at all. They bounce on every broadcast, forever, which is
+    // the reputation damage this file exists to prevent.
+    //
+    // The distinction was unobservable where it was applied: withoutAddresses
+    // strips <them@aol.com> before the wording test, so the reply that names
+    // the mailbox and the relay's refusal of our own account read identically.
+    // It is read before the stripping now.
+    for (const message of [
+      '554 5.7.1 <them@aol.com>: Recipient address rejected: This account has been disabled or discontinued',
+      "550 5.7.1 This user doesn't have a yahoo.com account (them@yahoo.com)",
+      '550 5.7.1 <them@example.com>: Recipient address rejected: unrouteable address',
+      '550 5.7.1 <them@example.com>: Recipient address rejected: Address unknown',
+      '550 5.7.1 <them@example.com>: Recipient address rejected: The email address does not exist',
+    ]) {
+      const address = `gone-${Math.random().toString(36).slice(2)}@example.com`;
+      expect(await recordFailure(tenant.id, address, message, 1, 6), message).toBe('hard');
+      expect(await isSuppressed(tenant.id, address), message).not.toBeNull();
+    }
+
+    // The controls, all of which quote nobody or say nothing about a mailbox,
+    // and none of which may ever be read as a dead address.
+    for (const message of [
+      '550 5.7.1 This account has been disabled',
+      '550 5.7.0 Your account has been deactivated for policy reasons',
+      '550 5.7.1 <them@example.com>: Recipient address rejected: Access denied',
+      '554 5.7.1 Service unavailable; Client host [203.0.113.7] blocked using zen.spamhaus.org',
+      '550 5.7.606 Access denied, banned sending IP [203.0.113.7]',
+    ]) {
+      expect(classifyFailure(message), message).toBe('soft');
+    }
+  });
+
+  it('reads a credential refusal that carries no enhanced status (HIGH)', () => {
+    // Amazon SES answers "535 Authentication Credentials Invalid". The
+    // qualified wording set missed it and there is no 5.7.x to fall back on,
+    // so our own SMTP password being wrong came back soft, spent every
+    // attempt, and suppressed the recipient for thirty days -- identically for
+    // every address in the queue, which is the worst thing this file can do.
+    for (const message of [
+      '535 Authentication Credentials Invalid',
+      '535 Authentication Credentials Invalid, please check your credentials',
+      '535 5.7.3 Authentication unsuccessful',
+      // Wording nothing recognises, carried by a code the reply opens with --
+      // which is the only thing left to read it by.
+      '538 Encryption required for requested authentication mechanism',
+    ]) {
+      expect(classifyFailure(message), message).toBe('transport');
+    }
+
+    // The control that made the bare code unusable before: a quoted number is
+    // not a reply code, and the code a reply *opens* with is.
+    expect(classifyFailure('550 5.1.1 User unknown; original message size: 535 KB accepted')).toBe(
+      'hard',
+    );
+  });
+
   it('does not count a reputation block toward suppression either (HIGH)', async () => {
     // Classifying a block as soft is only half of it. A soft failure still
     // suppresses for thirty days once the attempts run out, so the gate that
