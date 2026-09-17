@@ -281,8 +281,20 @@ export async function eraseContact(
     // wallet on file against their wishes -- and this refusal is temporary and
     // actionable, which neither of those is.
     const inFlight = await client.query<{ kind: string; id: string }>(
+      // Live, not merely unfinished.
+      //
+      // Refusing on `status = 'pending'` alone was worse than the bug it
+      // fixed: a spend intent is created the moment somebody taps "Pay with
+      // TBAY", nothing moved it out of pending, and `verifySpendIntent`
+      // refuses an expired one -- so a customer who changed their mind could
+      // never be erased, and the operator's only remedy was an UPDATE against
+      // production. An erasure a controller cannot carry out is itself the
+      // defect. An intent past its expiry is settled by abandonment; there is
+      // nothing in flight to protect. (expireStaleSpendIntents now moves them
+      // too; this predicate does not depend on that worker having run.)
       `SELECT 'token spend' AS kind, id::text FROM token_spend_intents
-        WHERE tenant_id = $1 AND contact_id = $2 AND status = 'pending'
+        WHERE tenant_id = $1 AND contact_id = $2
+          AND status = 'pending' AND expires_at > now()
         UNION ALL
        SELECT 'bridge withdrawal', id::text FROM bridge_withdrawals
         WHERE tenant_id = $1 AND contact_id = $2
@@ -293,7 +305,9 @@ export async function eraseContact(
       const what = inFlight.rows.map((row) => `${row.kind} ${row.id}`).join(', ');
       throw ApiError.badRequest(
         `This person has an unsettled on-chain transaction (${what}). ` +
-          'Settle or cancel it first — erasing now would destroy funds that are already in flight.',
+          'Erasing now would destroy funds that are already in flight. A token spend ' +
+          'clears itself once it expires; a bridge withdrawal needs releasing or ' +
+          'rejecting first.',
       );
     }
 

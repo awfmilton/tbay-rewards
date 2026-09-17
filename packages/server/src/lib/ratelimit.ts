@@ -57,36 +57,31 @@ export function rateLimit(key: string, limit: number, windowMs = 60_000): RateLi
   const onSchedule = now - lastSweep > windowMs;
   const tooBig = windows.size > SWEEP_AT_SIZE && now - lastSizeSweep > MIN_SWEEP_GAP_MS;
   if (onSchedule || tooBig) {
-    // One pass, collecting the barely-used keys as it goes.
-    const barelyUsed: string[] = [];
     for (const [existing, window] of windows) {
       if (window.resetAt <= now) windows.delete(existing);
-      else if (window.count <= 1) barelyUsed.push(existing);
     }
     lastSweep = now;
     if (tooBig) lastSizeSweep = now;
 
-    // Evict by how little a key has been used, not by how long it has been
-    // there.
+    // Evict the least-used keys, ranked against each other.
     //
-    // Insertion order put the *longest-lived* buckets at the front -- the
-    // tenant's admin key, every steady visitor -- so the eviction fell on
-    // exactly the callers who had done nothing wrong, handing them a fresh
-    // window while the flood that caused it kept its own. A key seen once is
-    // what a flood is made of, and dropping it costs its owner a single
-    // request of accounting.
+    // Two wrong answers came before this one. Insertion order took the
+    // *longest-lived* buckets -- the tenant's admin key, every steady visitor
+    // -- handing exactly the innocent callers a fresh window while the flood
+    // that caused the eviction kept its own. Then "count <= 1" was defeated by
+    // an attacker touching each minted key twice, which costs them nothing and
+    // put every flood key out of reach of the rule, falling back to insertion
+    // order again: measured at admin evicted, 0 of 20 steady visitors kept,
+    // and 70,000 of 70,000 flood keys kept.
+    //
+    // Ranking is the part that matters. A flood's keys are the least-used
+    // things in the map whatever fixed threshold you pick, because a real
+    // visitor accumulates and a minted key does not.
     if (windows.size > HARD_CEILING) {
-      let excess = windows.size - HARD_CEILING;
-      for (const existing of barelyUsed) {
-        if (excess <= 0) break;
-        if (windows.delete(existing)) excess -= 1;
-      }
-      // Still over: a map genuinely full of busy keys. Take from the front,
-      // which is the best that is left.
-      for (const existing of windows.keys()) {
-        if (excess <= 0) break;
-        windows.delete(existing);
-        excess -= 1;
+      const ranked = [...windows.entries()].sort((a, b) => a[1].count - b[1].count);
+      const excess = windows.size - HARD_CEILING;
+      for (let i = 0; i < excess; i += 1) {
+        windows.delete(ranked[i]![0]);
       }
     }
   }

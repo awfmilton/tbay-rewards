@@ -906,7 +906,7 @@ export async function reevaluateAll(
   tenantId: string,
   options: { badges?: boolean; ranks?: boolean; batchSize?: number } = {},
   runner: Queryable = db(),
-): Promise<{ contacts: number; promoted: number; badgesAwarded: number }> {
+): Promise<{ contacts: number; promoted: number; badgesAwarded: number; skipped: number }> {
   const doBadges = options.badges ?? true;
   const doRanks = options.ranks ?? true;
   const batchSize = Math.min(Math.max(options.batchSize ?? 500, 1), 5000);
@@ -915,6 +915,8 @@ export async function reevaluateAll(
   let contacts = 0;
   let promoted = 0;
   let badgesAwarded = 0;
+  /** Contacts that went away mid-sweep, most often to a merge. */
+  let skipped = 0;
 
   // Every currency's ladder, since a member holds one rank per currency. For a
   // retailer with a single currency this is the one pass it always was.
@@ -944,25 +946,38 @@ export async function reevaluateAll(
       // ledger is supposed to make impossible. Per contact rather than per
       // batch so a tenant with 200,000 members still never holds one snapshot
       // open for the whole run.
-      await withTransaction(async (client) => {
-        if (doBadges) {
-          const earned = await evaluateBadges(tenantId, row.id, client);
-          badgesAwarded += earned.length;
-        }
-        if (doRanks) {
-          for (const ladder of ladders) {
-            const result = await evaluateRank(tenantId, row.id, client, ladder);
-            if (result.promoted) promoted += 1;
+      try {
+        await withTransaction(async (client) => {
+          if (doBadges) {
+            const earned = await evaluateBadges(tenantId, row.id, client);
+            badgesAwarded += earned.length;
           }
-        }
-      });
+          if (doRanks) {
+            for (const ladder of ladders) {
+              const result = await evaluateRank(tenantId, row.id, client, ladder);
+              if (result.promoted) promoted += 1;
+            }
+          }
+        });
+      } catch (error) {
+        // One contact must not end the run.
+        //
+        // This walks the whole member list, and anything can happen to one row
+        // while it does -- most obviously a merge, which makes the contact
+        // vanish and every writer answer "no longer exists" by design. With no
+        // handler here that answer aborted the sweep, leaving the tenant's
+        // re-rank half applied and `POST /v1/gamification/reevaluate` failing.
+        // A bulk job skips what it cannot do and reports it.
+        if (!(error instanceof ApiError) || error.statusCode >= 500) throw error;
+        skipped += 1;
+      }
     }
 
     after = rows[rows.length - 1]!.id;
     if (rows.length < batchSize) break;
   }
 
-  return { contacts, promoted, badgesAwarded };
+  return { contacts, promoted, badgesAwarded, skipped };
 }
 
 /**

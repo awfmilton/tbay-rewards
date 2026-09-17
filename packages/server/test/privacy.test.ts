@@ -1063,3 +1063,75 @@ describe('erasure never destroys money in flight (HIGH)', () => {
     ]);
   });
 });
+
+describe('an abandoned checkout does not block an erasure forever (HIGH)', () => {
+  it('erases once a pending spend intent is past its expiry', async () => {
+    // A spend intent is created the moment somebody taps "Pay with TBAY", and
+    // nothing moved it out of `pending`: verifySpendIntent refuses an expired
+    // one, and there was no cancel route, no service call and no worker. So a
+    // customer who changed their mind could never be erased, and the
+    // operator's only remedy was an UPDATE against production. An erasure a
+    // controller cannot carry out is itself the defect.
+    const contact = await upsertContact(tenant.id, { email: 'abandoned@example.com' });
+    await db().query(
+      `INSERT INTO token_spend_intents (
+         tenant_id, contact_id, member_id, token_amount_wei, from_address, to_address,
+         chain_id, contract_address, credit_cents, currency, status, expires_at
+       )
+       SELECT $1, $2, c.member_id, 1, $3, $4, 300,
+              '0x74eb73aca939fc911f79d9589e808f0207684d09', 100, 'USD', 'pending',
+              now() - interval '90 days'
+         FROM contacts c WHERE c.id = $2`,
+      [
+        tenant.id,
+        contact.id,
+        '0x14dc79964da2c08b23698b3d3cc7ca32193d9955',
+        '0x1111111111111111111111111111111111111111',
+      ],
+    );
+
+    await expect(eraseContact(tenant.id, contact.id)).resolves.toMatchObject({
+      contact_id: contact.id,
+    });
+  });
+
+  it('closes out abandoned intents so they stop looking live', async () => {
+    const { expireStaleSpendIntents } = await import('../src/services/token.js');
+    const contact = await upsertContact(tenant.id, { email: 'sweepable@example.com' });
+    await db().query(
+      `INSERT INTO token_spend_intents (
+         tenant_id, contact_id, member_id, token_amount_wei, from_address, to_address,
+         chain_id, contract_address, credit_cents, currency, status, expires_at
+       )
+       SELECT $1, $2, c.member_id, 1, $3, $3, 300,
+              '0x74eb73aca939fc911f79d9589e808f0207684d09', 100, 'USD', 'pending',
+              now() - interval '1 hour'
+         FROM contacts c WHERE c.id = $2`,
+      [tenant.id, contact.id, '0x14dc79964da2c08b23698b3d3cc7ca32193d9955'],
+    );
+
+    expect(await expireStaleSpendIntents()).toBe(1);
+    const { rows } = await db().query<{ status: string }>(
+      'SELECT status FROM token_spend_intents WHERE contact_id = $1',
+      [contact.id],
+    );
+    expect(rows[0]!.status).toBe('expired');
+  });
+
+  it('still refuses while the intent is genuinely live', async () => {
+    const contact = await upsertContact(tenant.id, { email: 'paying@example.com' });
+    await db().query(
+      `INSERT INTO token_spend_intents (
+         tenant_id, contact_id, member_id, token_amount_wei, from_address, to_address,
+         chain_id, contract_address, credit_cents, currency, status, expires_at
+       )
+       SELECT $1, $2, c.member_id, 1, $3, $3, 300,
+              '0x74eb73aca939fc911f79d9589e808f0207684d09', 100, 'USD', 'pending',
+              now() + interval '20 minutes'
+         FROM contacts c WHERE c.id = $2`,
+      [tenant.id, contact.id, '0x14dc79964da2c08b23698b3d3cc7ca32193d9955'],
+    );
+
+    await expect(eraseContact(tenant.id, contact.id)).rejects.toThrow(/in flight/i);
+  });
+});

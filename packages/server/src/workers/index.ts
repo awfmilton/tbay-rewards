@@ -4,7 +4,7 @@ import { flushEmailQueue } from '../services/email.js';
 import { releaseMaturedPoints } from '../services/points.js';
 import { approveMaturedCommissions } from '../services/commissions.js';
 import { expireStaleShares } from '../services/shares.js';
-import { expireStaleClaims, reconcileClaims } from '../services/token.js';
+import { expireStaleClaims, expireStaleSpendIntents, reconcileClaims } from '../services/token.js';
 import { purgeExpiredChallenges } from '../services/wallets.js';
 import { buildAllSegments } from '../services/segments.js';
 import { runDueBroadcasts } from '../services/broadcasts.js';
@@ -42,6 +42,9 @@ export const JOBS: Job[] = [
   { name: 'commission_release', intervalMs: 300_000, run: () => approveMaturedCommissions() },
   { name: 'share_expiry', intervalMs: 300_000, run: () => expireStaleShares() },
   { name: 'claim_expiry', intervalMs: 60_000, run: () => expireStaleClaims() },
+  // Without this a pending spend intent never left `pending`, which is what
+  // let one abandoned checkout block a customer's erasure forever.
+  { name: 'spend_intent_expiry', intervalMs: 300_000, run: () => expireStaleSpendIntents() },
   { name: 'claim_reconcile', intervalMs: 120_000, run: () => reconcileClaims() },
   { name: 'webhook_delivery', intervalMs: 20_000, run: () => deliverWebhooks() },
   { name: 'challenge_purge', intervalMs: 3_600_000, run: () => purgeExpiredChallenges() },

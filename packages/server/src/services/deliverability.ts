@@ -72,7 +72,18 @@ const CONTENT_BLOCK = /\b(?:spam|abuse|complaint|unsolicited|blocked|blacklist|d
  * outage retried five times permanently suppressed every recipient queued at
  * the time, which is the opposite of what a retry limit is for.
  */
-const TRANSPORT_FAILURE = new RegExp(
+/**
+ * Failures that can only be about the connection.
+ *
+ * A socket error, a TLS handshake, an authentication refusal, a system that
+ * says its own mail store is full. None of these can be said about a mailbox,
+ * so they decide the answer before anything else looks at the text -- which
+ * matters because the quota rules below read the same reply and would claim
+ * it. `4.3.1 Insufficient system storage` lives here rather than with quota:
+ * RFC 3463 calls it a mail *system* condition, and the system is not the
+ * recipient.
+ */
+const TRANSPORT_CODES = new RegExp(
   [
     'ECONN(?:REFUSED|RESET|ABORTED)',
     'ETIMEDOUT|ESOCKET|EHOSTUNREACH|ENETUNREACH|ENOTFOUND|EAI_AGAIN|EPIPE',
@@ -83,21 +94,39 @@ const TRANSPORT_FAILURE = new RegExp(
     // accepted the connection and went quiet spent the attempt budget and
     // suppressed the address for thirty days -- for a fault at our end.
     '^timeout$|\\btimed out\\b|greeting (?:never received|timeout)',
-    // Transient SMTP. Over-quota is carved out by OVER_QUOTA below, which is
-    // checked first -- not by a negative lookahead here. The lookahead version
-    // needed anchors to work, and `^...$` without the `m` flag cannot match a
-    // string containing a newline: nodemailer joins multi-line SMTP replies
-    // with \n, which is how Gmail and Outlook word every deferral, so an
-    // afternoon of throttling stopped being read as transport at all.
-    '\\b(?:421|450|451|452)\\b',
     '\\b535\\b|authentication (?:failed|required)|invalid login',
-    // Matched against the reply with quoted addresses stripped out; see
-    // withoutAddresses(). Word boundaries alone were not enough, because `<`,
-    // `@` and `.` are all non-word characters -- so <ssl@example.com> and
-    // <jo@ssl.example.com> still read as our TLS failing.
-    '\\bcertificate\\b|\\bself.?signed\\b|\\bTLS\\b|\\bSSL\\b|\\bSTARTTLS\\b',
-    'greylist|try again|too many connections|rate limit',
   ].join('|'),
+  'i',
+);
+
+/**
+ * The same, in words that could plausibly be somebody's mailbox.
+ *
+ * Split from the codes above because these two need different text. `SSL` and
+ * `certificate` are ordinary enough to be a local part, so they are matched
+ * against the reply with addresses stripped -- that is the whole
+ * <ssl@example.com> class. `ECONNREFUSED` is nobody's mailbox, so it is
+ * matched against the raw reply: stripping ate it when the error arrived as a
+ * whitespace-free blob, which is what a JSON-stringified nodemailer error is.
+ */
+const TRANSPORT_WORDS =
+  /\bcertificate\b|\bself.?signed\b|\bTLS\b|\bSSL\b|\bSTARTTLS\b|insufficient (?:system )?storage|\b4\.3\.1\b/i;
+
+/**
+ * Transient replies that are only a code and a mood.
+ *
+ * Checked after the quota rules, because a bare 4xx is exactly what a full
+ * mailbox answers with and there is nothing in the number to tell them apart.
+ * No anchors: `^...$` without the `m` flag cannot match a string containing a
+ * newline, and nodemailer joins multi-line SMTP replies with one -- which is
+ * how Gmail and Outlook word every deferral, so an afternoon of throttling
+ * stopped being read as transport at all.
+ */
+/** A 5xx reply code, or the enhanced status that goes with one. */
+const PERMANENT_CODE = /\b5\d\d\b|\b5\.\d\.\d\b/;
+
+const TRANSPORT_TRANSIENT = new RegExp(
+  ['\\b(?:421|450|451|452)\\b', 'greylist|try again|too many connections|rate limit'].join('|'),
   'i',
 );
 
@@ -114,7 +143,7 @@ export type FailureKind = 'hard' | 'soft' | 'complaint' | 'transport';
  * owner has not gone anywhere, and they may well empty it next week.
  */
 const OVER_QUOTA =
-  /over ?quota|quota exceeded|mailbox (?:is )?full|user'?s mailbox is full|insufficient (?:system )?storage|\b552\b/i;
+  /over ?quota|quota exceeded|mailbox (?:is )?full|user'?s mailbox is full|\b552\b/i;
 
 /**
  * The reply with quoted addresses taken out.
@@ -127,16 +156,48 @@ const OVER_QUOTA =
  * the whole class rather than the examples of it.
  */
 function withoutAddresses(message: string): string {
-  return message.replace(/<[^>\s]*>/g, ' ').replace(/\S+@\S+/g, ' ');
+  // Bounded, and no backtracking.
+  //
+  // `\S+@\S+` retries from every start position on a long run of non-space
+  // with no `@` in it: 64 KB of that took seven seconds of blocked event loop,
+  // and the text comes from a remote MTA, so anyone with a domain they control
+  // can answer with it. `[^\s@]+` cannot overlap the separator, and 2 KB is
+  // far past any real SMTP reply.
+  return message
+    .slice(0, 2048)
+    .replace(/<[^>\s]*>/g, ' ')
+    // Address-shaped, not merely "has an @ in it". The looser version ate a
+    // whole JSON-stringified error because it contained a recipient, taking
+    // the error code with it.
+    .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/g, ' ');
 }
 
 export function classifyFailure(message: string): FailureKind {
-  // Before anything else; see OVER_QUOTA.
-  if (OVER_QUOTA.test(message)) return 'soft';
+  // Every rule reads the reply with quoted addresses taken out. The quota
+  // rules were reading the raw text, and they carry a bare `552` -- so a hard
+  // bounce for <552@qq.com>, or any numeric mailbox, came back as a soft one
+  // and that dead address was never suppressed. Numeric local parts are
+  // ordinary at QQ and 163 and on ticketing systems.
+  const said = withoutAddresses(message);
 
-  // Checked next: a relay that rejects everything with "spam" in the text is
-  // a transport problem, not four thousand people complaining.
-  if (TRANSPORT_FAILURE.test(withoutAddresses(message))) return 'transport';
+  // First, because these can only be about the connection. The codes read the
+  // raw reply and the words read the stripped one; see TRANSPORT_WORDS.
+  if (TRANSPORT_CODES.test(message) || TRANSPORT_WORDS.test(said)) return 'transport';
+
+  // Then the recipient's mailbox, before the bare 4xx codes -- a full mailbox
+  // answers with one of those and there is nothing in the number to tell it
+  // from a deferral.
+  if (OVER_QUOTA.test(said)) return 'soft';
+
+  // A permanent refusal outranks a transient code it merely quotes.
+  //
+  // Bounces recount their own history: "Response: 450 4.1.1 …" from an
+  // upstream probe, "Earlier attempt: 451 4.3.0 deferred". The final word is
+  // the 5xx, and reading the 4xx instead meant a mailbox that does not exist
+  // was retried and never suppressed.
+  if (PERMANENT_CODE.test(said) && HARD_BOUNCE.test(said)) return 'hard';
+
+  if (TRANSPORT_TRANSIENT.test(said)) return 'transport';
 
   // A content or reputation block is about this message, or about our sending
   // domain. Soft, so it is retried and lapses, and — this is the part that

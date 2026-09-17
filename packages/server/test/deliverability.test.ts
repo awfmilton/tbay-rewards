@@ -56,6 +56,58 @@ describe('classifying a delivery failure', () => {
     }
   });
 
+  it('does not read a numeric mailbox as a quota reply (MEDIUM)', () => {
+    // The quota rules carry a bare `552` and were matched against the raw
+    // reply, so a hard bounce for <552@qq.com> -- or any numeric local part,
+    // which is ordinary at QQ and 163 and on ticketing systems -- came back
+    // soft. That dead address was then never suppressed: retried on every
+    // broadcast, one bounce per send, forever.
+    for (const message of [
+      '550 5.1.1 <552@qq.com>: Recipient address rejected: User unknown',
+      '550 5.1.1 <jo.552@example.com>: User unknown',
+      '550 5.1.1 <552-sales@example.com>: User unknown',
+    ]) {
+      expect(classifyFailure(message), message).toBe('hard');
+    }
+  });
+
+  it('lets a connection failure outrank a quota mention (MEDIUM)', () => {
+    // Checking quota before the connection meant any relay-side failure whose
+    // text happened to mention a full mailbox spent the attempt budget and
+    // ended in a thirty-day suppression. `4.3.1 Insufficient system storage`
+    // is a mail *system* condition in RFC 3463, and the system is not the
+    // recipient.
+    for (const message of [
+      '452 4.3.1 Insufficient system storage; try again later',
+      '421 4.3.1 Mail system full; closing connection, try again later',
+      'ECONNRESET while reading greeting from relay (mailbox full warning banner)',
+      '{"code":"ETIMEDOUT","command":"CONN","recipient":"bob@example.com"}',
+    ]) {
+      expect(classifyFailure(message), message).toBe('transport');
+    }
+  });
+
+  it('lets a permanent code outrank a transient one it quotes (MEDIUM)', () => {
+    // Bounces recount their own history. The final word is the 5xx.
+    for (const message of [
+      '550-Verification failed for <bob@example.com>\n550-Response: 450 4.1.1 Recipient address rejected\n550 Sender verify failed',
+      'Delivery failed permanently.\n550 5.1.1 The email account that you tried to reach does not exist.\nEarlier attempt: 451 4.3.0 deferred',
+    ]) {
+      expect(classifyFailure(message), message).toBe('hard');
+    }
+  });
+
+  it('does not stall on a hostile reply (MEDIUM)', () => {
+    // The address stripper backtracked from every start position on a long run
+    // of non-whitespace: 64 KB took seven seconds of blocked event loop, and
+    // the text comes from a remote MTA, so anyone with a domain they control
+    // can answer with it.
+    const hostile = `550 ${'a'.repeat(64_000)}`;
+    const started = performance.now();
+    classifyFailure(hostile);
+    expect(performance.now() - started).toBeLessThan(250);
+  });
+
   it('reads a full mailbox the way a real MTA words it (HIGH)', () => {
     // A negative lookahead took over-quota out of `transport` and nothing put
     // it into `soft`, so the common Postfix wording fell through to the
@@ -114,10 +166,15 @@ describe('classifying a delivery failure', () => {
       '452 4.2.2 The email account that the user is trying to reach is over quota',
       '552 5.2.2 Over quota',
       '422 mailbox full',
-      '451 4.3.1 Insufficient system storage',
     ]) {
       expect(classifyFailure(message), message).toBe('soft');
     }
+
+    // Not this one, which an earlier version of this test had wrong: RFC 3463
+    // calls 4.3.1 a mail *system* condition, and the system is not the
+    // recipient. It is the destination server out of room, so it retries
+    // without spending the address's budget.
+    expect(classifyFailure('451 4.3.1 Insufficient system storage')).toBe('transport');
   });
 
   it('reads a surname that happens to contain a protocol name (MEDIUM)', () => {
