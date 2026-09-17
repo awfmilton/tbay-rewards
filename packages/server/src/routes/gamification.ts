@@ -4,7 +4,7 @@ import { db } from '../db/pool.js';
 import { requireSecretKey, tenantOf } from '../lib/auth.js';
 import { ApiError } from '../lib/errors.js';
 import { parse } from './collect.js';
-import { contactHandleSchema, pointTypeField } from './schemas.js';
+import { contactHandleSchema, pointTypeField, timestampString } from './schemas.js';
 import { requireContact } from '../services/contacts.js';
 import {
   awardBadgeManually,
@@ -165,7 +165,7 @@ export async function gamificationRoutes(app: FastifyInstance): Promise<void> {
         points: z.number().int().positive().max(1_000_000),
         maxUses: z.number().int().positive().nullish(),
         perContactLimit: z.number().int().positive().max(100).optional(),
-        expiresAt: z.string().max(40).nullish(),
+        expiresAt: timestampString.nullish(),
         // Balance band the redeemer must sit inside, and what the code hands
         // out besides points.
         minBalance: z.number().int().min(0).nullish(),

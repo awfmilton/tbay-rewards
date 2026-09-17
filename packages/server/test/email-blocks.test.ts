@@ -758,6 +758,64 @@ describe('what the reviews found', () => {
     await expect(startBroadcast(tenant.id, 'unwritten')).rejects.toThrow(/has no body|no message/i);
   });
 
+  it('keeps the fields a save does not name', async () => {
+    // wp-admin's form does not post `text`, and an API caller editing a
+    // subject line posts neither `transactional` nor `topicKey`. Each omission
+    // used to clear the field — and clearing `transactional` stops a receipt
+    // reaching anyone without a marketing opt-in.
+    await authed('PUT', '/v1/email/topics/receipts', { name: 'Receipts' });
+    await authed('PUT', '/v1/email/templates/receipt', {
+      subject: 'Your order',
+      html: '<p>Thanks</p>',
+      text: 'Thanks for your order',
+      transactional: true,
+      topicKey: 'receipts',
+      preheader: 'Order confirmed',
+    });
+
+    const edited = await authed('PUT', '/v1/email/templates/receipt', {
+      subject: 'Your order is on its way',
+      html: '<p>On its way</p>',
+    });
+    expect(edited.statusCode).toBe(200);
+
+    const after = await getTemplate(tenant.id, 'receipt');
+    expect(after?.subject).toBe('Your order is on its way');
+    expect(after?.text).toBe('Thanks for your order');
+    expect(after?.transactional).toBe(true);
+    expect(after?.topic_key).toBe('receipts');
+    expect(after?.preheader).toBe('Order confirmed');
+  });
+
+  it('still lets each of those be cleared on purpose', async () => {
+    await authed('PUT', '/v1/email/templates/clearable', {
+      subject: 'Clearable', html: '<p>Hi</p>', text: 'Hi', transactional: true,
+    });
+    await authed('PUT', '/v1/email/templates/clearable', {
+      subject: 'Clearable', html: '<p>Hi</p>', text: null, transactional: false,
+    });
+    const after = await getTemplate(tenant.id, 'clearable');
+    expect(after?.text).toBeNull();
+    expect(after?.transactional).toBe(false);
+  });
+
+  it('replaces a composed body when hand-written HTML is saved over it', async () => {
+    await authed('PUT', '/v1/email/templates/wasblocks', {
+      subject: 'Was blocks',
+      blocks: [{ type: 'text', text: 'Composed' }],
+    });
+    expect((await getTemplate(tenant.id, 'wasblocks'))?.blocks).toHaveLength(1);
+
+    await authed('PUT', '/v1/email/templates/wasblocks', {
+      subject: 'Was blocks', html: '<p>Hand written</p>',
+    });
+    const after = await getTemplate(tenant.id, 'wasblocks');
+    // Generated HTML cannot be parsed back into blocks, so keeping both would
+    // leave the builder reopening something the message no longer is.
+    expect(after?.blocks).toBeNull();
+    expect(after?.html).toBe('<p>Hand written</p>');
+  });
+
   it('lets a template leave every topic', async () => {
     await authed('PUT', '/v1/email/topics/offers', { name: 'Offers' });
     await authed('PUT', '/v1/email/templates/topical', {

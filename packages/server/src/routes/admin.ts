@@ -4,7 +4,7 @@ import { db, queryOne } from '../db/pool.js';
 import { requireSecretKey, tenantOf } from '../lib/auth.js';
 import { ApiError } from '../lib/errors.js';
 import { parse } from './collect.js';
-import { contactHandleSchema, pointTypeField } from './schemas.js';
+import { contactHandleSchema, pointTypeField, timestampString } from './schemas.js';
 import { limitOf, uuidOf } from '../lib/paging.js';
 import {
   eraseContact,
@@ -196,18 +196,23 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     });
     const input = parse(schema, request.body);
 
-    if (!input.blocks && !input.html) {
+    // A template that exists already may be edited a field at a time; a new one
+    // needs a body, or it would be stored empty.
+    if (!input.blocks && !input.html && !(await getTemplate(tenant.id, request.params.key))) {
       throw ApiError.badRequest('A template needs either html or blocks');
     }
 
+    // Passed through as sent, undefined included: a field the caller did not
+    // name is one they did not mean to change, and flattening it to null here
+    // is what cleared the plain-text override on every wp-admin save.
     await upsertTemplate(tenant.id, request.params.key, {
       subject: input.subject,
-      html: input.html ?? '',
-      text: input.text ?? null,
-      transactional: input.transactional ?? false,
-      topicKey: input.topicKey ?? null,
+      html: input.html,
+      text: input.text,
+      transactional: input.transactional,
+      topicKey: input.topicKey,
       blocks: input.blocks,
-      preheader: input.preheader ?? null,
+      preheader: input.preheader,
     });
     return { key: request.params.key, saved: true };
   });
@@ -886,7 +891,7 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
       segmentKey: z.string().max(64).optional(),
       templateKey: z.string().max(64).optional(),
       subject: z.string().max(300).nullish(),
-      sendAt: z.string().max(40).nullish(),
+      sendAt: timestampString.nullish(),
       // A body composed for this send instead of naming a template. Null
       // clears it and goes back to the template.
       blocks: z.array(z.record(z.unknown())).max(60).nullish(),

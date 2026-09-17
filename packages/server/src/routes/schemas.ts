@@ -2,6 +2,21 @@ import { z } from 'zod';
 
 /** Shared request schemas. Everything crossing the wire is parsed, never cast. */
 
+/**
+ * A timestamp the caller supplied.
+ *
+ * Checked here rather than at the column: an unparseable date reached Postgres
+ * and came back as `invalid input syntax for type timestamp with time zone`,
+ * which the error handler could only call a 500. A caller's typo is a 400, and
+ * it should say which field.
+ */
+export const timestampString = z
+  .string()
+  .max(40)
+  .refine((value) => !Number.isNaN(Date.parse(value)), {
+    message: 'must be a date, such as 2026-09-17T10:00:00Z',
+  });
+
 export const heatmapSampleSchema = z.object({
   x: z.number().finite(),
   y: z.number().finite(),
@@ -34,7 +49,7 @@ export const incomingEventSchema = z.object({
   valueCents: z.number().int().nullish(),
   currency: z.string().length(3).nullish(),
   props: z.record(z.unknown()).optional(),
-  occurredAt: z.string().max(40).nullish(),
+  occurredAt: timestampString.nullish(),
   product: z
     .object({
       name: z.string().max(255).nullish(),
@@ -172,7 +187,7 @@ export const orderSchema = z.object({
   cartToken: z.string().max(128).nullish(),
   visitorAnonId: z.string().max(64).nullish(),
   linkCode: z.string().max(64).nullish(),
-  placedAt: z.string().max(40).nullish(),
+  placedAt: timestampString.nullish(),
 });
 
 export const contactHandleSchema = z.object({
@@ -224,8 +239,8 @@ export const createLinkSchema = z.object({
 });
 
 export const dateRangeSchema = z.object({
-  from: z.string().max(40).optional(),
-  to: z.string().max(40).optional(),
+  from: timestampString.optional(),
+  to: timestampString.optional(),
   limit: z.coerce.number().int().positive().max(500).optional(),
 });
 
