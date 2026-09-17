@@ -22,6 +22,7 @@ import { award, getBalance } from '../src/services/points.js';
 import {
   createSpendIntent,
   expireStaleClaims,
+  expireStaleSpendIntents,
   outstandingClaims,
   quote,
   reconcileClaims,
@@ -476,6 +477,172 @@ describe('spending TBAY at a retailer', () => {
     // not that the code never existed.
     await expect(redeemStoreCredit(tenant.id, result.credit!.code, 'order-100'))
       .rejects.toThrow(/already been used/i);
+  });
+
+  it('survives the expiry worker running mid-verification (HIGH)', async () => {
+    // Two writers, one predicate, a network call in between.
+    //
+    // verifySpendIntent read the intent, went to the chain, and only then
+    // wrote 'verified' behind `WHERE status = 'pending'`. expireStaleSpendIntents
+    // writes 'expired' over that same predicate on a five-minute tick. A verify
+    // that starts a second before the deadline and spends three seconds on the
+    // RPC loses its row -- and the customer's TBAY is already at the retailer's
+    // payout wallet, so the losing side of the race is money taken with no
+    // credit issued.
+    //
+    // The worker is fired from inside the stubbed RPC, which is exactly where
+    // it lands in production: after the read, before the write.
+    await updateTenantSettings(db(), tenant.id, { payoutWallet: PAYOUT });
+    const contact = await fundedContact(0, 'racing@example.com');
+    const tenantRow = await tenantObject();
+    const { intent } = await createSpendIntent(tenantRow, {
+      contact,
+      amountTokens: 5,
+      fromAddress: CUSTOMER,
+    });
+    // The quote lapses while the customer is signing in their wallet app.
+    await db().query(
+      `UPDATE token_spend_intents SET expires_at = now() - interval '1 minute' WHERE id = $1`,
+      [intent.id],
+    );
+
+    let sweptDuringRpc = 0;
+    setChainClient(
+      stubChain({
+        transfersInTx: async () => {
+          sweptDuringRpc = await expireStaleSpendIntents();
+          return [
+            {
+              from: getAddress(CUSTOMER),
+              to: getAddress(PAYOUT),
+              value: tokensToWei(5),
+              blockNumber: 100,
+              confirmations: 3,
+            },
+          ];
+        },
+      }),
+    );
+
+    const result = await verifySpendIntent(tenantRow, intent.id, '0xdeadbeefdeadbeef');
+    // The worker ran and found nothing to take, because the row was claimed.
+    expect(sweptDuringRpc).toBe(0);
+    expect(result.intent.status).toBe('verified');
+    expect(result.credit?.amount_cents).toBe(500);
+
+    const { rows } = await db().query<{ n: string }>(
+      'SELECT count(*)::text AS n FROM store_credits WHERE spend_intent_id = $1',
+      [intent.id],
+    );
+    expect(rows[0]!.n).toBe('1');
+  });
+
+  it('puts the claim back when the verification does not settle (HIGH)', async () => {
+    // A claim that is not released is a strand: the customer cannot retry with
+    // the right hash, and nothing but the ten-minute reaper would ever free it.
+    await updateTenantSettings(db(), tenant.id, { payoutWallet: PAYOUT });
+    const contact = await fundedContact(0, 'retrying@example.com');
+    const tenantRow = await tenantObject();
+    const { intent } = await createSpendIntent(tenantRow, {
+      contact,
+      amountTokens: 5,
+      fromAddress: CUSTOMER,
+    });
+
+    setChainClient(stubChain({ transfersInTx: async () => [] }));
+    await expect(verifySpendIntent(tenantRow, intent.id, '0xnope')).rejects.toMatchObject({
+      statusCode: 422,
+    });
+    const afterMiss = await db().query<{ status: string }>(
+      'SELECT status FROM token_spend_intents WHERE id = $1',
+      [intent.id],
+    );
+    expect(afterMiss.rows[0]!.status).toBe('pending');
+
+    // An RPC that throws has to release it too.
+    setChainClient(
+      stubChain({
+        transfersInTx: async () => {
+          throw new Error('RPC unavailable');
+        },
+      }),
+    );
+    await expect(verifySpendIntent(tenantRow, intent.id, '0xnope')).rejects.toThrow(/RPC/);
+    const afterThrow = await db().query<{ status: string }>(
+      'SELECT status FROM token_spend_intents WHERE id = $1',
+      [intent.id],
+    );
+    expect(afterThrow.rows[0]!.status).toBe('pending');
+
+    // And the customer's real transaction still settles afterwards.
+    setChainClient(
+      stubChain({
+        transfersInTx: async () => [
+          {
+            from: getAddress(CUSTOMER),
+            to: getAddress(PAYOUT),
+            value: tokensToWei(5),
+            blockNumber: 100,
+            confirmations: 3,
+          },
+        ],
+      }),
+    );
+    const settled = await verifySpendIntent(tenantRow, intent.id, '0xdeadbeefdeadbeef');
+    expect(settled.intent.status).toBe('verified');
+  });
+
+  it('settles a transfer that arrived after the quote lapsed (HIGH)', async () => {
+    // `expires_at` bounds how long the quote stands; it does not bound the
+    // money. A customer who sent their TBAY and lost the tab has tokens at the
+    // retailer's payout wallet, and refusing to settle because a sixty-minute
+    // timer ran out is keeping it.
+    await updateTenantSettings(db(), tenant.id, { payoutWallet: PAYOUT });
+    const contact = await fundedContact(0, 'late@example.com');
+    const tenantRow = await tenantObject();
+    const { intent } = await createSpendIntent(tenantRow, {
+      contact,
+      amountTokens: 5,
+      fromAddress: CUSTOMER,
+    });
+    await db().query(
+      `UPDATE token_spend_intents SET status = 'expired', expires_at = now() - interval '3 days'
+        WHERE id = $1`,
+      [intent.id],
+    );
+
+    setChainClient(
+      stubChain({
+        transfersInTx: async () => [
+          {
+            from: getAddress(CUSTOMER),
+            to: getAddress(PAYOUT),
+            value: tokensToWei(5),
+            blockNumber: 100,
+            confirmations: 3,
+          },
+        ],
+      }),
+    );
+    const result = await verifySpendIntent(tenantRow, intent.id, '0xdeadbeefdeadbeef');
+    expect(result.intent.status).toBe('verified');
+    expect(result.credit?.amount_cents).toBe(500);
+
+    // Past the settlement window it is closed, and says so rather than
+    // silently issuing credit against a year-old quote.
+    const { intent: ancient } = await createSpendIntent(tenantRow, {
+      contact,
+      amountTokens: 5,
+      fromAddress: CUSTOMER,
+    });
+    await db().query(
+      `UPDATE token_spend_intents SET status = 'expired', expires_at = now() - interval '400 days'
+        WHERE id = $1`,
+      [ancient.id],
+    );
+    await expect(verifySpendIntent(tenantRow, ancient.id, '0xfeedfacefeedface')).rejects.toThrow(
+      /can no longer be settled/i,
+    );
   });
 
   it('rejects a transfer that went to the wrong address', async () => {

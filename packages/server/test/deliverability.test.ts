@@ -9,7 +9,7 @@ import {
   truncateAll,
   type TestTenant,
 } from './helpers.js';
-import { classifyFailure, isSuppressed, suppress } from '../src/services/deliverability.js';
+import { classifyFailure, isSuppressed, recordFailure, suppress } from '../src/services/deliverability.js';
 import {
   flushEmailQueue,
   outbox,
@@ -54,6 +54,58 @@ describe('classifying a delivery failure', () => {
     ]) {
       expect(classifyFailure(message)).toBe('hard');
     }
+  });
+
+  it('does not read a reputation block as a dead mailbox (HIGH)', () => {
+    // Postfix words *every* rejection the same way, whatever the reason:
+    // "<addr>: Recipient address rejected: <reason>". So the hard-bounce
+    // wording is present in an RBL hit, a content rejection and a policy
+    // refusal, none of which is about the mailbox. Ranking a permanent code
+    // above the block rules meant one afternoon behind a Spamhaus listing
+    // permanently suppressed every recipient in the batch on their first
+    // attempt -- expires_at null, subscription 'bounced', no way back without
+    // a manual unsuppress per address.
+    for (const message of [
+      '550 5.7.1 <them@example.com>: Recipient address rejected: Access denied',
+      '554 5.7.1 Service unavailable; Client host [203.0.113.7] blocked using zen.spamhaus.org',
+      '550 5.7.1 <them@example.com>: Recipient address rejected: Message rejected due to content restrictions',
+      '550 5.7.606 Access denied, banned sending IP [203.0.113.7]',
+    ]) {
+      expect(classifyFailure(message), message).toBe('soft');
+    }
+
+    // The control: the same wording with an addressing status really is a
+    // dead mailbox, and still reads as one.
+    expect(
+      classifyFailure('550 5.1.1 <them@example.com>: Recipient address rejected: User unknown'),
+    ).toBe('hard');
+  });
+
+  it('does not read an incidental number as a reply code (HIGH)', () => {
+    // A reply code is the first token of a reply line, not any three digits in
+    // the text. Scanning for `\b5\d\d\b` found the duration in "try again in
+    // 500 seconds", and scanning for `\b5\.\d\.\d\b` found an octet inside
+    // "10.5.3.2" -- so two ordinary deferrals were read as permanent refusals
+    // and the recipients were suppressed on the first attempt.
+    // Worded the way Postfix actually words them, because that is what made
+    // the bug bite: the same reply carries "Recipient address rejected", so a
+    // stray permanent code is all that stands between a greylist and a
+    // permanent suppression.
+    for (const message of [
+      '450 4.7.1 <them@example.com>: Recipient address rejected: Greylisted, try again in 500 seconds',
+      '451 4.7.1 <them@example.com>: Recipient address rejected: Service unavailable; relay 10.5.1.1 is not responding',
+      '451 4.7.500 <them@example.com>: Recipient address rejected: Server busy, try again later',
+      '450 4.2.0 <them@example.com>: Recipient address rejected: deferred, retry in 550 seconds, queue id 550ABC',
+    ]) {
+      expect(classifyFailure(message), message).not.toBe('hard');
+    }
+
+    // The control: move the permanent code into reply position and the same
+    // wording is a dead mailbox again, so this is testing where the digits
+    // are and not merely that they are ignored.
+    expect(
+      classifyFailure('550 5.1.1 <them@example.com>: Recipient address rejected: unknown user'),
+    ).toBe('hard');
   });
 
   it('does not read a numeric mailbox as a quota reply (MEDIUM)', () => {
@@ -102,10 +154,24 @@ describe('classifying a delivery failure', () => {
     // of non-whitespace: 64 KB took seven seconds of blocked event loop, and
     // the text comes from a remote MTA, so anyone with a domain they control
     // can answer with it.
-    const hostile = `550 ${'a'.repeat(64_000)}`;
-    const started = performance.now();
-    classifyFailure(hostile);
-    expect(performance.now() - started).toBeLessThan(250);
+    //
+    // One payload was not enough: the fix bounded the address stripper and
+    // left three patterns scanning the raw reply, where `\b550\b.*no such
+    // user` is quadratic in the number of codes -- 64 KB of "550 " took 1.5
+    // seconds and 256 KB took 23.8. Each shape below defeats a different one
+    // of the three attempts at this, so they are all kept.
+    const payloads = [
+      `550 ${'a'.repeat(64_000)}`, // one huge non-space run, no '@'
+      `${'x'.repeat(256_000)}@`, // the same, ending in the separator
+      '550 '.repeat(64_000), // many codes: the quadratic pairing
+      `550 5.1.1 ${'<a@b.example.com> '.repeat(8_000)}`, // many addresses to strip
+      `${'4.7.1 '.repeat(48_000)}user unknown`, // many enhanced statuses
+    ];
+    for (const hostile of payloads) {
+      const started = performance.now();
+      classifyFailure(hostile);
+      expect(performance.now() - started, `${hostile.length} bytes`).toBeLessThan(250);
+    }
   });
 
   it('reads a full mailbox the way a real MTA words it (HIGH)', () => {
@@ -129,13 +195,108 @@ describe('classifying a delivery failure', () => {
     // ^...$ and no `m` flag meant none of them matched, so an afternoon of
     // throttling spent the attempt budget and suppressed the throttled
     // recipients for a month.
+    //
+    // 421 is "closing transmission channel" and 4.3.x is the receiving mail
+    // *system*: both are about the connection rather than about anything in
+    // the envelope, so the attempt is refunded as well as never counted.
     for (const message of [
       '421-4.7.0 Our system has detected an unusual rate of unsolicited mail\n421 4.7.0 originating',
-      '450-4.2.1 The user you are trying to contact is receiving mail at a rate that\n450-4.2.1 prevents',
       '451-4.3.0 Mail server temporarily rejected message.\n451 4.3.0 Please retry',
     ]) {
       expect(classifyFailure(message), message).toBe('transport');
     }
+  });
+
+  it('gives up on a message that can never leave the queue (HIGH)', async () => {
+    // A transport failure refunds its attempt, so a message stuck on one has
+    // no budget to run out of: retried every sixty seconds for as long as the
+    // queue exists, never sent, never failed, and never visible as a problem.
+    // That is the standing cost of any classifier mistake in this direction,
+    // and it is why the classifier has to be right *and* bounded.
+    const { queueEmail, flushEmailQueue, setEmailTransport } = await import(
+      '../src/services/email.js'
+    );
+    await queueEmail({
+      tenantId: tenant.id,
+      templateKey: 'receipt',
+      to: 'stuck@example.com',
+      subject: 'Your order',
+      html: '<p>Thanks</p>',
+      dedupeKey: 'stuck-1',
+    });
+    setEmailTransport({
+      async send() {
+        throw new Error('connect ECONNREFUSED 10.0.0.5:587');
+      },
+    });
+
+    // Two days of a broken relay: still trying, still no attempts spent.
+    await db().query(
+      `UPDATE email_messages SET created_at = now() - interval '2 days' WHERE tenant_id = $1`,
+      [tenant.id],
+    );
+    await flushEmailQueue(50);
+    const trying = await db().query<{ status: string; attempts: number }>(
+      'SELECT status, attempts FROM email_messages WHERE tenant_id = $1',
+      [tenant.id],
+    );
+    expect(trying.rows[0]!.status).toBe('queued');
+    expect(trying.rows[0]!.attempts).toBe(0);
+
+    // Four days, and it ends -- visibly, with its last error, rather than
+    // cycling out of sight.
+    await db().query(
+      `UPDATE email_messages SET created_at = now() - interval '4 days', next_attempt_at = now()
+        WHERE tenant_id = $1`,
+      [tenant.id],
+    );
+    await flushEmailQueue(50);
+    const done = await db().query<{ status: string; error: string | null }>(
+      'SELECT status, error FROM email_messages WHERE tenant_id = $1',
+      [tenant.id],
+    );
+    expect(done.rows[0]!.status).toBe('failed');
+    expect(done.rows[0]!.error).toMatch(/gave up after/i);
+
+    // And it is not a suppression: four days of a broken relay says nothing
+    // about the mailbox.
+    expect(await isSuppressed(tenant.id, 'stuck@example.com')).toBeNull();
+  });
+
+  it('never writes off an address over a deferral, whatever the label (HIGH)', async () => {
+    // The harm the deferral rules exist to prevent is not the classification,
+    // it is the ending: an afternoon of throttling used to spend the attempt
+    // budget and then suppress every throttled recipient for a month.
+    //
+    // So this asserts the ending. recordFailure is called at the last attempt,
+    // which is the only moment a soft failure is allowed to suppress, and the
+    // address has to come back mailable. A deferral is a verdict about the
+    // message and never a statement that the mailbox is gone -- true whether
+    // the reply is read as transport or as soft, which is why the label is not
+    // what is checked. These are also the replies that hit every recipient of
+    // a broadcast identically, so a rule that counts them takes the whole
+    // audience off the list at the same moment.
+    for (const message of [
+      '421-4.7.0 Our system has detected an unusual rate of unsolicited mail\n421 4.7.0 originating',
+      '450-4.2.1 The user you are trying to contact is receiving mail at a rate that\n450-4.2.1 prevents',
+      '451-4.3.0 Mail server temporarily rejected message.\n451 4.3.0 Please retry',
+      '450 4.7.1 <them@example.com>: Greylisted, try again in 500 seconds',
+      'greylisted, try again later',
+      '452 4.2.2 <them@example.com>: Recipient address rejected: mailbox is full',
+      '550 5.7.1 Message rejected as spam by Content Filtering',
+      '554 5.7.1 Service unavailable; Client host blocked using zen.spamhaus.org',
+    ]) {
+      const address = `deferred-${Math.random().toString(36).slice(2)}@example.com`;
+      const kind = await recordFailure(tenant.id, address, message, 6, 6);
+      expect(kind, message).not.toBe('hard');
+      expect(await isSuppressed(tenant.id, address), message).toBeNull();
+    }
+
+    // And the control: a failure that says nothing identifiable at all is
+    // exactly what the attempt budget is for, so it still ends in one.
+    const unexplained = `unexplained-${Math.random().toString(36).slice(2)}@example.com`;
+    await recordFailure(tenant.id, unexplained, 'Message could not be delivered', 6, 6);
+    expect(await isSuppressed(tenant.id, unexplained)).not.toBeNull();
   });
 
   it('does not read a protocol name inside the recipient address (MEDIUM)', () => {
@@ -197,7 +358,6 @@ describe('classifying a delivery failure', () => {
     for (const message of [
       '451 4.3.0 Temporary server error',
       'ECONNREFUSED',
-      'greylisted, try again later',
       'unable to verify the first certificate',
       'Client network socket disconnected before secure TLS connection was established',
     ]) {

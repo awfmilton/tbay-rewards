@@ -2,6 +2,7 @@ import { db, queryOne, withTransaction, type Queryable } from '../db/pool.js';
 import { ApiError } from '../lib/errors.js';
 import { hashPii } from '../lib/crypto.js';
 import { getTenantById, type Tenant } from './tenants.js';
+import { SPEND_SETTLEMENT_DAYS } from './token.js';
 
 /**
  * Erasure, subject access, and not keeping what nobody needs.
@@ -39,6 +40,16 @@ export interface EraseResult {
   contact_id: string;
   points_forfeited: number;
   rows_deleted: Record<string, number>;
+  /**
+   * On-chain obligations that outlived the erasure.
+   *
+   * A bridge withdrawal whose L2 tokens are already burned still owes L1
+   * tokens to the wallet that burned them. Erasure unlinks it from the person
+   * but cannot cancel it, so it is reported here rather than disappearing:
+   * the retailer has to know something is still payable, and the erasure log
+   * has to show that it was not quietly destroyed.
+   */
+  obligations_kept: number;
 }
 
 /**
@@ -264,54 +275,57 @@ export async function eraseContact(
     // The rows stay: a token claim is a financial record and a mint against a
     // supply budget, and deleting it makes the supply unreconcilable. What
     // goes is everything that says who it was.
-    // An on-chain obligation that has not settled is not erasable yet.
+    // An on-chain obligation outlives the person's account.
     //
     // Round four overwrote every address on these tables with the zero
     // address, unconditionally, and that destroyed money twice over. A
-    // `pending` spend intent is verified by matching an on-chain transfer
+    // `pending` spend intent is settled by matching an on-chain transfer
     // against the addresses recorded here, so blanking them meant the customer
     // had sent their TBAY, the retailer had it, and the store credit could
     // never be issued. A `burn_verified` bridge withdrawal is worse: the L2
     // tokens are already burned and an operator is about to send L1 tokens to
-    // `l1_recipient` -- which had just been repointed at the address bridge.ts
-    // uses as its burn address.
+    // `l1_recipient` -- which had just been repointed at the burn address.
     //
-    // So: settle or cancel first. Refusing is the only honest answer, because
-    // the alternatives are destroying the customer's funds or keeping their
-    // wallet on file against their wishes -- and this refusal is temporary and
-    // actionable, which neither of those is.
-    const inFlight = await client.query<{ kind: string; id: string }>(
-      // Live, not merely unfinished.
-      //
-      // Refusing on `status = 'pending'` alone was worse than the bug it
-      // fixed: a spend intent is created the moment somebody taps "Pay with
-      // TBAY", nothing moved it out of pending, and `verifySpendIntent`
-      // refuses an expired one -- so a customer who changed their mind could
-      // never be erased, and the operator's only remedy was an UPDATE against
-      // production. An erasure a controller cannot carry out is itself the
-      // defect. An intent past its expiry is settled by abandonment; there is
-      // nothing in flight to protect. (expireStaleSpendIntents now moves them
-      // too; this predicate does not depend on that worker having run.)
+    // Round five answered that by refusing the erasure outright, and round
+    // seven showed what that costs: the refusal named "releasing or rejecting"
+    // a withdrawal as the remedy, both of which need the platform's bridge
+    // operator credential, which a retailer does not have and which ships
+    // empty -- so the route answers 503 and the erasure could never be carried
+    // out at all. An erasure a controller cannot complete is itself the
+    // defect, and this one was unbounded.
+    //
+    // Neither destroying the record nor refusing forever is right, because
+    // both treat one row as a single thing. It is two: a link to a person, and
+    // an obligation to a wallet. The link is what identifies, and it goes. The
+    // wallet is what the money is owed to, it is a public chain identifier the
+    // retailer can already read off their own payout address, and keeping it
+    // is the only way an unsettled transfer can ever be settled. Article
+    // 17(3)(e) exists for exactly this: a record kept for the establishment of
+    // a legal claim.
+    //
+    // So: unlink everything, and scrub the wallet only where nothing is owed.
+    const unsettled = await client.query<{ kind: string; id: string }>(
+      // Live, not merely unfinished -- and only for the one case where erasing
+      // *now* would break something actually in progress. A spend intent is
+      // created the moment somebody taps "Pay with TBAY"; the expiry worker
+      // moves it out of `pending` within five minutes of its own deadline, so
+      // this refusal lasts minutes and clears itself. A verification in flight
+      // is about to write a store credit against this contact.
       `SELECT 'token spend' AS kind, id::text FROM token_spend_intents
         WHERE tenant_id = $1 AND contact_id = $2
-          AND status = 'pending' AND expires_at > now()
-        UNION ALL
-       SELECT 'bridge withdrawal', id::text FROM bridge_withdrawals
-        WHERE tenant_id = $1 AND contact_id = $2
-          AND status IN ('pending', 'burn_verified')`,
+          AND (status = 'verifying' OR (status = 'pending' AND expires_at > now()))`,
       [tenantId, contactId],
     );
-    if ((inFlight.rowCount ?? 0) > 0) {
-      const what = inFlight.rows.map((row) => `${row.kind} ${row.id}`).join(', ');
+    if ((unsettled.rowCount ?? 0) > 0) {
+      const what = unsettled.rows.map((row) => `${row.kind} ${row.id}`).join(', ');
       throw ApiError.badRequest(
-        `This person has an unsettled on-chain transaction (${what}). ` +
-          'Erasing now would destroy funds that are already in flight. A token spend ' +
-          'clears itself once it expires; a bridge withdrawal needs releasing or ' +
-          'rejecting first.',
+        `This person has a checkout in progress (${what}). Erasing mid-payment would ` +
+          'lose the store credit they are about to be owed. A spend intent closes ' +
+          'itself when it expires, or POST /v1/token/spend/{id}/cancel closes it now.',
       );
     }
 
-    // What is left is history, and its addresses can go.
+    // What is left is history, and most of its addresses can go.
     //
     // The columns are NOT NULL, so they are overwritten rather than emptied.
     // `to_address` on a spend intent is deliberately untouched: that is the
@@ -324,17 +338,56 @@ export async function eraseContact(
         WHERE tenant_id = $1 AND contact_id = $2`,
       [tenantId, contactId, ERASED_ADDRESS],
     );
+
+    // A spend intent keeps its `from_address` while it could still be settled.
+    //
+    // `expires_at` bounds the quote, not the money: a customer who sent their
+    // TBAY and lost the tab has tokens sitting at the retailer's payout wallet,
+    // and `from_address` is the only field a hand-settlement can match on.
+    // Scrubbing it on every expired intent -- which is what a sixty-minute TTL
+    // made the common case -- is how the round-four bug came back narrower.
+    // Settled means settled: verified, cancelled by the retailer, or past the
+    // window in which anyone can still act on it.
     await client.query(
       `UPDATE token_spend_intents SET from_address = $3, member_id = NULL
-        WHERE tenant_id = $1 AND contact_id = $2`,
-      [tenantId, contactId, ERASED_ADDRESS],
+        WHERE tenant_id = $1 AND contact_id = $2
+          AND (
+            status IN ('verified', 'cancelled')
+            OR (status = 'expired' AND expires_at <= now() - ($4 || ' days')::interval)
+          )`,
+      [tenantId, contactId, ERASED_ADDRESS, String(SPEND_SETTLEMENT_DAYS)],
     );
+
+    // Everything else on the table loses its cross-tenant link but keeps the
+    // wallet it owes against. `contact_id` stays: it points at the stripped
+    // contact row, which carries no identifier any more, and it is what lets
+    // the retailer see that an obligation belongs to an erasure rather than to
+    // nobody at all. `member_id` is the platform-wide identity and does go.
+    await client.query(
+      `UPDATE token_spend_intents SET member_id = NULL
+        WHERE tenant_id = $1 AND contact_id = $2`,
+      [tenantId, contactId],
+    );
+
+    // A released or rejected bridge withdrawal owes nothing, so its addresses
+    // go. One still in flight keeps them: those L2 tokens are burned and the
+    // L1 release has to reach the wallet that burned them.
     await client.query(
       `UPDATE bridge_withdrawals
-          SET from_address = $3, l1_recipient = $3, member_id = NULL
-        WHERE tenant_id = $1 AND contact_id = $2`,
+          SET from_address = $3, l1_recipient = $3
+        WHERE tenant_id = $1 AND contact_id = $2
+          AND status IN ('released', 'rejected')`,
       [tenantId, contactId, ERASED_ADDRESS],
     );
+    const stillOwed = await client.query<{ status: string }>(
+      `UPDATE bridge_withdrawals SET member_id = NULL
+        WHERE tenant_id = $1 AND contact_id = $2
+        RETURNING status`,
+      [tenantId, contactId],
+    );
+    const obligationsKept = stillOwed.rows.filter(
+      (row) => row.status === 'pending' || row.status === 'burn_verified',
+    ).length;
 
     // The ledger keeps its rows -- the points have to reconcile -- but a
     // redemption wrote the wallet into `ref_id`, the idempotency key and the
@@ -392,11 +445,19 @@ export async function eraseContact(
         options.reason ?? 'request',
         options.requestedBy ?? null,
         forfeited,
-        JSON.stringify(rowsDeleted),
+        // The obligations ride along in the same blob so the proof-of-erasure
+        // endpoint shows them without a migration: a retailer reading the log
+        // needs to see that something was kept, and why, not just what went.
+        JSON.stringify({ ...rowsDeleted, obligations_kept: obligationsKept }),
       ],
     );
 
-    return { contact_id: contactId, points_forfeited: forfeited, rows_deleted: rowsDeleted };
+    return {
+      contact_id: contactId,
+      points_forfeited: forfeited,
+      rows_deleted: rowsDeleted,
+      obligations_kept: obligationsKept,
+    };
   };
 
   return runner ? run(runner) : withTransaction(run);

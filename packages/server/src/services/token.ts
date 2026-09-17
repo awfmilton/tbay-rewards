@@ -581,11 +581,70 @@ export async function supplyStatus(runner: Queryable = db()): Promise<{
  * position as before this worker existed.
  */
 export async function expireStaleSpendIntents(runner: Queryable = db()): Promise<number> {
+  // Release first, expire second.
+  //
+  // A request that died between claiming the row and hearing back from the RPC
+  // leaves it 'verifying', which nothing else will ever touch -- the same
+  // shape of stranding this worker was written to fix, one state along. The
+  // window is generous because the thing it waits on is an RPC call against a
+  // public node, and releasing a claim that is merely slow would hand the row
+  // straight back to the race the claim exists to close.
+  await runner.query(
+    `UPDATE token_spend_intents
+        SET status = 'pending', verify_claimed_at = NULL
+      WHERE status = 'verifying'
+        AND verify_claimed_at < now() - $1::interval`,
+    [STALE_VERIFY_CLAIM],
+  );
+
   const { rowCount } = await runner.query(
+    // 'verifying' is deliberately not expired here, however old the intent
+    // is: a verify in flight has already proved the transfer or is about to,
+    // and the chain does not care what our clock says.
     `UPDATE token_spend_intents SET status = 'expired'
       WHERE status = 'pending' AND expires_at <= now()`,
   );
   return rowCount ?? 0;
+}
+
+/**
+ * How long a verification may hold an intent before the worker takes it back.
+ */
+const STALE_VERIFY_CLAIM = '10 minutes';
+
+/**
+ * How long after expiry a transfer can still be settled by hand.
+ *
+ * `expires_at` bounds the quote, not the money. A customer who sent their TBAY
+ * and lost the tab -- or whose verification failed because our RPC was down --
+ * has parted with tokens that are sitting at the retailer's payout wallet, and
+ * refusing to settle that because a sixty-minute timer ran out is simply
+ * keeping their money. The chain proof is what matters and it does not expire;
+ * this window exists only so that "unsettled" is eventually a closed question
+ * for the retailer's books and for erasure.
+ */
+export const SPEND_SETTLEMENT_DAYS = 30;
+
+/**
+ * Give up on an intent the retailer has dealt with by other means.
+ *
+ * The state existed in the schema from the first migration and nothing could
+ * reach it, which is why every error message that suggested cancelling was
+ * naming a remedy that did not exist. Cancelling is also what tells erasure
+ * that the wallet on the intent is no longer evidence of anything owed.
+ */
+export async function cancelSpendIntent(
+  tenantId: string,
+  intentId: string,
+  runner: Queryable = db(),
+): Promise<SpendIntent | null> {
+  return queryOne<SpendIntent>(
+    runner,
+    `UPDATE token_spend_intents SET status = 'cancelled'
+      WHERE tenant_id = $1 AND id = $2 AND status IN ('pending', 'expired')
+      RETURNING *`,
+    [tenantId, intentId],
+  );
 }
 
 export async function expireStaleClaims(runner: Queryable = db()): Promise<number> {
@@ -751,7 +810,7 @@ export interface SpendIntent {
   contract_address: string;
   credit_cents: number;
   currency: string;
-  status: 'pending' | 'verified' | 'expired' | 'cancelled';
+  status: 'pending' | 'verifying' | 'verified' | 'expired' | 'cancelled';
   tx_hash: string | null;
   expires_at: Date;
 }
@@ -866,21 +925,73 @@ export async function verifySpendIntent(
   const client = chain();
   if (!client) throw new ApiError(503, 'chain_unavailable', 'No RPC endpoint configured');
 
-  const intent = await queryOne<SpendIntent>(
+  // Claim the row before talking to the chain.
+  //
+  // The old shape read the intent, made an RPC round trip, and only then wrote
+  // 'verified' behind `WHERE status = 'pending'`. The expiry worker writes
+  // 'expired' over that same predicate every five minutes, so a verify that
+  // started a second before the deadline and spent three seconds on the RPC
+  // lost the row and raised "Spend intent was already settled" -- with the
+  // customer's TBAY already at the retailer's payout wallet and no store
+  // credit issued. Two writers, one predicate, and a network call in between.
+  //
+  // 'expired' is claimable too, inside the settlement window: `expires_at`
+  // bounds how long the quote stands, and the transfer it quotes is on a chain
+  // that has never heard of our timer. Refusing to settle a transfer that
+  // really happened is keeping somebody's money because a clock ran out.
+  const claimed = await queryOne<SpendIntent>(
     db(),
-    `SELECT * FROM token_spend_intents WHERE tenant_id = $1 AND id = $2`,
-    [tenant.id, intentId],
+    `UPDATE token_spend_intents
+        SET status = 'verifying', verify_claimed_at = now()
+      WHERE tenant_id = $1 AND id = $2
+        AND (
+          status = 'pending'
+          OR (status = 'expired' AND expires_at > now() - ($3 || ' days')::interval)
+        )
+      RETURNING *`,
+    [tenant.id, intentId, String(SPEND_SETTLEMENT_DAYS)],
   );
-  if (!intent) throw ApiError.notFound('Spend intent not found');
-  if (intent.status === 'verified') {
-    return { intent, credit: null };
-  }
-  if (intent.status !== 'pending') throw ApiError.unprocessable(`Intent is ${intent.status}`);
-  if (new Date(intent.expires_at).getTime() < Date.now()) {
-    throw ApiError.unprocessable('Spend intent has expired');
+
+  if (!claimed) {
+    // Which of the several reasons it was, rather than one flat conflict.
+    const existing = await queryOne<SpendIntent>(
+      db(),
+      `SELECT * FROM token_spend_intents WHERE tenant_id = $1 AND id = $2`,
+      [tenant.id, intentId],
+    );
+    if (!existing) throw ApiError.notFound('Spend intent not found');
+    if (existing.status === 'verified') return { intent: existing, credit: null };
+    if (existing.status === 'verifying') {
+      throw ApiError.conflict('That spend intent is already being verified');
+    }
+    if (existing.status === 'expired') {
+      throw ApiError.unprocessable(
+        `Spend intent expired more than ${SPEND_SETTLEMENT_DAYS} days ago and can no longer be settled`,
+      );
+    }
+    throw ApiError.unprocessable(`Intent is ${existing.status}`);
   }
 
-  const transfers = await client.transfersInTx(txHash);
+  const intent = claimed;
+
+  // Everything from here has to put the claim back, or the intent is stranded
+  // in a state only the reaper can leave.
+  const release = async (): Promise<void> => {
+    await db().query(
+      `UPDATE token_spend_intents SET status = 'pending', verify_claimed_at = NULL
+        WHERE id = $1 AND status = 'verifying'`,
+      [intent.id],
+    );
+  };
+
+  let transfers: Awaited<ReturnType<typeof client.transfersInTx>>;
+  try {
+    transfers = await client.transfersInTx(txHash);
+  } catch (err) {
+    await release();
+    throw err;
+  }
+
   const required = BigInt(intent.token_amount_wei);
   const minConfirmations = opts.minConfirmations ?? 1;
 
@@ -892,43 +1003,53 @@ export async function verifySpendIntent(
       transfer.confirmations >= minConfirmations,
   );
   if (!match) {
+    await release();
     throw ApiError.unprocessable('No matching TBAY transfer found in that transaction', {
       expected_to: intent.to_address,
       expected_amount_wei: intent.token_amount_wei,
     });
   }
 
-  return withTransaction(async (tx) => {
-    const updated = await queryOne<SpendIntent>(
-      tx,
-      `UPDATE token_spend_intents
-          SET status = 'verified', verified_at = now(), tx_hash = $2
-        WHERE id = $1 AND status = 'pending'
-        RETURNING *`,
-      [intent.id, txHash],
-    );
-    if (!updated) throw ApiError.conflict('Spend intent was already settled');
+  try {
+    return await withTransaction(async (tx) => {
+      const updated = await queryOne<SpendIntent>(
+        tx,
+        `UPDATE token_spend_intents
+            SET status = 'verified', verified_at = now(), tx_hash = $2,
+                verify_claimed_at = NULL
+          WHERE id = $1 AND status = 'verifying'
+          RETURNING *`,
+        [intent.id, txHash],
+      );
+      if (!updated) throw ApiError.conflict('Spend intent was already settled');
 
-    const code = `TBAY-${randomCode(10)}`;
-    const credit = await queryOne<{ code: string; amount_cents: number; currency: string }>(
-      tx,
-      `INSERT INTO store_credits (
-         tenant_id, contact_id, code, amount_cents, currency, source, spend_intent_id
-       ) VALUES ($1, $2, $3, $4, $5, 'token_spend', $6)
-       RETURNING code, amount_cents, currency`,
-      [tenant.id, intent.contact_id, code, intent.credit_cents, intent.currency, intent.id],
-    );
+      const code = `TBAY-${randomCode(10)}`;
+      const credit = await queryOne<{ code: string; amount_cents: number; currency: string }>(
+        tx,
+        `INSERT INTO store_credits (
+           tenant_id, contact_id, code, amount_cents, currency, source, spend_intent_id
+         ) VALUES ($1, $2, $3, $4, $5, 'token_spend', $6)
+         RETURNING code, amount_cents, currency`,
+        [tenant.id, intent.contact_id, code, intent.credit_cents, intent.currency, intent.id],
+      );
 
-    const { enqueueWebhook } = await import('./automations.js');
-    await enqueueWebhook(tx, tenant.id, 'store_credit_issued', {
-      contact_id: intent.contact_id,
-      code: credit!.code,
-      amount_cents: credit!.amount_cents,
-      currency: credit!.currency,
+      const { enqueueWebhook } = await import('./automations.js');
+      await enqueueWebhook(tx, tenant.id, 'store_credit_issued', {
+        contact_id: intent.contact_id,
+        code: credit!.code,
+        amount_cents: credit!.amount_cents,
+        currency: credit!.currency,
+      });
+
+      return { intent: updated, credit: credit! };
     });
-
-    return { intent: updated, credit: credit! };
-  });
+  } catch (err) {
+    // A duplicate tx_hash, a failed insert, a dropped connection: the intent
+    // has to come back out of 'verifying' either way, or the customer cannot
+    // retry and the worker has to wait ten minutes to notice.
+    await release();
+    throw err;
+  }
 }
 
 /**

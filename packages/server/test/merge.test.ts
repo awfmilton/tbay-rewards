@@ -846,13 +846,37 @@ describe('every writer reaches for the contact before anything else', () => {
       contacts.push(contact.id);
     }
 
+    // A rank the seeded balance qualifies for, so "was this contact actually
+    // evaluated?" has a visible answer.
+    await db().query(
+      `INSERT INTO ranks (tenant_id, key, name, min_points, display_order)
+       VALUES ($1, 'swept-gold', 'Gold', 500, 1)`,
+      [tenant.id],
+    );
+
     const merges = [10, 20, 30, 40].map((n) =>
       mergeContacts(tenant.id, contacts[n - 1]!, contacts[n]!).catch(() => null),
     );
     const swept = await reevaluateAll(tenant.id, { badges: false, ranks: true });
     await Promise.all(merges);
 
-    expect(swept.contacts).toBeGreaterThan(0);
+    // `contacts` counts rows the sweep *reached*, and it is incremented before
+    // the try block -- so on its own it is 60 whether the run did the work or
+    // threw on every single one. What proves the run happened is the ranks it
+    // wrote and the size of what it gave up on.
+    expect(swept.contacts).toBe(60);
+    expect(swept.skipped).toBeLessThanOrEqual(4);
+    expect(swept.missing.length).toBe(swept.skipped);
+
+    const { rows } = await db().query<{ ranked: string; total: string }>(
+      `SELECT count(*) FILTER (WHERE current_rank_id IS NOT NULL)::text AS ranked,
+              count(*)::text AS total
+         FROM points_balances WHERE tenant_id = $1 AND lifetime_earned >= 500`,
+      [tenant.id],
+    );
+    expect(Number(rows[0]!.total)).toBeGreaterThanOrEqual(56);
+    // Every surviving balance over the threshold actually holds the rank.
+    expect(rows[0]!.ranked).toBe(rows[0]!.total);
   });
 
   it('says what happened when the contact was merged away mid-flight', async () => {

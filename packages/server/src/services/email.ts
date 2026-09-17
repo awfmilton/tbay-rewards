@@ -178,6 +178,17 @@ export async function flushEmailQueue(limit = 50, runner: Queryable = db()): Pro
   // `sending` at all. The message sat there forever: never sent, never failed,
   // no error, invisible to the retailer. Give those rows the ending they
   // earned. Not a suppression: five dead workers say nothing about the address.
+  // Nothing lives in the queue forever, whatever its attempt count says.
+  await runner.query(
+    `UPDATE email_messages
+        SET status = 'failed',
+            error = COALESCE(error, '') || ' (gave up after ' || $1 || ' in the queue)',
+            claimed_at = NULL, claim_token = NULL
+      WHERE status IN ('queued', 'sending')
+        AND created_at < now() - $1::interval`,
+    [MAX_QUEUE_AGE],
+  );
+
   await runner.query(
     `UPDATE email_messages
         SET status = 'failed',
@@ -451,6 +462,24 @@ const STALE_CLAIM = '5 minutes';
  * retailer's queue said it failed with no provider id to trace it by.
  */
 const ABANDONED_CLAIM = '30 minutes';
+
+/**
+ * The outside edge of a message's life in the queue.
+ *
+ * A transport failure deliberately refunds its attempt, so a message stuck on
+ * one has no attempt budget to run out of: it is retried every sixty seconds
+ * for as long as the queue exists. That is right for the ninety-second relay
+ * outage it was written for and wrong for everything longer -- and it is the
+ * standing cost of every classifier mistake in this direction, because a reply
+ * misread as transport is retried forever *and* never suppressed.
+ *
+ * Three days is what a normal MTA gives a message before it gives up, and
+ * failing here is honest: the row ends `failed` with its last error visible on
+ * the retailer's queue screen, rather than quietly cycling out of sight. It is
+ * not a suppression -- three days of a broken relay says nothing about the
+ * recipient.
+ */
+const MAX_QUEUE_AGE = '3 days';
 
 /**
  * How long to wait before trying a message again.

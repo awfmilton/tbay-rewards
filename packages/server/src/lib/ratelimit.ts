@@ -11,38 +11,50 @@ interface Window {
   resetAt: number;
 }
 
-const windows = new Map<string, Window>();
+/**
+ * One map per key class, and that is the actual defence.
+ *
+ * Three rounds were spent looking for a ranking that would decide which key to
+ * drop when the map is full, and every candidate was chosen by the attacker.
+ * Insertion order took the longest-lived buckets, which are the tenant's own.
+ * "count <= 1" was beaten by touching each minted key twice, at no cost.
+ * Ranking by count was beaten the same way, because an idle admin bucket sits
+ * at count 1 and a flood key touched twice sits above it -- measured at admin
+ * evicted in every configuration and 200,000 of 210,000 flood keys kept.
+ *
+ * The mistake was looking for a ranking at all. The keys are not
+ * interchangeable: `admin:<tenant>` is minted by provisioning a tenant, and
+ * there is one per tenant, while `ingest:...:<address>:<visitor>` is minted by
+ * whoever is calling. Only the second kind is unbounded, so only the second
+ * kind needs a ceiling, and a flood confined to its own class cannot reach the
+ * tenant's bucket however it is shaped.
+ *
+ * Within a class the order is least-recently-used, which is the one statistic
+ * that cannot be gamed in the attacker's favour: to keep a key out of reach of
+ * eviction they have to keep sending to it, and a key being sent to constantly
+ * is a key the limiter is already rejecting. Being evicted hands out a fresh
+ * window, so the keys that must survive are the ones at their limit -- and
+ * those are, by definition, the most recently used.
+ */
+const CEILINGS: Record<string, number> = {
+  // One key per tenant, minted by provisioning rather than by a caller. The
+  // ceiling is a backstop, not a budget anyone can spend.
+  admin: 100_000,
+  // Per address and per visitor. This is the only unbounded class, so it is
+  // the one a flood is confined to.
+  ingest: 200_000,
+  // Anything else, including keys added later that nobody thought to classify.
+  other: 50_000,
+};
+
+const classes = new Map<string, Map<string, Window>>();
 let lastSweep = Date.now();
 
-/**
- * Sweep on size as well as on time, so a burst of distinct keys inside one
- * window cannot grow the map unchecked between scheduled sweeps. The tenant
- * and address ceilings bound how many keys a caller can mint, so this is
- * belt-and-braces rather than the actual defence.
- */
-const SWEEP_AT_SIZE = 50_000;
-
-/**
- * Where the map stops growing, whatever the sweep managed to free.
- *
- * Sweeping only deletes windows that have already expired, so a map of live
- * keys frees nothing however often it runs. A caller who can mint keys (a
- * spoofable address, a routed IPv6 /64) would otherwise grow it without
- * bound.
- */
-const HARD_CEILING = 200_000;
-
-/**
- * The shortest gap between two size-triggered sweeps.
- *
- * Without it, "sweep whenever the map is large" meant a full walk on *every*
- * call once past SWEEP_AT_SIZE -- measured at 0.65 ms per call at 52,000 keys
- * and rising linearly, on a path that runs twice per ingest request. The
- * ceiling bounded the memory and not the work. One walk a second is
- * amortised; one per request is the load itself.
- */
-const MIN_SWEEP_GAP_MS = 1_000;
-let lastSizeSweep = 0;
+function classOf(key: string): string {
+  const separator = key.indexOf(':');
+  const name = separator === -1 ? key : key.slice(0, separator);
+  return name in CEILINGS ? name : 'other';
+}
 
 export interface RateLimitResult {
   allowed: boolean;
@@ -53,54 +65,78 @@ export interface RateLimitResult {
 export function rateLimit(key: string, limit: number, windowMs = 60_000): RateLimitResult {
   const now = Date.now();
 
-  // Amortised cleanup so the map cannot grow without bound.
-  const onSchedule = now - lastSweep > windowMs;
-  const tooBig = windows.size > SWEEP_AT_SIZE && now - lastSizeSweep > MIN_SWEEP_GAP_MS;
-  if (onSchedule || tooBig) {
-    for (const [existing, window] of windows) {
-      if (window.resetAt <= now) windows.delete(existing);
-    }
-    lastSweep = now;
-    if (tooBig) lastSizeSweep = now;
-
-    // Evict the least-used keys, ranked against each other.
-    //
-    // Two wrong answers came before this one. Insertion order took the
-    // *longest-lived* buckets -- the tenant's admin key, every steady visitor
-    // -- handing exactly the innocent callers a fresh window while the flood
-    // that caused the eviction kept its own. Then "count <= 1" was defeated by
-    // an attacker touching each minted key twice, which costs them nothing and
-    // put every flood key out of reach of the rule, falling back to insertion
-    // order again: measured at admin evicted, 0 of 20 steady visitors kept,
-    // and 70,000 of 70,000 flood keys kept.
-    //
-    // Ranking is the part that matters. A flood's keys are the least-used
-    // things in the map whatever fixed threshold you pick, because a real
-    // visitor accumulates and a minted key does not.
-    if (windows.size > HARD_CEILING) {
-      const ranked = [...windows.entries()].sort((a, b) => a[1].count - b[1].count);
-      const excess = windows.size - HARD_CEILING;
-      for (let i = 0; i < excess; i += 1) {
-        windows.delete(ranked[i]![0]);
+  // Scheduled reclamation only.
+  //
+  // There used to be a second, size-triggered sweep that ran a full walk and
+  // then a full sort whenever the map was large. Past the threshold that meant
+  // one sort of 200,000 entries per second on a path that runs twice per
+  // ingest request -- measured at 60 ms of blocked event loop per second and
+  // 15 MB of garbage per sweep, which is a bigger denial of service than the
+  // one it was guarding against. The ceilings below bound the size exactly, in
+  // constant time per insert, so there is nothing left for it to do.
+  if (now - lastSweep > windowMs) {
+    for (const windows of classes.values()) {
+      for (const [existing, window] of windows) {
+        if (window.resetAt <= now) windows.delete(existing);
       }
     }
+    lastSweep = now;
+  }
+
+  const klass = classOf(key);
+  let windows = classes.get(klass);
+  if (!windows) {
+    windows = new Map();
+    classes.set(klass, windows);
   }
 
   const current = windows.get(key);
-  if (!current || current.resetAt <= now) {
-    const resetAt = now + windowMs;
-    windows.set(key, { count: 1, resetAt });
-    return { allowed: true, remaining: limit - 1, resetAt };
+  if (current && current.resetAt > now) {
+    current.count += 1;
+    // Move to the back, so "least recently used" means what it says. A Map
+    // keeps insertion order and `set` on an existing key does not change it,
+    // so without the delete this would be first-seen order -- which is how
+    // the very first version of this evicted the steady callers and kept the
+    // flood.
+    windows.delete(key);
+    windows.set(key, current);
+    return {
+      allowed: current.count <= limit,
+      remaining: Math.max(0, limit - current.count),
+      resetAt: current.resetAt,
+    };
   }
 
-  current.count += 1;
-  return {
-    allowed: current.count <= limit,
-    remaining: Math.max(0, limit - current.count),
-    resetAt: current.resetAt,
-  };
+  const resetAt = now + windowMs;
+  windows.delete(key);
+  windows.set(key, { count: 1, resetAt });
+
+  // Constant work: drop from the front, which is the end nobody has touched.
+  // Sweeping alone could never do this -- it only deletes windows that have
+  // already expired, so a map of live keys frees nothing however often it
+  // runs, and a caller who can mint keys (a spoofable address, a routed IPv6
+  // /64) would grow it without bound.
+  const ceiling = CEILINGS[klass]!;
+  let over = windows.size - ceiling;
+  if (over > 0) {
+    for (const oldest of windows.keys()) {
+      if (over <= 0) break;
+      windows.delete(oldest);
+      over -= 1;
+    }
+  }
+
+  return { allowed: 1 <= limit, remaining: Math.max(0, limit - 1), resetAt };
 }
 
 export function resetRateLimits(): void {
-  windows.clear();
+  classes.clear();
+  lastSweep = Date.now();
+}
+
+/** Live key counts per class. Test and diagnostics helper. */
+export function rateLimitSizes(): Record<string, number> {
+  const sizes: Record<string, number> = {};
+  for (const [klass, windows] of classes) sizes[klass] = windows.size;
+  return sizes;
 }

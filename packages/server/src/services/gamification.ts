@@ -906,7 +906,14 @@ export async function reevaluateAll(
   tenantId: string,
   options: { badges?: boolean; ranks?: boolean; batchSize?: number } = {},
   runner: Queryable = db(),
-): Promise<{ contacts: number; promoted: number; badgesAwarded: number; skipped: number }> {
+): Promise<{
+  contacts: number;
+  promoted: number;
+  badgesAwarded: number;
+  skipped: number;
+  /** Which contacts were skipped, capped so a huge run stays a usable reply. */
+  missing: string[];
+}> {
   const doBadges = options.badges ?? true;
   const doRanks = options.ranks ?? true;
   const batchSize = Math.min(Math.max(options.batchSize ?? 500, 1), 5000);
@@ -917,6 +924,7 @@ export async function reevaluateAll(
   let badgesAwarded = 0;
   /** Contacts that went away mid-sweep, most often to a merge. */
   let skipped = 0;
+  const missing: string[] = [];
 
   // Every currency's ladder, since a member holds one rank per currency. For a
   // retailer with a single currency this is the one pass it always was.
@@ -960,16 +968,26 @@ export async function reevaluateAll(
           }
         });
       } catch (error) {
-        // One contact must not end the run.
+        // One contact that went away must not end the run -- and nothing else
+        // qualifies.
         //
-        // This walks the whole member list, and anything can happen to one row
-        // while it does -- most obviously a merge, which makes the contact
-        // vanish and every writer answer "no longer exists" by design. With no
-        // handler here that answer aborted the sweep, leaving the tenant's
-        // re-rank half applied and `POST /v1/gamification/reevaluate` failing.
-        // A bulk job skips what it cannot do and reports it.
-        if (!(error instanceof ApiError) || error.statusCode >= 500) throw error;
+        // This walks the whole member list, and a row can vanish under it: a
+        // merge makes the contact disappear and every writer answers "no
+        // longer exists" by design, which with no handler here aborted the
+        // sweep and left the tenant's re-rank half applied.
+        //
+        // Catching every 4xx instead was far too wide. A misconfiguration --
+        // a point type that cannot be resolved, a rule that refuses -- fails
+        // for *every* contact, and the run reported 200 OK with
+        // {contacts: 200, skipped: 190} while ten people were actually
+        // re-ranked and nothing was written anywhere. A bulk job may skip what
+        // has gone; it may not skip what it is doing wrong.
+        const gone = error instanceof ApiError && error.statusCode === 404;
+        if (!gone) throw error;
         skipped += 1;
+        // Named, not just counted: "190 skipped" is a number nobody can act
+        // on unless they can see which members and why.
+        missing.push(row.id);
       }
     }
 
@@ -977,7 +995,7 @@ export async function reevaluateAll(
     if (rows.length < batchSize) break;
   }
 
-  return { contacts, promoted, badgesAwarded, skipped };
+  return { contacts, promoted, badgesAwarded, skipped, missing: missing.slice(0, 100) };
 }
 
 /**
