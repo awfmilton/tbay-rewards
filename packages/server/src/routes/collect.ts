@@ -5,7 +5,7 @@ import { collect } from '../services/ingest.js';
 import { upsertContact } from '../services/contacts.js';
 import { linkVisitorToContact, upsertVisitor } from '../services/visitors.js';
 import { subscribe } from '../services/newsletter.js';
-import { withTransaction } from '../db/pool.js';
+import { queryOne, withTransaction } from '../db/pool.js';
 import { fire } from '../services/automations.js';
 import { collectSchema, identifySchema, subscribeSchema } from './schemas.js';
 import { config } from '../config.js';
@@ -72,6 +72,16 @@ export async function collectRoutes(app: FastifyInstance): Promise<void> {
     const input = parse(identifySchema, request.body);
 
     return withTransaction(async (client) => {
+      // Did this person already exist? `contact.created` fires a welcome
+      // sequence, and firing it for somebody the store created weeks ago
+      // through the secret key paid them a joining bonus for coming back to
+      // the site. The dedupe key stops a second one, not the first wrong one.
+      const before = await queryOne<{ id: string }>(
+        client,
+        'SELECT id FROM contacts WHERE tenant_id = $1 AND email_normalised = lower($2)',
+        [tenant.id, input.email],
+      );
+
       const contact = await upsertContact(
         tenant.id,
         {
@@ -95,12 +105,14 @@ export async function collectRoutes(app: FastifyInstance): Promise<void> {
         await linkVisitorToContact(client, tenant.id, visitor.id, contact.id);
       }
 
-      await fire(
-        tenant.id,
-        'contact.created',
-        { contact, data: { source: 'identify' }, dedupeKey: `identify:${contact.id}` },
-        client,
-      );
+      if (!before) {
+        await fire(
+          tenant.id,
+          'contact.created',
+          { contact, data: { source: 'identify' }, dedupeKey: `identify:${contact.id}` },
+          client,
+        );
+      }
 
       return { contact_id: contact.id };
     });

@@ -4,7 +4,6 @@ import { clientIp } from '../lib/auth.js';
 import { ApiError } from '../lib/errors.js';
 import { config } from '../config.js';
 import { getLinkByCode, issueAttributionCookie, recordClick } from '../services/links.js';
-import { creditShareClick } from '../services/shares.js';
 import { getTenantById } from '../services/tenants.js';
 import {
   confirmSubscription,
@@ -46,12 +45,18 @@ export async function redirectRoutes(app: FastifyInstance): Promise<void> {
         landingUrl: link.target_url,
       });
 
-      // A share only pays out on a genuine human click.
-      if (!recorded.isBot && link.kind === 'share') {
-        await creditShareClick(client, tenant.id, link.id);
-      }
-      // The tracker credits the click with visitor context once the landing
-      // page loads, which is where a self-click is actually detectable.
+      // A share is NOT credited here.
+      //
+      // This handler knows the IP and the user agent and nothing else — no
+      // visitor, no contact — so `creditShareClick`'s self-click checks had
+      // nothing to check, and with one click needed to verify a share, a
+      // member opening their own link in a private window was paid for it.
+      //
+      // The credit happens when the landing page's tracker reports the click
+      // (`share_click` in ingest.ts), which is the first moment the clicker is
+      // known. A click from a browser with no tracker therefore pays nobody,
+      // which is the right way round: a share reward should need evidence that
+      // somebody else arrived, and "a request reached this URL" is not that.
       return recorded;
     });
 

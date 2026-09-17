@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import {
+  DESKTOP_UA,
+  ids,
   closeApp,
   closeDb,
   db,
@@ -729,5 +731,294 @@ describe('an idempotency key names one operation (LOW)', () => {
       contactId: second, points: 100, reason: 'Mine', idempotencyKey: 'shared-key',
     });
     expect(res.statusCode).toBe(409);
+  });
+});
+
+describe('a referral means somebody new (HIGH)', () => {
+  /**
+   * `/v1/identify` takes the public site key — the one in every page's source
+   * — and any email address the caller types. A member's own referral link,
+   * clicked by the attacker, then identified as an existing customer, attached
+   * a referral to that customer and paid the member for "introducing" somebody
+   * the store had known for years. The whole customer list could be harvested
+   * that way, one address at a time.
+   */
+  const clickThenIdentify = async (anonId: string, linkCode: string, email: string) => {
+    const app = await testApp();
+    await app.inject({
+      method: 'POST',
+      url: '/v1/collect',
+      headers: { 'x-tbay-key': tenant.publicKey },
+      payload: {
+        key: tenant.publicKey,
+        visitor: anonId,
+        session: `s-${anonId}`,
+        url: `https://shop.example.com/?tb_ref=${linkCode}`,
+        linkCode,
+        events: [{ type: 'pageview', url: `https://shop.example.com/?tb_ref=${linkCode}` }],
+      },
+    });
+    return app.inject({
+      method: 'POST',
+      url: '/v1/identify',
+      headers: { 'x-tbay-key': tenant.publicKey },
+      payload: { key: tenant.publicKey, visitor: anonId, email },
+    });
+  };
+
+  const referralsFor = async (email: string): Promise<number> => {
+    const { rows } = await db().query<{ n: string }>(
+      `SELECT count(*) AS n FROM referrals r
+         JOIN contacts c ON c.id = r.referee_contact_id
+        WHERE r.tenant_id = $1 AND c.email_normalised = $2`,
+      [tenant.id, email],
+    );
+    return Number(rows[0]!.n);
+  };
+
+  it('is not attached to a customer the store already had', async () => {
+    const member = JSON.parse(
+      (await authed('POST', '/v1/contacts', { email: 'referrer@example.com' })).body,
+    ).contact_id as string;
+    const link = JSON.parse(
+      (await authed('POST', '/v1/links', {
+        kind: 'referral',
+        ownerContactId: member,
+        targetUrl: 'https://shop.example.com/',
+        label: 'refer a friend',
+      })).body,
+    );
+    const code = link.link?.code ?? link.code;
+
+    await authed('POST', '/v1/contacts', { email: 'longstanding@example.com' });
+    await db().query(
+      "UPDATE contacts SET created_at = now() - interval '2 years' WHERE email_normalised = 'longstanding@example.com'",
+    );
+
+    expect((await clickThenIdentify('attacker', code, 'longstanding@example.com')).statusCode)
+      .toBe(200);
+    expect(await referralsFor('longstanding@example.com')).toBe(0);
+  });
+
+  it('is still attached to somebody the link actually brought', async () => {
+    const member = JSON.parse(
+      (await authed('POST', '/v1/contacts', { email: 'referrer@example.com' })).body,
+    ).contact_id as string;
+    const link = JSON.parse(
+      (await authed('POST', '/v1/links', {
+        kind: 'referral',
+        ownerContactId: member,
+        targetUrl: 'https://shop.example.com/',
+        label: 'refer a friend',
+      })).body,
+    );
+    const code = link.link?.code ?? link.code;
+
+    // Never seen before: the contact is created by the identify itself.
+    expect((await clickThenIdentify('newcomer', code, 'brand-new@example.com')).statusCode)
+      .toBe(200);
+    expect(await referralsFor('brand-new@example.com')).toBe(1);
+  });
+});
+
+describe('ingest rate limiting cannot be rotated away (HIGH)', () => {
+  /**
+   * Both keys the limiter used to reach for are written by the caller. The
+   * visitor id comes straight out of the request body, and X-Forwarded-For is
+   * a header anyone can send -- nginx's $proxy_add_x_forwarded_for appends the
+   * peer address to whatever arrived rather than replacing it, so the
+   * left-hand entries are the client's own claim. Rotating either one bought
+   * unlimited throughput: measured at 800/800 requests through a 600/minute
+   * bucket.
+   */
+  const collect = (
+    anonId: string | null,
+    forwardedFor: string,
+  ) => ({
+    method: 'POST' as const,
+    url: '/v1/collect',
+    headers: { 'x-tbay-key': tenant.publicKey, 'x-forwarded-for': forwardedFor },
+    payload: {
+      ...(anonId === null ? {} : { anonId }),
+      events: [{ type: 'pageview', url: 'https://shop.example/p' }],
+    },
+  });
+
+  async function countAllowed(
+    requests: number,
+    key: (n: number) => { anonId: string | null; forwardedFor: string },
+  ) {
+    const app = await testApp();
+    let allowed = 0;
+    for (let n = 0; n < requests; n += 1) {
+      const { anonId, forwardedFor } = key(n);
+      const response = await app.inject(collect(anonId, forwardedFor));
+      if (response.statusCode !== 429) allowed += 1;
+    }
+    return allowed;
+  }
+
+  it('still gives one steady visitor their own bucket', async () => {
+    const steady = await countAllowed(650, () => ({
+      anonId: 'steady-visitor',
+      forwardedFor: '198.51.100.7, 10.0.0.1',
+    }));
+
+    expect(steady).toBe(600);
+  });
+
+  it('caps a visitor who rotates their anon id at the address ceiling', async () => {
+    // A fresh id per request no longer opens a fresh allowance; it spends the
+    // address ceiling instead, which is the part of the key the caller does
+    // not get to choose. Before this, all 3,200 went through.
+    const rotating = await countAllowed(3_200, (n) => ({
+      anonId: `rotating-${n}`,
+      forwardedFor: '198.51.100.8, 10.0.0.1',
+    }));
+
+    expect(rotating).toBe(3_000);
+  });
+
+  it('does not mint a new bucket per spoofed X-Forwarded-For entry', async () => {
+    // Every request claims a different origin address, but the entry the proxy
+    // itself appended is the same throughout, and that is the one that counts.
+    const spoofing = await countAllowed(3_200, (n) => ({
+      anonId: null,
+      forwardedFor: `203.0.113.${n % 250}, 10.0.0.2`,
+    }));
+
+    expect(spoofing).toBe(3_000);
+  });
+
+  it('keeps genuinely separate addresses on separate buckets', async () => {
+    // The NAT case the per-visitor bucket exists for: the ceiling is shared,
+    // but one heavy visitor must not spend a colleague's allowance.
+    const heavy = await countAllowed(650, () => ({
+      anonId: 'heavy',
+      forwardedFor: '198.51.100.9, 10.0.0.3',
+    }));
+    expect(heavy).toBe(600);
+
+    const colleague = await countAllowed(10, () => ({
+      anonId: 'colleague',
+      forwardedFor: '198.51.100.9, 10.0.0.3',
+    }));
+    expect(colleague).toBe(10);
+  });
+});
+
+describe('the site key may introduce, not restate (MEDIUM)', () => {
+  /**
+   * The product details on an event come from the page it was sent from --
+   * which means from whoever sent the request, since the key authorising it is
+   * in every page's source. Allowed to overwrite, that is the retailer's
+   * catalogue: their product names, their prices, the images their dashboard
+   * renders, and their categories, which reward rules match on and which
+   * therefore decide what a product earns.
+   */
+  async function collect(product: Record<string, unknown>) {
+    const app = await testApp();
+    return app.inject({
+      method: 'POST',
+      url: '/v1/collect',
+      // A real user agent: ingest skips product handling for bots, and no
+      // header at all reads as one.
+      headers: { 'x-tbay-key': tenant.publicKey, 'user-agent': DESKTOP_UA },
+      payload: {
+        ...ids(),
+        url: 'https://shop.example/p/1',
+        events: [{ type: 'product_view', productRef: 'SKU-1', product }],
+      },
+    });
+  }
+
+  async function storedProduct() {
+    const { rows } = await db().query<{
+      name: string | null; price_cents: number | null; categories: string[];
+    }>(
+      'SELECT name, price_cents, categories FROM products WHERE tenant_id = $1 AND product_ref = $2',
+      [tenant.id, 'SKU-1'],
+    );
+    return rows[0]!;
+  }
+
+  it('creates a product nobody has seen before', async () => {
+    await collect({ name: 'Red Mug', priceCents: 1_200, categories: ['kitchen'] });
+
+    expect(await storedProduct()).toMatchObject({
+      name: 'Red Mug',
+      price_cents: 1_200,
+      categories: ['kitchen'],
+    });
+  });
+
+  it('cannot rewrite one the store already has', async () => {
+    await authed('PUT', '/v1/products/SKU-1', {
+      name: 'Red Mug', priceCents: 1_200, categories: ['kitchen'],
+    });
+
+    await collect({ name: 'Free Mug', priceCents: 1, categories: ['clearance'] });
+
+    // Categories especially: reward rules match on them.
+    expect(await storedProduct()).toMatchObject({
+      name: 'Red Mug',
+      price_cents: 1_200,
+      categories: ['kitchen'],
+    });
+  });
+
+  it('lets the storefront correct it over the secret key', async () => {
+    await collect({ name: 'Red Mug', priceCents: 1_200, categories: ['kitchen'] });
+
+    const response = await authed('PUT', '/v1/products/SKU-1', {
+      name: 'Red Mug (2024)', priceCents: 1_500, categories: ['kitchen', 'gifts'],
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(await storedProduct()).toMatchObject({
+      name: 'Red Mug (2024)',
+      price_cents: 1_500,
+      categories: ['kitchen', 'gifts'],
+    });
+  });
+});
+
+describe('a link owner has to be one of ours (MEDIUM)', () => {
+  it('refuses a contact id belonging to another retailer', async () => {
+    // `links.owner_contact_id` is a plain foreign key into a platform-wide
+    // table, so a uuid from someone else's store was accepted -- and every
+    // commission the link earned was booked against a stranger's customer.
+    const other = await makeTenant();
+    const app = await testApp();
+    const stranger = JSON.parse(
+      (
+        await app.inject({
+          method: 'POST',
+          url: '/v1/contacts',
+          headers: { authorization: `Bearer ${other.secretKey}` },
+          payload: { email: 'stranger@example.com' },
+        })
+      ).body,
+    );
+
+    const response = await authed('POST', '/v1/links', {
+      targetUrl: 'https://shop.example/p/1',
+      kind: 'writer',
+      ownerContactId: stranger.contact_id ?? stranger.id,
+    });
+
+    expect(response.statusCode).toBe(404);
+  });
+
+  it('still accepts one of our own', async () => {
+    const created = JSON.parse((await authed('POST', '/v1/contacts', { email: 'ours@example.com' })).body);
+
+    const response = await authed('POST', '/v1/links', {
+      targetUrl: 'https://shop.example/p/1',
+      kind: 'writer',
+      ownerContactId: created.contact_id ?? created.id,
+    });
+
+    expect(response.statusCode).toBe(200);
   });
 });

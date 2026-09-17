@@ -46,12 +46,20 @@ export async function gamificationRoutes(app: FastifyInstance): Promise<void> {
 
   // ── Profile, badges, ranks ────────────────────────────────────────────────
 
-  app.get<{ Querystring: { contactId?: string; email?: string; externalRef?: string } }>(
+  app.get<{
+    Querystring: { contactId?: string; email?: string; externalRef?: string; pointType?: string };
+  }>(
     '/v1/gamification/profile',
     async (request) => {
       const tenant = tenantOf(request);
       const contact = await requireContact(tenant.id, request.query);
-      return { contact_id: contact.id, ...(await profile(tenant.id, contact.id)) };
+      // Per ladder: ranks, badges and balances all belong to one currency, and
+      // a profile that silently answered for the default one was wrong for
+      // every retailer running a second.
+      return {
+        contact_id: contact.id,
+        ...(await profile(tenant.id, contact.id, db(), request.query.pointType ?? null)),
+      };
     },
   );
 

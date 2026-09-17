@@ -13,22 +13,53 @@ export interface ProductInfo {
   categories?: string[];
 }
 
+export interface UpsertProductOptions {
+  /**
+   * Fill blanks only; never change a value that is already there.
+   *
+   * What the browser tracker gets. The product details on an event come from
+   * the page it was sent from, which means from whoever sent the request --
+   * and the site key that authorises it is in every page's source. Allowed to
+   * overwrite, that is an open door to the retailer's catalogue: rename their
+   * products, restate their prices, point their dashboard's images anywhere.
+   *
+   * Categories are the part that is not merely cosmetic. Reward rules match on
+   * them, so rewriting a product's categories rewrites what it earns. Prices
+   * feed the revenue figures the retailer reports on.
+   *
+   * A product genuinely seen for the first time still lands, which is what the
+   * tracker is for. Correcting one afterwards is the storefront's job, over
+   * the secret key: PUT /v1/products/:productRef.
+   */
+  fillOnly?: boolean;
+}
+
 export async function upsertProduct(
   runner: Queryable,
   tenantId: string,
   info: ProductInfo,
+  options: UpsertProductOptions = {},
 ): Promise<void> {
   await runner.query(
+    // $9 is `fillOnly`; see UpsertProductOptions.
     `INSERT INTO products (tenant_id, product_ref, name, url, image_url, price_cents, currency, categories)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8::text[])
      ON CONFLICT (tenant_id, product_ref) DO UPDATE SET
-       name        = COALESCE(EXCLUDED.name, products.name),
-       url         = COALESCE(EXCLUDED.url, products.url),
-       image_url   = COALESCE(EXCLUDED.image_url, products.image_url),
-       price_cents = COALESCE(EXCLUDED.price_cents, products.price_cents),
-       currency    = COALESCE(EXCLUDED.currency, products.currency),
-       categories  = CASE WHEN cardinality(EXCLUDED.categories) > 0
-                          THEN EXCLUDED.categories ELSE products.categories END,
+       name        = CASE WHEN $9 THEN COALESCE(products.name, EXCLUDED.name)
+                          ELSE COALESCE(EXCLUDED.name, products.name) END,
+       url         = CASE WHEN $9 THEN COALESCE(products.url, EXCLUDED.url)
+                          ELSE COALESCE(EXCLUDED.url, products.url) END,
+       image_url   = CASE WHEN $9 THEN COALESCE(products.image_url, EXCLUDED.image_url)
+                          ELSE COALESCE(EXCLUDED.image_url, products.image_url) END,
+       price_cents = CASE WHEN $9 THEN COALESCE(products.price_cents, EXCLUDED.price_cents)
+                          ELSE COALESCE(EXCLUDED.price_cents, products.price_cents) END,
+       currency    = CASE WHEN $9 THEN COALESCE(products.currency, EXCLUDED.currency)
+                          ELSE COALESCE(EXCLUDED.currency, products.currency) END,
+       categories  = CASE
+                       WHEN cardinality(EXCLUDED.categories) = 0 THEN products.categories
+                       WHEN $9 AND cardinality(products.categories) > 0 THEN products.categories
+                       ELSE EXCLUDED.categories
+                     END,
        updated_at  = now()`,
     [
       tenantId,
@@ -39,6 +70,7 @@ export async function upsertProduct(
       info.priceCents ?? null,
       info.currency ?? null,
       info.categories ?? [],
+      options.fillOnly === true,
     ],
   );
 }

@@ -60,6 +60,22 @@ export async function createLink(
 ): Promise<Link> {
   const targetUrl = assertHttpUrl(input.targetUrl);
   const kind = input.kind ?? 'campaign';
+
+  // The owner has to be one of ours.
+  //
+  // `owner_contact_id` is a plain foreign key to contacts, which is a
+  // platform-wide table -- so a uuid belonging to another retailer's customer
+  // was accepted without complaint, and every commission the link earned was
+  // booked against somebody in a different store. Checked here rather than at
+  // the route, so it holds for every caller.
+  if (input.ownerContactId) {
+    const owner = await queryOne<{ id: string }>(
+      runner,
+      'SELECT id FROM contacts WHERE tenant_id = $1 AND id = $2',
+      [tenantId, input.ownerContactId],
+    );
+    if (!owner) throw ApiError.notFound('No such contact');
+  }
   const rate =
     input.commissionRateBps ??
     (kind === 'writer' ? config().commissions.defaultRateBps : 0);

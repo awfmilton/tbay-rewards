@@ -375,6 +375,22 @@ export async function refundOrder(
   runner?: Queryable,
 ): Promise<{ voided: number; pointsReversed: boolean }> {
   const run = async (client: Queryable) => {
+    // The contact first, before the order row.
+    //
+    // A refund ends in `reverse`, which holds the contact -- but by then this
+    // already had the order row, and a merge coming the other way (contact,
+    // then REASSIGN orders) held the contact and wanted the order. Two rounds
+    // in sixteen deadlocked. Read who owns it, hold them, then start writing.
+    const owner = await queryOne<{ contact_id: string | null }>(
+      client,
+      'SELECT contact_id FROM orders WHERE tenant_id = $1 AND order_ref = $2',
+      [tenant.id, orderRef],
+    );
+    if (owner?.contact_id) {
+      const { holdContact } = await import('./points.js');
+      await holdContact(client, tenant.id, owner.contact_id);
+    }
+
     const { rowCount } = await client.query(
       `UPDATE commissions SET status = 'void', voided_at = now()
         WHERE tenant_id = $1 AND order_ref = $2 AND status IN ('pending', 'approved')`,
@@ -387,29 +403,95 @@ export async function refundOrder(
       [tenant.id, orderRef],
     );
 
-    const entry = await queryOne<{ id: string }>(
-      client,
+    // Everything this order paid out, not only the purchase line.
+    //
+    // Reversing `rule_key = 'purchase'` alone left every other award the order
+    // triggered standing: a product rule that paid a bonus on one of its
+    // items, a first-order award under another rule key. The refund took the
+    // money back and left the points.
+    const { rows: entries } = await client.query<{ id: string }>(
       `SELECT id FROM points_ledger
-        WHERE tenant_id = $1 AND rule_key = 'purchase' AND ref_id = $2 AND status <> 'reversed'`,
+        WHERE tenant_id = $1 AND ref_type = 'order' AND ref_id = $2 AND status <> 'reversed'`,
       [tenant.id, orderRef],
     );
 
+    const { reverse } = await import('./points.js');
     let pointsReversed = false;
-    if (entry) {
-      const { reverse } = await import('./points.js');
+    for (const entry of entries) {
       // Clamped: if the customer already redeemed those points for TBAY, the
       // tokens exist and cannot be un-minted. Take back what remains rather
       // than rolling back the commission void as well.
       const compensation = await reverse(tenant.id, entry.id, 'Order refunded', client, {
         clampToBalance: true,
       });
-      pointsReversed = compensation !== null;
+      if (compensation !== null) pointsReversed = true;
     }
+
+    // And the referral this order qualified, if it was the only thing holding
+    // it up. Refer yourself, place an order, collect the bonus, refund the
+    // order was a complete loop that paid out every time -- the referral bonus
+    // is keyed on the referral rather than the order, so nothing above reaches
+    // it. Only unwound when no other order stands: a second, kept order is
+    // reason enough for the referral on its own.
+    const unqualified = await unqualifyReferralIfUnearned(client, tenant.id, orderRef);
+    if (unqualified) pointsReversed = true;
 
     return { voided: rowCount ?? 0, pointsReversed };
   };
 
   return runner ? run(runner) : withTransaction(run);
+}
+
+/**
+ * Take back a referral whose qualifying order has been refunded.
+ *
+ * Returns whether anything was reversed. A referral qualifies on the referee's
+ * first kept order, so it stays qualified as long as one remains.
+ */
+async function unqualifyReferralIfUnearned(
+  client: Queryable,
+  tenantId: string,
+  orderRef: string,
+): Promise<boolean> {
+  const order = await queryOne<{ contact_id: string | null }>(
+    client,
+    'SELECT contact_id FROM orders WHERE tenant_id = $1 AND order_ref = $2',
+    [tenantId, orderRef],
+  );
+  if (!order?.contact_id) return false;
+
+  const kept = await client.query(
+    `SELECT 1 FROM orders
+      WHERE tenant_id = $1 AND contact_id = $2 AND status <> 'refunded'
+      LIMIT 1`,
+    [tenantId, order.contact_id],
+  );
+  if ((kept.rowCount ?? 0) > 0) return false;
+
+  const referral = await queryOne<{ id: string }>(
+    client,
+    `UPDATE referrals SET status = 'pending', qualified_at = NULL
+      WHERE tenant_id = $1 AND referee_contact_id = $2 AND status = 'qualified'
+      RETURNING id`,
+    [tenantId, order.contact_id],
+  );
+  if (!referral) return false;
+
+  const { rows: bonuses } = await client.query<{ id: string }>(
+    `SELECT id FROM points_ledger
+      WHERE tenant_id = $1 AND ref_type = 'referral' AND ref_id = $2 AND status <> 'reversed'`,
+    [tenantId, referral.id],
+  );
+
+  const { reverse } = await import('./points.js');
+  let reversed = false;
+  for (const bonus of bonuses) {
+    const compensation = await reverse(tenantId, bonus.id, 'Referred order refunded', client, {
+      clampToBalance: true,
+    });
+    if (compensation !== null) reversed = true;
+  }
+  return reversed;
 }
 
 /** Release commissions whose refund-protection hold has elapsed. */

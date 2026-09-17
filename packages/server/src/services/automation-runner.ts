@@ -375,21 +375,25 @@ export async function resumeDueRuns(
         const tenant = await getTenantById(run.tenant_id);
         if (!tenant) return null;
 
-        // Counted here for a run that gets as far as committing; a run that
-        // throws has this rolled back and is counted in the catch instead, so
-        // either way an attempt is recorded exactly once.
-        await client.query(
-          `UPDATE automation_runs SET status = 'running', attempts = attempts + 1, updated_at = now()
-            WHERE id = $1`,
-          [run.id],
-        );
+        // No attempt counted here. It used to be, on the reasoning that a run
+        // which throws rolls this back and the catch counts it instead -- but
+        // a run that commits has *succeeded*, and charging it an attempt made
+        // `attempts` a count of resumptions rather than of failures. Every
+        // wait in a sequence is a resumption, so a sequence with three waits
+        // arrived at its first real error already out of budget and was
+        // written off without a single retry. The catch below is the only
+        // place a failure is counted.
 
         const result = await advanceRun(client, tenant, automation, run, performAction);
 
         await client.query(
           `UPDATE automation_runs
               SET status = $2, step_index = $3, resume_at = $4,
-                  steps_executed = $5, error = NULL, updated_at = now()
+                  steps_executed = $5, error = NULL,
+                  -- Consecutive failures, so a step that works clears the
+                  -- slate: two bad afternoons weeks apart are not three.
+                  attempts = 0,
+                  updated_at = now()
             WHERE id = $1`,
           [run.id, result.status, result.stepIndex, result.resumeAt, result.stepsExecuted],
         );

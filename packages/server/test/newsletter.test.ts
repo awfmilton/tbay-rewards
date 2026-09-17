@@ -268,33 +268,33 @@ describe('email queue', () => {
     expect(outbox()).toHaveLength(afterFirst);
   });
 
-  it('retries a failing send and gives up after five attempts', async () => {
+  it('retries a failing send and gives up after six attempts', async () => {
     let attempts = 0;
     setEmailTransport({
       async send() {
         attempts += 1;
-        throw new Error('SMTP unavailable');
+        throw new Error('550 5.7.1 Message rejected by policy');
       },
     });
 
     await subscribe(await tenantObject(), { email: 'reader@example.com' });
-    for (let i = 0; i < 6; i += 1) {
+    for (let i = 0; i < 8; i += 1) {
       await flushEmailQueue();
-      // Retries back off — 1, 2, 4, 8 minutes — so that five attempts spread
-      // over a quarter of an hour instead of a minute. Without the wait, an
-      // hour of throttling from the provider suppressed the address for thirty
-      // days. Nothing here is waiting a quarter of an hour, so the clock moves.
+      // Retries back off — 5m, 15m, 1h, 4h, 12h — so the six attempts spread
+      // over most of a day rather than a quarter of an hour. Without that, an
+      // afternoon of throttling from the provider suppressed the address for
+      // thirty days. Nothing here waits, so the clock moves instead.
       await db().query(
         'UPDATE email_messages SET next_attempt_at = now() WHERE tenant_id = $1',
         [tenant.id],
       );
     }
 
-    expect(attempts).toBe(5);
+    expect(attempts).toBe(6);
     const { rows } = await db().query('SELECT status, attempts FROM email_messages WHERE tenant_id = $1', [
       tenant.id,
     ]);
-    expect(rows[0]).toMatchObject({ status: 'failed', attempts: 5 });
+    expect(rows[0]).toMatchObject({ status: 'failed', attempts: 6 });
   });
 });
 
@@ -309,4 +309,61 @@ async function findUnsubToken(expectedHash: string): Promise<string | null> {
     if (match && hashToken(match[1]!) === expectedHash) return match[1]!;
   }
   return null;
+}
+
+describe('a form cannot answer for somebody who said no (MEDIUM)', () => {
+  /**
+   * On a single-opt-in list, subscribing granted consent outright. The form is
+   * in the page source and takes an address, so anyone could undo an
+   * unsubscribe that the person had made deliberately -- and rewrite the
+   * consent provenance with whatever `source` they typed while doing it.
+   */
+  it('makes a returning unsubscriber confirm by email', async () => {
+    const tenantRow = await tenantObject();
+
+    // Single opt-in, which is where this bites: subscribing grants consent
+    // outright, with nothing to click and nobody to check it was them.
+    await subscribe(tenantRow, { email: 'seed@example.com' });
+    await db().query('UPDATE lists SET double_optin = false WHERE tenant_id = $1', [tenant.id]);
+
+    const first = await subscribe(tenantRow, { email: 'left@example.com' });
+    expect(first.status).toBe('subscribed');
+
+    const { rows: subs } = await db().query<{ unsub_token_hash: string }>(
+      `SELECT s.unsub_token_hash FROM subscriptions s
+         JOIN contacts c ON c.id = s.contact_id
+        WHERE s.tenant_id = $1 AND c.email_normalised = 'left@example.com'`,
+      [tenant.id],
+    );
+    await unsubscribeByToken((await findUnsubToken(subs[0]!.unsub_token_hash))!);
+
+    expect(await consentOf('left@example.com')).toMatchObject({ marketing_consent: false });
+
+    // Somebody types their address into the public form again.
+    const again = await subscribe(
+      tenantRow,
+      { email: 'left@example.com', source: 'attacker_form' },
+      undefined,
+      { fillOnly: true },
+    );
+
+    // Not subscribed, not consented, and the provenance is untouched.
+    expect(again.status).toBe('pending');
+    const held = await consentOf('left@example.com');
+    expect(held.marketing_consent).toBe(false);
+    expect(held.consent_source).not.toBe('attacker_form');
+
+    // They can still come back -- by clicking the link in their own inbox.
+    expect(again.confirmToken).toBeTruthy();
+    await confirmSubscription(again.confirmToken!);
+    expect(await consentOf('left@example.com')).toMatchObject({ marketing_consent: true });
+  });
+});
+
+async function consentOf(email: string) {
+  const { rows } = await db().query<{ marketing_consent: boolean; consent_source: string | null }>(
+    'SELECT marketing_consent, consent_source FROM contacts WHERE email_normalised = $1',
+    [email],
+  );
+  return rows[0]!;
 }

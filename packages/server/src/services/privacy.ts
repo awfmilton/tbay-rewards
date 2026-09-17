@@ -158,13 +158,35 @@ export async function eraseContact(
       [tenantId, contactId],
     );
 
+    // Anything still queued never goes out. Blanking to_email and leaving the
+    // row queued handed the transport an empty recipient, which SMTP answers
+    // with "No recipients defined" -- retried, then written off as a failure
+    // against the address '', and a suppression row keyed on nothing.
+    await client.query(
+      `UPDATE email_messages
+          SET status = 'suppressed', error = 'Contact erased',
+              claimed_at = NULL, claim_token = NULL
+        WHERE tenant_id = $1 AND contact_id = $2
+          AND status IN ('queued', 'sending')`,
+      [tenantId, contactId],
+    );
+
     // The rendered body of a sent email quotes the recipient by name. The
     // delivery record stays — a suppression list whose reasons have been
     // deleted is a list nobody can audit — but the body goes.
+    //
+    // tracked_links goes with it, and that one is not cosmetic: every
+    // marketing body carries {{unsubscribe_url}} and {{preferences_url}}, the
+    // click tracker rewrites both, and the token in each is a base64url JSON
+    // blob with the address in plaintext. Leaving the array behind left the
+    // erased person's email address sitting in a column keyed by their contact
+    // id, readable without a key. tracking_token goes too: a pixel that still
+    // resolves is a live handle on somebody who asked to be forgotten.
     await client.query(
       `UPDATE email_messages
           SET html = '', text = NULL, subject = '[erased]',
-              to_email = '', unsubscribe_url = NULL
+              to_email = '', unsubscribe_url = NULL,
+              tracked_links = '[]'::jsonb, tracking_token = NULL
         WHERE tenant_id = $1 AND contact_id = $2`,
       [tenantId, contactId],
     );
@@ -535,6 +557,12 @@ export async function runRetentionSweep(
       // So a session is only removed once its events are out of retention too.
       // A tenant who keeps events forever keeps the sessions that hold them,
       // which is the honest reading of "keep events forever".
+      //
+      // "The sessions that hold them", though -- not all of them. Gating the
+      // whole leg on an event policy existing meant a retailer who set
+      // sessions to thirty days and left events alone deleted nothing at all,
+      // including sessions with no events to protect. Ask the question that
+      // was meant: does this session still hold an event we are keeping?
       bump(
         'sessions',
         await deleteBatch(
@@ -542,11 +570,13 @@ export async function runRetentionSweep(
           `DELETE FROM sessions WHERE ctid IN (
              SELECT s.ctid FROM sessions s
               WHERE s.tenant_id = $1 AND s.started_at < now() - ($2 || ' days')::interval
-                AND ($3::text IS NOT NULL)
                 AND NOT EXISTS (
                   SELECT 1 FROM events e
                    WHERE e.session_id = s.id
-                     AND e.occurred_at >= now() - ($3 || ' days')::interval
+                     -- No event policy means every event is one we are
+                     -- keeping, so only an event-free session may go.
+                     AND ($3::text IS NULL
+                          OR e.occurred_at >= now() - ($3 || ' days')::interval)
                 )
               LIMIT ${batchSize}
            )`,

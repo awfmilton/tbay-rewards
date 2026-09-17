@@ -21,6 +21,16 @@ declare module 'fastify' {
     operatorId?: string | null;
     keyId?: string | null;
     actorLabel?: string;
+    /**
+     * What the audit row should say instead of the address in the body.
+     *
+     * The erasure handler sets this. Its own audit row is written after it
+     * runs, so the scrub it performs inside the transaction cannot reach it,
+     * and the address the operator typed stayed in the log of the request that
+     * was meant to remove it. Overriding here means the plaintext is never
+     * written in the first place rather than written and then chased.
+     */
+    auditTarget?: string | null;
   }
 }
 
@@ -133,6 +143,8 @@ function summarise(body: unknown): Record<string, unknown> {
 
 /** The customer an action was about, when there is one. */
 function targetOf(request: FastifyRequest): string | null {
+  if (request.auditTarget !== undefined) return request.auditTarget;
+
   const body = (request.body ?? {}) as Record<string, unknown>;
   const query = (request.query ?? {}) as Record<string, unknown>;
   for (const key of ['contactId', 'keep', 'email']) {

@@ -63,6 +63,7 @@ import {
   upsertPointType,
 } from '../services/point-types.js';
 import { requireContact } from '../services/contacts.js';
+import { upsertProduct } from '../services/products.js';
 import { queryLedger, type LedgerQuery } from '../services/points.js';
 import { contactSummary, contactTimeline } from '../services/timeline.js';
 import { listSuppressions, suppress, unsuppress } from '../services/deliverability.js';
@@ -1128,6 +1129,46 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
   });
 
   /**
+   * The catalogue, stated by the store rather than guessed from a page.
+   *
+   * The tracker fills in products it sees, but only ever blanks: the site key
+   * is in every page's source, so anything it sends is whatever the caller
+   * typed, and a product's categories decide what buying it earns. This is how
+   * a storefront says what a product actually is -- over the secret key, where
+   * that claim means something.
+   */
+  app.put<{ Params: { productRef: string } }>('/v1/products/:productRef', async (request) => {
+    const tenant = tenantOf(request);
+    const schema = z.object({
+      name: z.string().max(300).nullish(),
+      url: z.string().url().max(2000).nullish(),
+      imageUrl: z.string().url().max(2000).nullish(),
+      priceCents: z.number().int().min(0).max(100_000_000).nullish(),
+      currency: z.string().length(3).nullish(),
+      categories: z.array(z.string().min(1).max(120)).max(50).optional(),
+    });
+    const input = parse(schema, request.body ?? {});
+    const productRef = request.params.productRef.slice(0, 128);
+
+    await upsertProduct(db(), tenant.id, {
+      productRef,
+      name: input.name ?? null,
+      url: input.url ?? null,
+      imageUrl: input.imageUrl ?? null,
+      priceCents: input.priceCents ?? null,
+      currency: input.currency ? input.currency.toUpperCase() : null,
+      categories: input.categories ?? [],
+    });
+
+    const product = await queryOne(
+      db(),
+      'SELECT * FROM products WHERE tenant_id = $1 AND product_ref = $2',
+      [tenant.id, productRef],
+    );
+    return { product };
+  });
+
+  /**
    * What people chose instead of leaving.
    *
    * The number that says whether the preference page is earning its keep: a
@@ -1209,6 +1250,13 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     });
     const input = parse(schema, request.body);
     const contact = await requireContact(tenant.id, input);
+
+    // This request's own audit row is written after the handler returns, so
+    // the scrub inside eraseContact cannot reach it: the address the operator
+    // typed survived in the log of the request that was supposed to erase it.
+    // Say up front what the row should hold. The contact id is not personal
+    // data on its own and keeps the entry findable.
+    request.auditTarget = `erased:contact:${contact.id}`;
 
     return eraseContact(tenant.id, contact.id, {
       reason: input.reason,

@@ -580,3 +580,34 @@ function stubChain(overrides: Partial<ChainClient>): ChainClient {
     ...overrides,
   };
 }
+
+describe('token amounts convert exactly or not at all (LOW)', () => {
+  /**
+   * `String(n)` renders very large and very small numbers in exponent form,
+   * which BigInt cannot parse, so this normalises first. `toFixed(20)` was
+   * doing the normalising and does not: the spec says toFixed returns
+   * String(x) unchanged once |x| >= 1e21, so the exponent survived and the
+   * replace chain chewed on it -- `1.5e21` came out as "5e+210000000000000".
+   * A different number, not an error, and only BigInt rejecting the letter e
+   * kept it from being minted.
+   */
+  it('expands exponent notation in both directions', () => {
+    expect(tokensToWei(1).toString()).toBe('1000000000000000000');
+    expect(tokensToWei(123.456).toString()).toBe('123456000000000000000');
+    // Small enough that String() reaches for an exponent.
+    expect(tokensToWei(1e-7).toString()).toBe('100000000000');
+    expect(tokensToWei(1e-18).toString()).toBe('1');
+    // Large, but still exact as a double.
+    expect(tokensToWei(9e15).toString()).toBe('9000000000000000000000000000000000');
+    expect(tokensToWei(0).toString()).toBe('0');
+  });
+
+  it('refuses an amount a double cannot hold exactly', () => {
+    // Past 2^53 the wei figure would be quietly wrong rather than merely
+    // large. TBAY's whole supply is a million, so nothing legitimate is near
+    // this -- and a 400 saying so beats a 500 from BigInt, or worse, silence.
+    for (const amount of [1e21, 1.5e21, 1e20]) {
+      expect(() => tokensToWei(amount)).toThrow(/too large to represent exactly/);
+    }
+  });
+});

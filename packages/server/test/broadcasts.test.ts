@@ -285,7 +285,9 @@ describe('a send honours what people chose per topic', () => {
       segmentKey: 'promo',
       templateKey: 'promo',
     });
-    expect(saved.json().broadcast.topic_key).toBe('offers');
+    // Nothing is stored: the column is an override, and the topic that applies
+    // is the template's, read when the send actually runs.
+    expect(saved.json().broadcast.topic_key).toBeNull();
 
     await startBroadcast(tenant.id, 'sale');
     await sendBroadcastBatch(tenant.id, 'sale', 100);
@@ -389,5 +391,101 @@ describe('arming a send that would reach nobody', () => {
     await expect(startBroadcast(tenant.id, 'broken')).resolves.toMatchObject({
       status: 'scheduled',
     });
+  });
+});
+
+describe('a campaign belongs to its template\'s topic, today (MEDIUM)', () => {
+  /**
+   * The topic used to be copied onto the broadcast when it was saved. That
+   * snapshot went stale three ways: a broadcast written before the column
+   * existed kept null and mailed people who had turned the topic off, a
+   * template retagged after the campaign was scheduled did not follow, and a
+   * later save that simply omitted `topicKey` silently re-inherited a topic
+   * the caller had just cleared.
+   */
+  async function optedOutOf(topic: string): Promise<{ id: string; email: string }> {
+    await seedAudience(2);
+    const { rows } = await db().query<{ id: string; email: string }>(
+      'SELECT id, email FROM contacts WHERE tenant_id = $1 ORDER BY email',
+      [tenant.id],
+    );
+    const person = rows[0]!;
+    await authed('PUT', '/v1/email/preferences', {
+      contactId: person.id,
+      topics: { [topic]: false },
+    });
+    return person;
+  }
+
+  async function mailedAddresses(): Promise<string[]> {
+    const { rows } = await db().query<{ to_email: string }>(
+      'SELECT to_email FROM email_messages WHERE tenant_id = $1',
+      [tenant.id],
+    );
+    return rows.map((row) => row.to_email);
+  }
+
+  it('honours a topic on a broadcast saved before the column was written', async () => {
+    await authed('PUT', '/v1/email/topics/offers', { name: 'Offers' });
+    await authed('PUT', '/v1/email/templates/promo', {
+      subject: 'Our sale', html: '<p>Sale</p>', topicKey: 'offers',
+    });
+    const person = await optedOutOf('offers');
+
+    await authed('PUT', '/v1/broadcasts/legacy', {
+      name: 'Legacy', segmentKey: 'promo', templateKey: 'promo',
+    });
+    // Exactly what the old code left behind.
+    await db().query('UPDATE broadcasts SET topic_key = NULL WHERE tenant_id = $1', [tenant.id]);
+
+    await startBroadcast(tenant.id, 'legacy');
+    await sendBroadcastBatch(tenant.id, 'legacy', 100);
+
+    expect(await mailedAddresses()).not.toContain(person.email);
+  });
+
+  it('follows the template when its topic changes after the campaign is saved', async () => {
+    await authed('PUT', '/v1/email/topics/offers', { name: 'Offers' });
+    await authed('PUT', '/v1/email/topics/news', { name: 'News' });
+    await authed('PUT', '/v1/email/templates/promo', {
+      subject: 'Our sale', html: '<p>Sale</p>', topicKey: 'offers',
+    });
+    const person = await optedOutOf('news');
+
+    await authed('PUT', '/v1/broadcasts/sale', {
+      name: 'Sale', segmentKey: 'promo', templateKey: 'promo',
+    });
+    // Retagged after the campaign was scheduled.
+    await authed('PUT', '/v1/email/templates/promo', {
+      subject: 'Our sale', html: '<p>Sale</p>', topicKey: 'news',
+    });
+
+    await startBroadcast(tenant.id, 'sale');
+    await sendBroadcastBatch(tenant.id, 'sale', 100);
+
+    expect(await mailedAddresses()).not.toContain(person.email);
+  });
+
+  it('keeps an explicit override across a save that does not mention it', async () => {
+    await authed('PUT', '/v1/email/topics/offers', { name: 'Offers' });
+    await authed('PUT', '/v1/email/topics/news', { name: 'News' });
+    await authed('PUT', '/v1/email/templates/promo', {
+      subject: 'Our sale', html: '<p>Sale</p>', topicKey: 'offers',
+    });
+    const person = await optedOutOf('news');
+
+    await authed('PUT', '/v1/broadcasts/sale', {
+      name: 'Sale', segmentKey: 'promo', templateKey: 'promo', topicKey: 'news',
+    });
+    // A later edit that says nothing about the topic must not undo it.
+    const resaved = await authed('PUT', '/v1/broadcasts/sale', {
+      name: 'Sale, renamed', segmentKey: 'promo', templateKey: 'promo',
+    });
+    expect(resaved.json().broadcast.topic_key).toBe('news');
+
+    await startBroadcast(tenant.id, 'sale');
+    await sendBroadcastBatch(tenant.id, 'sale', 100);
+
+    expect(await mailedAddresses()).not.toContain(person.email);
   });
 });

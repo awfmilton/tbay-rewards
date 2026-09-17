@@ -25,7 +25,9 @@ export async function buildApp(): Promise<FastifyInstance> {
 
   const app = Fastify({
     logger: { level: cfg.logLevel },
-    trustProxy: true,
+    // Not `true`: that trusts every X-Forwarded-For entry, including the ones
+    // the caller wrote themselves. See config.security.trustProxyHops.
+    trustProxy: (_address: string, hop: number) => hop < cfg.security.trustProxyHops,
     bodyLimit: 1_048_576, // 1 MB: a tracker batch is a few KB at most.
     // Fastify's default is 100 characters, which is shorter than a signed
     // unsubscribe token — the URL in every marketing email — and a route

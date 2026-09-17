@@ -207,10 +207,24 @@ export async function contactSummary(
        (SELECT COALESCE(SUM(o.total_cents), 0) FROM orders o
          WHERE o.tenant_id = $1 AND o.contact_id = $2 AND o.status <> 'refunded')::int
          AS total_spent_cents,
-       (SELECT COALESCE(b.balance, 0) FROM points_balances b
-         WHERE b.tenant_id = $1 AND b.contact_id = $2)::int AS points_balance,
-       (SELECT COALESCE(b.lifetime_earned, 0) FROM points_balances b
-         WHERE b.tenant_id = $1 AND b.contact_id = $2)::int AS lifetime_points,
+       -- The default currency, one row. These were scalar subqueries keyed on
+       -- tenant and contact, but since point types arrived the key includes
+       -- the currency -- so the moment a retailer ran a second one, this 500'd
+       -- with "more than one row returned by a subquery" for every customer
+       -- holding both. That is the support screen, so it broke exactly when
+       -- somebody was trying to help. The COALESCE also has to sit outside
+       -- the subquery: inside, it never runs when there are no rows, so a
+       -- contact who has never earned anything reported a null balance.
+       COALESCE((SELECT b.balance FROM points_balances b
+          JOIN point_types t ON t.tenant_id = b.tenant_id AND t.key = b.point_type
+         WHERE b.tenant_id = $1 AND b.contact_id = $2
+         ORDER BY t.is_default DESC, t.key
+         LIMIT 1), 0)::int AS points_balance,
+       COALESCE((SELECT b.lifetime_earned FROM points_balances b
+          JOIN point_types t ON t.tenant_id = b.tenant_id AND t.key = b.point_type
+         WHERE b.tenant_id = $1 AND b.contact_id = $2
+         ORDER BY t.is_default DESC, t.key
+         LIMIT 1), 0)::int AS lifetime_points,
        (SELECT COUNT(*) FROM email_messages m
          WHERE m.tenant_id = $1 AND m.contact_id = $2 AND m.status = 'sent')::int AS emails_sent,
        (SELECT COUNT(*) FROM email_messages m

@@ -77,6 +77,12 @@ const TRANSPORT_FAILURE = new RegExp(
     'ECONN(?:REFUSED|RESET|ABORTED)',
     'ETIMEDOUT|ESOCKET|EHOSTUNREACH|ENETUNREACH|ENOTFOUND|EAI_AGAIN|EPIPE',
     'socket close|connection (?:closed|timeout|refused)',
+    // nodemailer raises its own timeouts as bare `Error('Timeout')` and
+    // `Error('Greeting never received')`, with the detail only in `err.code`.
+    // Matched on the message alone these read as soft bounces, so a relay that
+    // accepted the connection and went quiet spent the attempt budget and
+    // suppressed the address for thirty days -- for a fault at our end.
+    '^timeout$|\\btimed out\\b|greeting (?:never received|timeout)',
     '\\b(?:421|450|451|452)\\b',            // transient SMTP
     '\\b535\\b|authentication (?:failed|required)|invalid login',
     'certificate|self.?signed|TLS|SSL',

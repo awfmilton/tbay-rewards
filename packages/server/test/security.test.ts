@@ -365,6 +365,36 @@ describe('share rewards need a genuine third-party click', () => {
     expect((await getBalance(tenant.id, sharer.id)).balance).toBe(0);
   });
 
+  it('pays nothing for a bare hit on the redirect, where the clicker is unknown', async () => {
+    // `/r/:code` knows an IP and a user agent and nothing else, so the
+    // self-click checks had nothing to check — and one click verifies a share.
+    // A member opening their own link in a private window was paid for it.
+    const { createShare } = await import('../src/services/shares.js');
+
+    const sharer = await upsertContact(tenant.id, { email: 'selfclick@example.com' });
+    const share = await createShare(await tenantObject(), {
+      contactId: sharer.id,
+      network: 'x',
+      targetUrl: 'https://shop.example.com/product/flag',
+    });
+
+    const app = await testApp();
+    const hit = await app.inject({
+      method: 'GET',
+      url: `/r/${share.link.code}`,
+      headers: { 'user-agent': 'Mozilla/5.0 (Macintosh) AppleWebKit Chrome/120 Safari' },
+    });
+    expect(hit.statusCode).toBe(302);
+
+    expect((await getBalance(tenant.id, sharer.id)).balance).toBe(0);
+    const { rows } = await db().query<{ status: string; verified_clicks: number }>(
+      'SELECT status, verified_clicks FROM share_events WHERE tenant_id = $1',
+      [tenant.id],
+    );
+    expect(rows[0]!.status).toBe('pending');
+    expect(rows[0]!.verified_clicks).toBe(0);
+  });
+
   it('still pays when a different person clicks', async () => {
     const { createShare, recordLinkClickForShare } = await import('../src/services/shares.js');
 

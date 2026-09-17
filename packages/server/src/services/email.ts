@@ -2,6 +2,7 @@ import nodemailer, { type Transporter } from 'nodemailer';
 import { db, queryOne, type Queryable } from '../db/pool.js';
 import { config } from '../config.js';
 import { ApiError } from '../lib/errors.js';
+import { mayReceive } from './preferences.js';
 import { planTracking } from './email-tracking.js';
 import { isSuppressed, recordFailure } from './deliverability.js';
 import type { Tenant } from './tenants.js';
@@ -49,7 +50,18 @@ class SmtpTransport implements EmailTransport {
   private transporter: Transporter;
 
   constructor(url: string) {
-    this.transporter = nodemailer.createTransport(url);
+    this.transporter = nodemailer.createTransport(url, {
+      // These have to stay well under STALE_CLAIM, because that is what the
+      // queue assumes: a send still running when another worker reclaims the
+      // row delivers the message a second time. nodemailer's own defaults do
+      // not hold that -- its socket timeout is ten minutes, twice the claim
+      // window -- so a relay that accepts the connection and then goes quiet
+      // is exactly the stall that sends twice. Say the numbers out loud
+      // instead of inheriting them.
+      connectionTimeout: 30_000,
+      greetingTimeout: 30_000,
+      socketTimeout: 120_000,
+    });
   }
 
   async send(message: OutgoingEmail): Promise<{ providerId: string }> {
@@ -160,6 +172,24 @@ export async function queueEmail(input: QueueInput, runner: Queryable = db()): P
 
 /** Send up to `limit` queued messages. Returns how many went out. */
 export async function flushEmailQueue(limit = 50, runner: Queryable = db()): Promise<number> {
+  // A worker that dies mid-send leaves the row in `sending` for the next claim
+  // to take back -- but each reclaim spends an attempt, and once they run out
+  // the claim's `attempts < MAX` skips the row while nothing else looks at
+  // `sending` at all. The message sat there forever: never sent, never failed,
+  // no error, invisible to the retailer. Give those rows the ending they
+  // earned. Not a suppression: five dead workers say nothing about the address.
+  await runner.query(
+    `UPDATE email_messages
+        SET status = 'failed',
+            error = COALESCE(error, 'Sending stopped responding and ran out of attempts'),
+            claimed_at = NULL,
+            claim_token = NULL
+      WHERE status = 'sending'
+        AND attempts >= $1
+        AND claimed_at < now() - $2::interval`,
+    [MAX_SEND_ATTEMPTS, STALE_CLAIM],
+  );
+
   const { rows } = await runner.query<{
     id: string;
     tenant_id: string;
@@ -170,6 +200,8 @@ export async function flushEmailQueue(limit = 50, runner: Queryable = db()): Pro
     text: string | null;
     attempts: number;
     unsubscribe_url: string | null;
+    template_key: string | null;
+    claim_token: string;
   }>(
     // The claim moves the row to `sending`, which no other claim selects.
     //
@@ -184,6 +216,16 @@ export async function flushEmailQueue(limit = 50, runner: Queryable = db()): Pro
     // could plausibly take. That is at-least-once rather than exactly-once,
     // which is the honest guarantee for "we called an SMTP server and did not
     // hear back".
+    //
+    // Each row comes back with a fresh `claim_token`, because every write below
+    // is a compare-and-swap against it. Without that, a worker whose send outlived
+    // the stale window wrote its late failure over the row another worker had
+    // already marked `sent` -- the message went back to `queued` and was
+    // delivered a second time. A stall that long is not exotic: nodemailer's
+    // default socket timeout is ten minutes, so a relay that goes quiet
+    // mid-conversation produces exactly it. A token rather than `claimed_at`:
+    // Postgres keeps microseconds, node-postgres hands back a JS Date with
+    // milliseconds, and the truncated value never matches on the way in.
     //
     // RETURNING does not inherit the subselect's ORDER BY, so the final SELECT
     // is what actually sends a batch in the order it was queued.
@@ -200,13 +242,14 @@ export async function flushEmailQueue(limit = 50, runner: Queryable = db()): Pro
         FOR UPDATE SKIP LOCKED
      ), bumped AS (
        UPDATE email_messages
-          SET attempts = attempts + 1, status = 'sending', claimed_at = now()
+          SET attempts = attempts + 1, status = 'sending', claimed_at = now(),
+              claim_token = gen_random_uuid()
         WHERE id IN (SELECT id FROM claimed)
         RETURNING id, tenant_id, contact_id, to_email, subject, html, text, attempts,
-                  unsubscribe_url, created_at
+                  unsubscribe_url, template_key, claim_token, created_at
      )
      SELECT id, tenant_id, contact_id, to_email, subject, html, text, attempts,
-            unsubscribe_url
+            unsubscribe_url, template_key, claim_token
        FROM bumped ORDER BY created_at`,
     [limit, MAX_SEND_ATTEMPTS, STALE_CLAIM],
   );
@@ -231,9 +274,9 @@ export async function flushEmailQueue(limit = 50, runner: Queryable = db()): Pro
     if (blocked) {
       await runner.query(
         `UPDATE email_messages
-            SET status = 'suppressed', error = $2, claimed_at = NULL
-          WHERE id = $1`,
-        [message.id, `Address suppressed: ${blocked.reason}`],
+            SET status = 'suppressed', error = $2, claimed_at = NULL, claim_token = NULL
+          WHERE id = $1 AND status = 'sending' AND claim_token = $3`,
+        [message.id, `Address suppressed: ${blocked.reason}`, message.claim_token],
       );
       continue;
     }
@@ -249,13 +292,22 @@ export async function flushEmailQueue(limit = 50, runner: Queryable = db()): Pro
       await runner.query(
         `UPDATE email_messages
             SET status = 'sent', sent_at = now(), provider_id = $2,
-                error = NULL, claimed_at = NULL
-          WHERE id = $1`,
-        [message.id, providerId],
+                error = NULL, claimed_at = NULL, claim_token = NULL
+          WHERE id = $1 AND status = 'sending' AND claim_token = $3`,
+        [message.id, providerId, message.claim_token],
       );
       sent += 1;
     } catch (err) {
-      const reason = err instanceof Error ? err.message : String(err);
+      // The code as well as the message: nodemailer puts the useful part of a
+      // timeout in `err.code` and leaves the message as the bare word
+      // "Timeout", which reads like a soft bounce against the recipient.
+      const code = (err as { code?: unknown } | null)?.code;
+      const reason = [
+        err instanceof Error ? err.message : String(err),
+        typeof code === 'string' && code !== '' ? `(${code})` : '',
+      ]
+        .filter((part) => part !== '')
+        .join(' ');
 
       // Classify before deciding to retry: a mailbox that does not exist will
       // not start existing on the fourth attempt, and four more tries at it is
@@ -271,32 +323,32 @@ export async function flushEmailQueue(limit = 50, runner: Queryable = db()): Pro
 
       // A transport failure is about us, not the recipient, so it neither
       // gives up nor spends the attempt budget. Otherwise a relay that is down
-      // for ninety seconds burns all five attempts on every queued message and
-      // a whole broadcast is lost to an outage that fixed itself.
+      // for ninety seconds burns the whole attempt budget on every queued
+      // message and a whole broadcast is lost to an outage that fixed itself.
       const transport = type === 'transport';
       const giveUp = !transport && (type !== 'soft' || message.attempts >= MAX_SEND_ATTEMPTS);
 
       await runner.query(
-        // Backed off, not retried on the next tick. Five attempts fifteen
-        // seconds apart wrote a message off in about a minute and suppressed
-        // its address for thirty days — so an hour of throttling, or an
-        // afternoon on a blocklist, cost the mailing list. 1, 2, 4, 8 minutes
-        // gives the other end time to stop being broken.
+        // Backed off, not retried on the next tick: see
+        // SOFT_RETRY_DELAYS_SECONDS for why the budget is hours rather than
+        // minutes.
         `UPDATE email_messages
             SET status = $3,
                 error = $2,
                 bounce_type = $4,
                 claimed_at = NULL,
+                claim_token = NULL,
                 next_attempt_at = now() + ($6 || ' seconds')::interval,
                 attempts = CASE WHEN $5::boolean THEN GREATEST(attempts - 1, 0) ELSE attempts END
-          WHERE id = $1`,
+          WHERE id = $1 AND status = 'sending' AND claim_token = $7`,
         [
           message.id,
           reason.slice(0, 500),
           giveUp ? 'failed' : 'queued',
           type,
           transport,
-          String(retryDelaySeconds(message.attempts)),
+          String(retryDelaySeconds(message.attempts, transport)),
+          message.claim_token,
         ],
       );
     }
@@ -314,26 +366,48 @@ export async function flushEmailQueue(limit = 50, runner: Queryable = db()): Pro
  */
 async function withdrawnConsent(
   runner: Queryable,
-  message: { tenant_id: string; contact_id?: string | null },
+  message: { tenant_id: string; contact_id?: string | null; template_key?: string | null },
 ): Promise<{ reason: string } | null> {
   if (!message.contact_id) return null;
-  const row = await queryOne<{ marketing_consent: boolean }>(
+
+  // Everything the preference page can say, not just the consent flag.
+  //
+  // This read `marketing_consent` alone, so somebody who chose "pause for 30
+  // days" or turned this topic off between the queue and the send was mailed
+  // anyway. A large audience spends the best part of an hour in the queue;
+  // every answer given during it has to count, not only the strongest one.
+  const topic = await queryOne<{ topic_key: string | null }>(
     runner,
-    'SELECT marketing_consent FROM contacts WHERE tenant_id = $1 AND id = $2',
-    [message.tenant_id, message.contact_id],
+    'SELECT topic_key FROM email_templates WHERE tenant_id = $1 AND key = $2',
+    [message.tenant_id, message.template_key ?? ''],
   );
-  return row && !row.marketing_consent ? { reason: 'consent_withdrawn' } : null;
+
+  const verdict = await mayReceive(
+    message.tenant_id,
+    message.contact_id,
+    topic?.topic_key ?? null,
+    runner,
+  );
+  return verdict.allowed ? null : { reason: verdict.reason ?? 'not_permitted' };
 }
 
-const MAX_SEND_ATTEMPTS = 5;
+// Six, paired with SOFT_RETRY_DELAYS_SECONDS: five backoffs of 5m, 15m, 1h,
+// 4h and 12h, then the sixth failure is the one that gives up.
+const MAX_SEND_ATTEMPTS = 6;
 
 /**
  * How long a claimed message may sit in `sending` before another worker takes
  * it back.
  *
  * Long enough that a slow SMTP conversation is never mistaken for a dead
- * worker — five minutes is far past any transport's own timeout — and short
- * enough that a crash does not strand a campaign until somebody notices.
+ * worker, and short enough that a crash does not strand a campaign until
+ * somebody notices.
+ *
+ * The first half of that only holds because SmtpTransport sets its own
+ * timeouts: 30s to connect, 30s for the greeting, 120s of silence mid-stream,
+ * so a send cannot outlive this window. It does not hold for a transport
+ * injected through setEmailTransport — give that one a timeout under five
+ * minutes too, or a stalled send will go out twice.
  */
 const STALE_CLAIM = '5 minutes';
 
@@ -345,8 +419,26 @@ const STALE_CLAIM = '5 minutes';
  * stops the queue hammering a relay that is down, and the unspent attempt is
  * what stops the outage suppressing anybody.
  */
-function retryDelaySeconds(attempts: number): number {
-  return Math.min(2 ** Math.max(0, attempts - 1), 8) * 60;
+/**
+ * How long before the next try.
+ *
+ * A transport failure is the relay being briefly unreachable, so it comes back
+ * in a minute and does not spend an attempt. Everything else is the far end
+ * saying no for a reason of its own -- throttling, a reputation block, a
+ * greylist that has not aged -- and those are measured in hours.
+ *
+ * 1, 2, 4, 8 minutes spent the whole budget in a quarter of an hour, which
+ * meant an afternoon on a blocklist ended with the address suppressed for
+ * thirty days. This schedule runs a little over seventeen hours across six
+ * attempts, so a bad afternoon or an overnight block is survivable and the
+ * address is still there in the morning.
+ */
+const SOFT_RETRY_DELAYS_SECONDS = [5 * 60, 15 * 60, 60 * 60, 4 * 60 * 60, 12 * 60 * 60];
+
+function retryDelaySeconds(attempts: number, transport: boolean): number {
+  if (transport) return 60;
+  const index = Math.min(Math.max(attempts, 1), SOFT_RETRY_DELAYS_SECONDS.length) - 1;
+  return SOFT_RETRY_DELAYS_SECONDS[index]!;
 }
 
 /**

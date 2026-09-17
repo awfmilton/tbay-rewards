@@ -12,6 +12,8 @@ import {
   type TestTenant,
 } from './helpers.js';
 import { flushEmailQueue, outbox, setEmailTransport } from '../src/services/email.js';
+import { upsertPointType } from '../src/services/point-types.js';
+import { award } from '../src/services/points.js';
 
 let tenant: TestTenant;
 
@@ -129,6 +131,56 @@ describe('contact timeline', () => {
     // 500 from the two orders at 1 point per currency unit, plus 50 for the
     // account the first order created.
     expect(summary.lifetime_points).toBe(550);
+  });
+
+  it('summarises a contact holding two currencies', async () => {
+    // The summary's balance figures were scalar subqueries keyed on tenant and
+    // contact. Point types made the balance key (tenant, contact, currency), so
+    // the second a retailer added a status currency this 500'd for everyone
+    // holding both -- on the screen support opens to help them.
+    await upsertPointType(tenant.id, { key: 'status', name: 'Status' });
+    await authed('POST', '/v1/contacts', { email: 'two@example.com' });
+    const contactId = (
+      await db().query(
+        `SELECT id FROM contacts WHERE tenant_id = $1 AND email_normalised = 'two@example.com'`,
+        [tenant.id],
+      )
+    ).rows[0].id as string;
+
+    await award(tenant.id, {
+      contactId, points: 100, reason: 'Spend', idempotencyKey: 'tl-default',
+    });
+    await award(tenant.id, {
+      contactId, points: 40, reason: 'Status', idempotencyKey: 'tl-status', pointType: 'status',
+    });
+
+    const response = await authed(
+      'GET',
+      `/v1/contacts/timeline?email=${encodeURIComponent('two@example.com')}`,
+    );
+
+    expect(response.statusCode).toBe(200);
+    // The headline number is the default currency, not a sum of unlike things:
+    // 100 spendable points, not 140 points-and-status.
+    const { summary } = JSON.parse(response.body);
+    expect(summary.points_balance).toBe(100);
+    expect(summary.lifetime_points).toBe(100);
+  });
+
+  it('reports zero, not null, for a contact who has never earned', async () => {
+    // COALESCE inside the subquery never runs when the subquery returns no
+    // rows, so a brand new contact reported a null balance to a screen whose
+    // contract says number.
+    await authed('POST', '/v1/contacts', { email: 'fresh@example.com' });
+
+    const response = await authed(
+      'GET',
+      `/v1/contacts/timeline?email=${encodeURIComponent('fresh@example.com')}`,
+    );
+    const { summary } = JSON.parse(response.body);
+
+    expect(summary.points_balance).toBe(0);
+    expect(summary.lifetime_points).toBe(0);
   });
 
   it('filters by kind', async () => {

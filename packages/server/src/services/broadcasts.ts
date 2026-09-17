@@ -153,16 +153,22 @@ export async function upsertBroadcast(
   // honoured. The column existed and nothing ever wrote it, which made the
   // preference centre work for automations and do nothing for campaigns — the
   // one kind of mail people actually turn off.
-  let topicKey = input.topicKey === undefined ? existing?.topic_key ?? null : input.topicKey;
+  //
+  // Stored only when the caller names one. It used to be copied from the
+  // template here, which snapshotted an answer that then went stale three
+  // ways: every broadcast saved before the column was written stayed null and
+  // ignored topic preferences forever, a template retagged afterwards did not
+  // follow, and a save that simply omitted `topicKey` silently re-inherited a
+  // topic the caller had just cleared. `sendBroadcast` reads the template's
+  // topic at send time instead, so this column is an override and nothing
+  // more.
+  const topicKey = input.topicKey === undefined ? existing?.topic_key ?? null : input.topicKey;
 
   if (templateKey) {
     const namedTemplate = await getTemplate(tenantId, templateKey, runner);
     if (!namedTemplate) {
       throw ApiError.notFound(`No email template "${templateKey}"`);
     }
-    // Inherited unless the caller said otherwise: the topic belongs to the
-    // message, and the message is the template's.
-    if (input.topicKey === undefined) topicKey = namedTemplate.topic_key ?? null;
     if (input.preheader) {
       // It would be stored and never read: the template's own preheader is
       // already rendered into the body this send goes out with.
@@ -373,6 +379,17 @@ export async function sendBroadcastBatch(
 
   const template = await bodyFor(tenantId, broadcast, runner);
 
+  // The topic is resolved now, not at save time: the broadcast's own value is
+  // an override, and a send built on a template belongs to whatever topic that
+  // template carries today. That is what makes the preference centre work for
+  // campaigns saved before the column was written, and for a template retagged
+  // after a campaign was scheduled.
+  const topicKey =
+    broadcast.topic_key ??
+    (broadcast.template_key
+      ? (await getTemplate(tenantId, broadcast.template_key, runner))?.topic_key ?? null
+      : null);
+
   const audience = await audienceAfter(
     runner,
     broadcast.segment_id,
@@ -414,7 +431,7 @@ export async function sendBroadcastBatch(
     // Checked here, not when the audience was built. A large send runs over
     // minutes or hours, and somebody who pauses partway through should not
     // receive the rest of it.
-    const wanted = await mayReceive(tenantId, contact.id, broadcast.topic_key ?? null, runner);
+    const wanted = await mayReceive(tenantId, contact.id, topicKey, runner);
     if (!wanted.allowed) {
       await recordRecipient(runner, broadcast.id, contact.id, null, 'skipped', wanted.reason);
       skipped += 1;
