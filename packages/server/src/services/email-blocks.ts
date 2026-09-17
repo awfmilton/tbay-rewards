@@ -70,7 +70,10 @@ const MAX_PRODUCTS = 12;
  * a retailer means to put in a newsletter.
  */
 function assertUrl(value: unknown, field: string): string {
-  const raw = String(value ?? '').trim();
+  if (value !== undefined && value !== null && typeof value !== 'string') {
+    throw ApiError.badRequest(`${field} must be a link`);
+  }
+  const raw = (value ?? '').trim();
   if (raw === '') throw ApiError.badRequest(`${field} is required`);
   if (raw.length > 2048) throw ApiError.badRequest(`${field} is too long`);
 
@@ -89,9 +92,26 @@ function assertUrl(value: unknown, field: string): string {
   return raw;
 }
 
-function text(value: unknown, field: string, max = MAX_TEXT): string {
-  const raw = String(value ?? '');
+/**
+ * A text field's value.
+ *
+ * A non-string is refused rather than coerced: `String({a: 1})` is
+ * "[object Object]", which a retailer then finds in a sent newsletter. The
+ * builder posts strings, so anything else is a caller getting the shape wrong
+ * and a 400 is the honest answer.
+ */
+function text(
+  value: unknown,
+  field: string,
+  max = MAX_TEXT,
+  required = false,
+): string {
+  if (value !== undefined && value !== null && typeof value !== 'string') {
+    throw ApiError.badRequest(`${field} must be text`);
+  }
+  const raw = value ?? '';
   if (raw.length > max) throw ApiError.badRequest(`${field} is longer than ${max} characters`);
+  if (required && raw.trim() === '') throw ApiError.badRequest(`${field} is required`);
   return raw;
 }
 
@@ -122,7 +142,10 @@ export function validateBlocks(input: unknown): Block[] {
     for (const key of ['visibleTo', 'hiddenFrom'] as const) {
       const value = block[key];
       if (value === undefined || value === null || value === '') continue;
-      const segment = String(value);
+      if (typeof value !== 'string') {
+        throw ApiError.badRequest(`Block ${index + 1}: ${key} must be a segment key`);
+      }
+      const segment = value;
       if (!/^[a-z0-9_]{2,64}$/.test(segment)) {
         throw ApiError.badRequest(`Block ${index + 1}: "${segment}" is not a segment key`);
       }
@@ -134,17 +157,21 @@ export function validateBlocks(input: unknown): Block[] {
         const level = Number(block.level ?? 2);
         return {
           type: 'heading',
-          text: text(block.text, `Block ${index + 1} heading`, 300),
+          text: text(block.text, `Block ${index + 1} heading`, 300, true),
           level: ([1, 2, 3].includes(level) ? level : 2) as 1 | 2 | 3,
           ...audience,
         };
       }
       case 'text':
-        return { type: 'text', text: text(block.text, `Block ${index + 1} text`), ...audience };
+        return {
+          type: 'text',
+          text: text(block.text, `Block ${index + 1} text`, MAX_TEXT, true),
+          ...audience,
+        };
       case 'button':
         return {
           type: 'button',
-          label: text(block.label, `Block ${index + 1} label`, 120),
+          label: text(block.label, `Block ${index + 1} label`, 120, true),
           url: assertUrl(block.url, `Block ${index + 1} link`),
           ...audience,
         };
@@ -159,7 +186,7 @@ export function validateBlocks(input: unknown): Block[] {
       case 'divider':
         return { type: 'divider', ...audience };
       case 'spacer': {
-        const size = String(block.size ?? 'medium');
+        const size = text(block.size ?? 'medium', `Block ${index + 1} height`, 16);
         return {
           type: 'spacer',
           size: (['small', 'medium', 'large'].includes(size) ? size : 'medium') as never,
@@ -167,6 +194,9 @@ export function validateBlocks(input: unknown): Block[] {
         };
       }
       case 'products': {
+        if (block.items !== undefined && !Array.isArray(block.items)) {
+          throw ApiError.badRequest(`Block ${index + 1}: products must be a list`);
+        }
         const items = Array.isArray(block.items) ? block.items : [];
         if (items.length > MAX_PRODUCTS) {
           throw ApiError.badRequest(`Block ${index + 1}: at most ${MAX_PRODUCTS} products`);
@@ -176,7 +206,7 @@ export function validateBlocks(input: unknown): Block[] {
           items: items.map((item, position) => {
             const one = (item ?? {}) as Record<string, unknown>;
             return {
-              title: text(one.title, `Block ${index + 1}, product ${position + 1}`, 200),
+              title: text(one.title, `Block ${index + 1}, product ${position + 1}`, 200, true),
               ...(one.url ? { url: assertUrl(one.url, `Product ${position + 1} link`) } : {}),
               ...(one.image ? { image: assertUrl(one.image, `Product ${position + 1} image`) } : {}),
               ...(one.price ? { price: text(one.price, `Product ${position + 1} price`, 40) } : {}),
@@ -204,6 +234,36 @@ export function segmentsUsed(blocks: Block[]): string[] {
     if (block.hiddenFrom) keys.add(block.hiddenFrom);
   }
   return [...keys];
+}
+
+/**
+ * Refuse a segment key that names no segment.
+ *
+ * A typo is otherwise invisible and silent in the worst direction: `visibleTo:
+ * "vips"` hides the block from everybody, `hiddenFrom: "vips"` shows it to
+ * everybody, and the retailer finds out from whoever received the wrong one.
+ */
+export async function assertSegmentsExist(
+  tenantId: string,
+  blocks: Block[],
+  runner: Queryable = db(),
+): Promise<void> {
+  const wanted = segmentsUsed(blocks);
+  if (wanted.length === 0) return;
+
+  const { rows } = await runner.query<{ key: string }>(
+    'SELECT key FROM segments WHERE tenant_id = $1 AND key = ANY($2::text[])',
+    [tenantId, wanted],
+  );
+  const known = new Set(rows.map((row) => row.key));
+  const missing = wanted.filter((key) => !known.has(key));
+  if (missing.length > 0) {
+    throw ApiError.badRequest(
+      missing.length === 1
+        ? `There is no segment "${missing[0]}"`
+        : `No such segments: ${missing.join(', ')}`,
+    );
+  }
 }
 
 /**
@@ -440,9 +500,14 @@ export async function personalise<
 
   let blocks: Block[];
   try {
-    blocks = Array.isArray(template.blocks)
-      ? (template.blocks as Block[])
-      : (JSON.parse(String(template.blocks)) as Block[]);
+    const parsed = Array.isArray(template.blocks)
+      ? template.blocks
+      : JSON.parse(String(template.blocks));
+    // Valid JSON that is not a list — `123`, `true`, an object — would reach
+    // `for…of` below and throw. Only a direct database write can produce it,
+    // which is exactly the case worth surviving.
+    if (!Array.isArray(parsed)) return template;
+    blocks = parsed as Block[];
   } catch {
     // Unparseable blocks are not a reason to fail somebody's receipt: the
     // stored HTML is a complete, if unconditional, copy of the message.

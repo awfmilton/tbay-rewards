@@ -141,10 +141,17 @@ describe('the catalogue and the validator agree', () => {
 
   it('describes a choice field only with values the validator keeps', () => {
     for (const spec of describeBlocks()) {
+      // A complete block, so a required field missing is not what fails.
+      const base: Record<string, unknown> = { type: spec.type };
+      for (const field of spec.fields) {
+        if (field.name === 'visibleTo' || field.name === 'hiddenFrom') continue;
+        if (field.kind !== 'choice') base[field.name] = sample(field);
+      }
+
       for (const field of spec.fields) {
         if (field.kind !== 'choice') continue;
         for (const choice of field.choices!) {
-          const [block] = validateBlocks([{ type: spec.type, [field.name]: choice.value }]) as [
+          const [block] = validateBlocks([{ ...base, [field.name]: choice.value }]) as [
             Record<string, unknown>,
           ];
           expect(
@@ -532,5 +539,235 @@ describe('composed templates in an automation', () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]!.html).toContain('1250');
     expect(rows[0]!.html).not.toContain('{{points_balance}}');
+  });
+
+  it('shows the balance, not the amount the order just earned', async () => {
+    // `order.completed` carries `points` — what that order earned. Reading it
+    // as a balance put "Your points: 50" in front of somebody holding 1050.
+    const created = await authed('POST', '/v1/contacts', {
+      email: 'buyer@example.com',
+      marketingConsent: true,
+    });
+    const contactId = created.json().contact_id as string;
+    await db().query(
+      `INSERT INTO points_balances (tenant_id, contact_id, point_type, balance)
+       VALUES ($1, $2, 'points', 1000)`,
+      [tenant.id, contactId],
+    );
+
+    await authed('PUT', '/v1/email/templates/order_note', {
+      subject: 'Thanks',
+      transactional: true,
+      blocks: [{ type: 'points', heading: 'Your balance' }],
+    });
+    await authed('PUT', '/v1/automations/order_note', {
+      name: 'Order note',
+      triggerType: 'order.completed',
+      actions: [{ type: 'send_email', template: 'order_note' }],
+    });
+
+    await fire(tenant.id, 'order.completed', {
+      contact: { id: contactId, email: 'buyer@example.com' } as never,
+      data: { order_ref: 'o-1', total_cents: 5000, points: 50 },
+      dedupeKey: 'order:o-1',
+    });
+
+    const { rows } = await db().query<{ html: string }>(
+      "SELECT html FROM email_messages WHERE tenant_id = $1 AND to_email = 'buyer@example.com'",
+      [tenant.id],
+    );
+    expect(rows[0]!.html).toContain('1000');
+    expect(rows[0]!.html).not.toContain('>50<');
+  });
+});
+
+describe('what the reviews found', () => {
+  it('does not escape the subject line', async () => {
+    // A store called "Bob's Bikes" was arriving as "Bob&#39;s Bikes".
+    await db().query('UPDATE tenants SET name = $2 WHERE id = $1', [tenant.id, "Bob's Bikes"]);
+    await authed('POST', '/v1/contacts', { email: 'sub@example.com', marketingConsent: true });
+    await authed('PUT', '/v1/email/templates/greet', {
+      subject: 'News from {{tenant_name}}',
+      transactional: true,
+      blocks: [{ type: 'text', text: 'Hello' }],
+    });
+    await authed('PUT', '/v1/automations/greet', {
+      name: 'Greet',
+      triggerType: 'contact.created',
+      actions: [{ type: 'send_email', template: 'greet' }],
+    });
+    const created = await authed('POST', '/v1/contacts', {
+      email: 'greeted@example.com',
+      marketingConsent: true,
+    });
+    await fire(tenant.id, 'contact.created', {
+      contact: { id: created.json().contact_id, email: 'greeted@example.com' } as never,
+      data: {},
+      dedupeKey: 'c-1',
+    });
+
+    const { rows } = await db().query<{ subject: string; text: string }>(
+      "SELECT subject, text FROM email_messages WHERE to_email = 'greeted@example.com'",
+    );
+    expect(rows[0]!.subject).toBe("News from Bob's Bikes");
+  });
+
+  it('does not put HTML entities in the plain-text part', async () => {
+    const blocks = validateBlocks([
+      { type: 'text', text: "Tom & Jerry's sale" },
+      { type: 'button', label: 'Shop', url: 'https://shop.test/?a=1&b=2' },
+    ]);
+    const text = blocksToText(blocks);
+    // `&amp;` in a text-only client is a broken link and a misspelt name.
+    expect(text).toContain("Tom & Jerry's sale");
+    expect(text).toContain('https://shop.test/?a=1&b=2');
+    expect(text).not.toContain('&amp;');
+    expect(text).not.toContain('&#39;');
+  });
+
+  it('refuses a template whose block list is empty', async () => {
+    const response = await authed('PUT', '/v1/email/templates/hollow', {
+      subject: 'Hollow',
+      blocks: [],
+    });
+    expect(response.statusCode).toBe(400);
+    expect(await getTemplate(tenant.id, 'hollow')).toBeNull();
+  });
+
+  it('refuses a block naming a segment that does not exist', async () => {
+    const response = await authed('PUT', '/v1/email/templates/typo', {
+      subject: 'Typo',
+      blocks: [{ type: 'text', text: 'VIP only', visibleTo: 'vips' }],
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().message).toMatch(/no segment "vips"/i);
+  });
+
+  it('refuses a field of the wrong type rather than coercing it', () => {
+    // String({a: 1}) is "[object Object]", which a retailer then finds in a
+    // sent newsletter.
+    expect(() => validateBlocks([{ type: 'heading', text: { a: 1 } }])).toThrow(/must be text/i);
+    expect(() => validateBlocks([{ type: 'text', text: ['a', 'b'] }])).toThrow(/must be text/i);
+    expect(() => validateBlocks([{ type: 'products', items: { 0: { title: 'x' } } }])).toThrow(
+      /must be a list/i,
+    );
+    expect(() => validateBlocks([{ type: 'divider', visibleTo: ['vip'] }])).toThrow(
+      /must be a segment key/i,
+    );
+  });
+
+  it('refuses an empty value where the catalogue says required', () => {
+    expect(() => validateBlocks([{ type: 'heading', text: '  ' }])).toThrow(/is required/i);
+    expect(() => validateBlocks([{ type: 'text', text: '' }])).toThrow(/is required/i);
+    expect(() => validateBlocks([{ type: 'button', label: '', url: 'https://a.test' }])).toThrow(
+      /is required/i,
+    );
+    expect(() => validateBlocks([{ type: 'products', items: [{ title: '' }] }])).toThrow(
+      /is required/i,
+    );
+  });
+
+  it('does not wipe a composed body when a later save names no body', async () => {
+    // The "prepare a send" form is the only screen that can change a draft's
+    // segment, so it is re-submitted for sends that already have a message.
+    await authed('PUT', '/v1/segments/promo', {
+      name: 'Promo',
+      definition: { match: 'all', filters: [{ field: 'order_count', operator: 'gte', value: 0 }] },
+    });
+    await authed('PUT', '/v1/broadcasts/keeper', {
+      name: 'Keeper',
+      segmentKey: 'promo',
+      subject: 'Hello',
+      blocks: [{ type: 'text', text: 'Written in the composer' }],
+    });
+
+    // Exactly what that form posts.
+    const again = await authed('PUT', '/v1/broadcasts/keeper', {
+      name: 'Keeper',
+      segmentKey: 'promo',
+      subject: 'Hello',
+    });
+    expect(again.statusCode).toBe(200);
+    expect(again.json().broadcast.blocks).toHaveLength(1);
+  });
+
+  it('does not un-schedule a send when its message is edited', async () => {
+    await authed('PUT', '/v1/segments/promo', {
+      name: 'Promo',
+      definition: { match: 'all', filters: [{ field: 'order_count', operator: 'gte', value: 0 }] },
+    });
+    await authed('PUT', '/v1/broadcasts/timed', {
+      name: 'Timed',
+      segmentKey: 'promo',
+      subject: 'Friday',
+      sendAt: '2030-01-01T10:00:00Z',
+      blocks: [{ type: 'text', text: 'First draft' }],
+    });
+
+    // The composer never posts a time; it used to mean "draft, never sends".
+    const edited = await authed('PUT', '/v1/broadcasts/timed', {
+      name: 'Timed',
+      subject: 'Friday',
+      blocks: [{ type: 'text', text: 'Second draft' }],
+    });
+    expect(edited.json().broadcast.status).toBe('scheduled');
+    expect(edited.json().broadcast.send_at).not.toBeNull();
+
+    // And an explicit null still clears it.
+    const cleared = await authed('PUT', '/v1/broadcasts/timed', { sendAt: null });
+    expect(cleared.json().broadcast.status).toBe('draft');
+  });
+
+  it('refuses a template and a composed body in the same call', async () => {
+    await authed('PUT', '/v1/email/templates/promo', { subject: 'Sale', html: '<p>Sale</p>' });
+    const response = await authed('PUT', '/v1/broadcasts/confused', {
+      name: 'Confused',
+      subject: 'Which one',
+      templateKey: 'promo',
+      blocks: [{ type: 'text', text: 'Or this' }],
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().message).toMatch(/not both/i);
+  });
+
+  it('refuses a preheader on a send that uses a template', async () => {
+    await authed('PUT', '/v1/email/templates/promo', { subject: 'Sale', html: '<p>Sale</p>' });
+    const response = await authed('PUT', '/v1/broadcasts/tpl', {
+      name: 'Templated',
+      templateKey: 'promo',
+      preheader: 'Never read',
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().message).toMatch(/preheader belongs to the message/i);
+  });
+
+  it('lets a draft exist before anybody has written it', async () => {
+    await authed('PUT', '/v1/segments/promo', {
+      name: 'Promo',
+      definition: { match: 'all', filters: [{ field: 'order_count', operator: 'gte', value: 0 }] },
+    });
+    const created = await authed('PUT', '/v1/broadcasts/unwritten', {
+      name: 'Unwritten',
+      segmentKey: 'promo',
+      subject: 'To be written',
+    });
+    expect(created.statusCode).toBe(200);
+    expect(created.json().broadcast.template_key).toBeNull();
+    expect(created.json().broadcast.blocks).toBeNull();
+    // Arming it is what is refused.
+    await expect(startBroadcast(tenant.id, 'unwritten')).rejects.toThrow(/has no body|no message/i);
+  });
+
+  it('lets a template leave every topic', async () => {
+    await authed('PUT', '/v1/email/topics/offers', { name: 'Offers' });
+    await authed('PUT', '/v1/email/templates/topical', {
+      subject: 'Offers', html: '<p>Offers</p>', topicKey: 'offers',
+    });
+    expect((await getTemplate(tenant.id, 'topical'))?.topic_key).toBe('offers');
+
+    await authed('PUT', '/v1/email/templates/topical', {
+      subject: 'Offers', html: '<p>Offers</p>', topicKey: null,
+    });
+    expect((await getTemplate(tenant.id, 'topical'))?.topic_key).toBeNull();
   });
 });
