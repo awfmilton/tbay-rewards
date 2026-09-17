@@ -325,3 +325,102 @@ describe('safety', () => {
     expect(outbox()).toHaveLength(0);
   });
 });
+
+describe('attempts count failures, not waits (MEDIUM)', () => {
+  /**
+   * `attempts` was bumped on every resumption, including the ones that
+   * succeeded -- so every wait in a sequence spent a retry. A sequence with
+   * three waits arrived at its first real error already out of budget and was
+   * written off without a single retry, which is exactly backwards: the longer
+   * a sequence runs, the more likely it is to meet a transient failure.
+   */
+  async function start(key: string, actions: unknown[], email: string): Promise<void> {
+    await authed('PUT', `/v1/automations/${key}`, {
+      name: key,
+      triggerType: 'contact.created',
+      actions,
+    });
+    const contactId = await makeContact({ email });
+    await fire(tenant.id, 'contact.created', {
+      contact: { id: contactId, email } as never,
+      data: {},
+      dedupeKey: `contact:${contactId}`,
+    });
+  }
+
+  it('still retries a sequence that has already waited three times', async () => {
+    await start(
+      'patient',
+      [
+        { type: 'wait', seconds: 1 },
+        { type: 'wait', seconds: 1 },
+        { type: 'wait', seconds: 1 },
+        { type: 'send_email', template: 'not_yet_written' },
+      ],
+      'patient@example.com',
+    );
+
+    // Three waits: the first runs on the trigger, two more on resumption.
+    for (let step = 0; step < 2; step += 1) {
+      await fastForward();
+      await runDueAutomations();
+    }
+
+    const waited = await runState();
+    expect(waited.status).toBe('waiting');
+    expect(waited.step_index).toBe(3);
+    // Nothing has gone wrong yet, so nothing has been spent. Before this, the
+    // three waits had already used the whole budget.
+    expect(waited.attempts).toBe(0);
+
+    // Now the step that fails, three times over.
+    for (const expected of [1, 2, 3]) {
+      await fastForward();
+      await runDueAutomations();
+      expect((await runState()).attempts).toBe(expected);
+    }
+
+    // Three real retries before giving up, which is what the limit is for.
+    expect((await runState()).status).toBe('failed');
+  });
+
+  it('clears the count once a step works again', async () => {
+    await start(
+      'recovering',
+      [
+        { type: 'wait', seconds: 1 },
+        { type: 'send_email', template: 'written_later' },
+        { type: 'wait', seconds: 1 },
+      ],
+      'recovering@example.com',
+    );
+
+    // One failure against a template that does not exist yet.
+    await fastForward();
+    await runDueAutomations();
+    expect((await runState()).attempts).toBe(1);
+
+    // The retailer writes it.
+    await authed('PUT', '/v1/email/templates/written_later', {
+      subject: 'Here now', html: '<p>Here now</p>', transactional: true,
+    });
+    await fastForward();
+    await runDueAutomations();
+
+    // Consecutive failures, so a step that works clears the slate: two bad
+    // afternoons weeks apart are not three.
+    expect((await runState()).attempts).toBe(0);
+  });
+});
+
+async function runState(): Promise<{
+  status: string; attempts: number; step_index: number; error: string | null;
+}> {
+  const { rows } = await db().query<{
+    status: string; attempts: number; step_index: number; error: string | null;
+  }>(
+    'SELECT status, attempts, step_index, error FROM automation_runs WHERE tenant_id = $1',
+    [tenant.id],
+  );
+  return rows[0]!;
+}

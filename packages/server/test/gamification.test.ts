@@ -3,8 +3,10 @@ import { closeApp, closeDb, db, makeTenant, setupDatabase, truncateAll, type Tes
 import { upsertContact } from '../src/services/contacts.js';
 import { award, getBalance } from '../src/services/points.js';
 import { recordOrder } from '../src/services/commissions.js';
+import { upsertRule } from '../src/services/rewards.js';
 import { getTenantById } from '../src/services/tenants.js';
 import {
+  assignRankManually,
   awardBadgeManually,
   badgesForContact,
   createCoupon,
@@ -18,7 +20,9 @@ import {
   redeemCoupon,
   transferPoints,
   unlockContent,
+  upsertRank,
 } from '../src/services/gamification.js';
+import { upsertPointType } from '../src/services/point-types.js';
 
 let tenant: TestTenant;
 
@@ -195,6 +199,37 @@ describe('ranks', () => {
 });
 
 describe('streaks', () => {
+  it('pays every member, not just the first one that day', async () => {
+    // The award key was `rule:<key>:<streak>:<date>` — no contact — so the
+    // first member to log in each day consumed it and everybody else hit the
+    // borrowed-key guard. That 409 also rolled back their streak row, because
+    // `recordStreak` books the award in the same transaction. Their day
+    // vanished with no error anybody would see.
+    await upsertRule(tenant.id, {
+      key: 'daily_login',
+      name: 'Daily login',
+      event: 'streak',
+      points: 5,
+      enabled: true,
+    });
+
+    const first = await member('first@example.com');
+    const second = await member('second@example.com');
+    const third = await member('third@example.com');
+
+    for (const contact of [first, second, third]) {
+      const result = await recordStreak(tenant.id, contact.id, 'daily_login');
+      expect(result.counted, contact.id).toBe(true);
+      expect(result.pointsAwarded, contact.id).toBe(5);
+    }
+
+    const { rows } = await db().query<{ n: string }>(
+      'SELECT count(*) AS n FROM streaks WHERE tenant_id = $1',
+      [tenant.id],
+    );
+    expect(Number(rows[0]!.n)).toBe(3);
+  });
+
   it('counts a day once, however many times it is recorded', async () => {
     const contact = await member('daily@example.com');
 
@@ -331,6 +366,62 @@ describe('point transfers', () => {
     // Exactly one 60-point transfer can succeed against a 100-point balance.
     expect(senderBalance.balance + recipientBalance.balance).toBe(100);
     expect(recipientBalance.balance).toBe(60);
+  });
+});
+
+describe('moving points is not earning them', () => {
+  it('does not let two accounts climb the ranks passing the same points back and forth', async () => {
+    // `lifetime_earned` drives ranks, `lifetime_points` badges and the
+    // all-time leaderboard, and every award added to it — including the credit
+    // leg of a transfer. Two accounts with a thousand points between them
+    // could reach any rank by sending it to each other.
+    const a = await member('ping@example.com');
+    const b = await member('pong@example.com');
+    await award(tenant.id, {
+      contactId: a.id,
+      points: 1000,
+      reason: 'seed',
+      idempotencyKey: 'ping-seed',
+    });
+
+    for (let round = 0; round < 3; round += 1) {
+      await transferPoints(tenant.id, { fromContactId: a.id, toContactId: b.id, points: 1000 });
+      await transferPoints(tenant.id, { fromContactId: b.id, toContactId: a.id, points: 1000 });
+    }
+
+    const { rows } = await db().query<{
+      contact_id: string; balance: string; lifetime_earned: string; lifetime_spent: string;
+    }>(
+      'SELECT contact_id, balance, lifetime_earned, lifetime_spent FROM points_balances WHERE tenant_id = $1',
+      [tenant.id],
+    );
+    const forA = rows.find((row) => row.contact_id === a.id)!;
+    const forB = rows.find((row) => row.contact_id === b.id);
+
+    // Exactly what they started with, on both sides of the books.
+    expect(Number(forA.balance)).toBe(1000);
+    expect(Number(forA.lifetime_earned)).toBe(1000);
+    expect(Number(forA.lifetime_spent)).toBe(0);
+    if (forB) {
+      expect(Number(forB.lifetime_earned)).toBe(0);
+      expect(Number(forB.lifetime_spent)).toBe(0);
+    }
+  });
+
+  it('keeps transferred points off the windowed leaderboard too', async () => {
+    const a = await member('board-a@example.com');
+    const b = await member('board-b@example.com');
+    await award(tenant.id, {
+      contactId: a.id, points: 500, reason: 'seed', idempotencyKey: 'board-seed',
+    });
+    await transferPoints(tenant.id, { fromContactId: a.id, toContactId: b.id, points: 500 });
+
+    const { leaderboard } = await import('../src/services/rewards.js');
+    const board = await leaderboard(tenant.id, { window: 'month', limit: 10 });
+    // B received 500 this month and earned none of it.
+    expect(board.rows.map((row) => row.contact_id)).not.toContain(b.id);
+    // A earned it, so A is still there.
+    expect(board.rows.map((row) => row.contact_id)).toContain(a.id);
   });
 });
 
@@ -482,5 +573,82 @@ describe('transfers are recorded once (LOW)', () => {
     expect(rows[0]!.total).toBe(succeeded * 100);
     expect((await getBalance(tenant.id, from)).balance).toBe(1000 - succeeded * 100);
     expect((await getBalance(tenant.id, to)).balance).toBe(succeeded * 100);
+  });
+});
+
+describe('the profile reports the rank the member actually holds (MEDIUM)', () => {
+  /**
+   * It re-derived the rank from lifetime_earned against every rank in the
+   * tenant instead of reading what `evaluateRank` decided. That disagreed with
+   * the rest of the system four ways at once, and a member reading their own
+   * profile got the wrong one of the two answers.
+   */
+  it('keeps a rank a support agent pinned by hand', async () => {
+    const contact = (await member('pinned@example.com')).id;
+    await upsertRank(tenant.id, { key: 'bronze', name: 'Bronze', minPoints: 0 });
+    await upsertRank(tenant.id, { key: 'vip', name: 'VIP', minPoints: 100_000 });
+
+    await award(tenant.id, {
+      contactId: contact, points: 10, reason: 'seed', idempotencyKey: 'profile-pin',
+    });
+    await assignRankManually(tenant.id, contact, 'vip');
+
+    const view = await profile(tenant.id, contact);
+    // Manual Mode exists because stores pin a tier no points total explains.
+    expect(view.rank?.key).toBe('vip');
+  });
+
+  it('does not promote anyone into a manual-only tier', async () => {
+    const contact = (await member('manual@example.com')).id;
+    // Its floor sits inside the seeded ladder's Member band (500-2499), so
+    // points alone would otherwise reach it.
+    await upsertRank(tenant.id, {
+      key: 'founder', name: 'Founder', minPoints: 600, manualOnly: true,
+    });
+
+    await award(tenant.id, {
+      contactId: contact, points: 700, reason: 'seed', idempotencyKey: 'profile-manual',
+    });
+    await evaluateRank(tenant.id, contact);
+
+    const view = await profile(tenant.id, contact);
+    expect(view.rank?.key).toBe('member');
+    // And it is not dangled as the next step either.
+    expect(view.next_rank?.key).not.toBe('founder');
+  });
+
+  it('respects a band that has a ceiling', async () => {
+    const contact = (await member('banded@example.com')).id;
+    await upsertRank(tenant.id, { key: 'starter', name: 'Starter', minPoints: 0, maxPoints: 99 });
+    await upsertRank(tenant.id, { key: 'regular', name: 'Regular', minPoints: 100 });
+
+    await award(tenant.id, {
+      contactId: contact, points: 50, reason: 'seed', idempotencyKey: 'profile-band',
+    });
+    await evaluateRank(tenant.id, contact);
+
+    expect((await profile(tenant.id, contact)).rank?.key).toBe('starter');
+  });
+
+  it('answers for the ladder it was asked about', async () => {
+    const contact = (await member('ladders@example.com')).id;
+    await upsertPointType(tenant.id, { key: 'status', name: 'Status' });
+    await upsertRank(tenant.id, { key: 'spender', name: 'Spender', minPoints: 10 });
+    await upsertRank(tenant.id, {
+      key: 'insider', name: 'Insider', minPoints: 10, pointType: 'status',
+    });
+
+    await award(tenant.id, {
+      contactId: contact, points: 50, reason: 'points', idempotencyKey: 'ladder-a',
+    });
+    await award(tenant.id, {
+      contactId: contact, points: 50, reason: 'status', idempotencyKey: 'ladder-b',
+      pointType: 'status',
+    });
+    await evaluateRank(tenant.id, contact);
+    await evaluateRank(tenant.id, contact, undefined, 'status');
+
+    expect((await profile(tenant.id, contact)).rank?.key).toBe('spender');
+    expect((await profile(tenant.id, contact, db(), 'status')).rank?.key).toBe('insider');
   });
 });

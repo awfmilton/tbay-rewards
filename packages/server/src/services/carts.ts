@@ -200,6 +200,28 @@ export async function dueForRecovery(
         -- window permanently. Recovery mail stopped for everybody, quietly,
         -- once 200 of them had accumulated.
         AND ct.marketing_consent
+        -- Consent was the only thing asked. A pause is the same answer said
+        -- more politely -- somebody who set "pause for 30 days" on the
+        -- preference page still got a recovery email an hour later, because
+        -- this leg never looked at it, and neither did the send-time re-check.
+        AND (ct.marketing_paused_until IS NULL OR ct.marketing_paused_until <= now())
+        -- And the topic, when the retailer has defined one for the stage
+        -- template. Same rule mayReceive applies: an explicit preference wins,
+        -- then the topic's default, and a topic that does not exist filters
+        -- nothing.
+        AND NOT EXISTS (
+          SELECT 1
+            FROM email_templates tpl
+            JOIN email_topics top
+              ON top.tenant_id = tpl.tenant_id AND top.key = tpl.topic_key
+            LEFT JOIN contact_topic_prefs pref
+              ON pref.tenant_id = top.tenant_id
+             AND pref.contact_id = ct.id
+             AND pref.topic_key = top.key
+           WHERE tpl.tenant_id = c.tenant_id
+             AND tpl.key = 'cart_recovery_' || (c.recovery_stage + 1)
+             AND COALESCE(pref.subscribed, top.default_on, true) = false
+        )
         AND c.recovery_stage < $1
         AND c.abandoned_at < now() - ((($2::numeric[])[c.recovery_stage + 1]) || ' hours')::interval
       ORDER BY c.abandoned_at

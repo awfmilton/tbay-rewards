@@ -16,6 +16,8 @@ import { runCartRecovery } from '../src/workers/cart-recovery.js';
 import { flushEmailQueue, outbox, setEmailTransport } from '../src/services/email.js';
 import { getTenantById } from '../src/services/tenants.js';
 import { confirmSubscription, subscribe } from '../src/services/newsletter.js';
+import { setPreferences, upsertTopic } from '../src/services/preferences.js';
+import { upsertTemplate } from '../src/services/email.js';
 
 let tenant: TestTenant;
 
@@ -309,5 +311,103 @@ describe('the recovery queue does not stall', () => {
     // may actually email is the one that comes back.
     const due = await dueForRecovery(db(), 2);
     expect(due.map((cart) => cart.recovery_token)).toEqual(['rt-willing']);
+  });
+});
+
+describe('cart recovery asks everything the preference page can say (MEDIUM)', () => {
+  /**
+   * It asked one question -- has this person given marketing consent -- and
+   * treated every other answer as no answer at all. Somebody who chose "pause
+   * for 30 days" on the preference page got a recovery email an hour later,
+   * and so did somebody who had turned that topic off, because neither the
+   * queueing query nor the send-time re-check looked.
+   */
+  it('does not mail somebody who paused their marketing email', async () => {
+    const contact = await consentedContact();
+    await upsertCart(db(), tenant.id, { cartToken: 'cart-1', items: ITEMS, contactId: contact.id });
+    await ageCart('cart-1', 90);
+    // Abandon it first: ageAbandonment backdates abandoned_at, which does not
+    // exist until a sweep has marked the cart. Without this pass the cart is
+    // never due and every assertion below passes for the wrong reason.
+    await runCartRecovery();
+    await ageAbandonment('cart-1', 2);
+
+    await setPreferences(tenant.id, contact.id, { pauseDays: 30 });
+
+    expect((await runCartRecovery()).queued).toBe(0);
+    await flushEmailQueue();
+    expect(outbox()).toHaveLength(0);
+  });
+
+  it('does not mail somebody who turned that topic off', async () => {
+    const contact = await consentedContact();
+    await upsertTopic(tenant.id, { key: 'reminders', name: 'Reminders' });
+    await upsertTemplate(tenant.id, 'cart_recovery_1', {
+      subject: 'You left something behind',
+      html: '<p>Your cart: {{cart_url}}</p>',
+      topicKey: 'reminders',
+    });
+    await setPreferences(tenant.id, contact.id, { topics: { reminders: false } });
+
+    await upsertCart(db(), tenant.id, { cartToken: 'cart-1', items: ITEMS, contactId: contact.id });
+    await ageCart('cart-1', 90);
+    // Abandon it first: ageAbandonment backdates abandoned_at, which does not
+    // exist until a sweep has marked the cart. Without this pass the cart is
+    // never due and every assertion below passes for the wrong reason.
+    await runCartRecovery();
+    await ageAbandonment('cart-1', 2);
+
+    expect((await runCartRecovery()).queued).toBe(0);
+    await flushEmailQueue();
+    expect(outbox()).toHaveLength(0);
+  });
+
+  it('still mails somebody who paused nothing and turned nothing off', async () => {
+    const contact = await consentedContact();
+    await upsertTopic(tenant.id, { key: 'reminders', name: 'Reminders' });
+    await upsertTemplate(tenant.id, 'cart_recovery_1', {
+      subject: 'You left something behind',
+      html: '<p>Your cart: {{cart_url}}</p>',
+      topicKey: 'reminders',
+    });
+
+    await upsertCart(db(), tenant.id, { cartToken: 'cart-1', items: ITEMS, contactId: contact.id });
+    await ageCart('cart-1', 90);
+    // Abandon it first: ageAbandonment backdates abandoned_at, which does not
+    // exist until a sweep has marked the cart. Without this pass the cart is
+    // never due and every assertion below passes for the wrong reason.
+    await runCartRecovery();
+    await ageAbandonment('cart-1', 2);
+
+    expect((await runCartRecovery()).queued).toBe(1);
+    await flushEmailQueue();
+    expect(outbox()).toHaveLength(1);
+  });
+
+  it('stops a message caught in the queue when the answer changes', async () => {
+    // Queued while consented, paused before the queue drained. A large send
+    // sits in the queue for the best part of an hour, and the re-check that
+    // exists for exactly that window only looked at the consent flag.
+    const contact = await consentedContact();
+    await upsertCart(db(), tenant.id, { cartToken: 'cart-1', items: ITEMS, contactId: contact.id });
+    await ageCart('cart-1', 90);
+    // Abandon it first: ageAbandonment backdates abandoned_at, which does not
+    // exist until a sweep has marked the cart. Without this pass the cart is
+    // never due and every assertion below passes for the wrong reason.
+    await runCartRecovery();
+    await ageAbandonment('cart-1', 2);
+    expect((await runCartRecovery()).queued).toBe(1);
+
+    await setPreferences(tenant.id, contact.id, { pauseDays: 30 });
+
+    await flushEmailQueue();
+    expect(outbox()).toHaveLength(0);
+
+    const { rows } = await db().query<{ status: string; error: string | null }>(
+      "SELECT status, error FROM email_messages WHERE tenant_id = $1 AND template_key = 'cart_recovery_1'",
+      [tenant.id],
+    );
+    expect(rows[0]!.status).toBe('suppressed');
+    expect(rows[0]!.error).toMatch(/paused/i);
   });
 });

@@ -49,9 +49,40 @@ export function loadConfig() {
       identitySalt: str('IDENTITY_SALT', 'dev-identity-salt-change-me'),
       /** Signs attribution cookies and opt-in tokens. */
       tokenSecret: str('TOKEN_SECRET', 'dev-token-secret-change-me'),
-      /** Requests per minute per tenant on the ingest endpoints. */
+      /** Requests per minute per visitor on the ingest endpoints. */
       ingestRatePerMinute: num('INGEST_RATE_PER_MINUTE', 600),
+      /**
+       * Requests per minute per client address on the ingest endpoints.
+       *
+       * The ceiling above the per-visitor bucket. A visitor id is whatever the
+       * caller types in the body, so a bucket keyed on one alone is not a limit
+       * at all -- rotate the id and every request opens a fresh allowance. This
+       * is the part of the key the caller cannot choose, so it is the part that
+       * actually bounds them.
+       *
+       * Generous on purpose: the tracker flushes about every 8 seconds, so an
+       * office behind one NAT address still fits a few hundred people before
+       * anyone notices. Lower it if you front the API with a CDN that already
+       * does this.
+       */
+      ingestRatePerAddressPerMinute: num('INGEST_RATE_PER_ADDRESS_PER_MINUTE', 3_000),
       adminRatePerMinute: num('ADMIN_RATE_PER_MINUTE', 300),
+      /**
+       * How many reverse-proxy hops sit in front of this process.
+       *
+       * X-Forwarded-For is a header, so anyone can send one; what makes the
+       * left-hand entries trustworthy is a proxy that appends to them. nginx's
+       * $proxy_add_x_forwarded_for -- the line in docs/DEPLOYMENT.md -- appends
+       * the peer address to whatever arrived, so `X-Forwarded-For: 1.2.3.4`
+       * from a caller becomes `1.2.3.4, <their real address>`. Trusting the
+       * whole chain therefore reads the client's own claim, which is how a
+       * rate limit, an audit trail and a consent record all come to record a
+       * number the caller chose.
+       *
+       * Counted from this process outwards: 1 for the documented single proxy,
+       * 2 behind Cloudflare in front of nginx, 0 when nothing is in front.
+       */
+      trustProxyHops: num('TRUST_PROXY_HOPS', 1),
     },
 
     tracking: {

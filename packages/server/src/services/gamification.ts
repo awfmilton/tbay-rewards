@@ -1,6 +1,6 @@
 import { db, queryOne, withTransaction, type Queryable } from '../db/pool.js';
 import { ApiError } from '../lib/errors.js';
-import { award, getBalance, reverse, spend, type Balance } from './points.js';
+import { award, getBalance, holdContact, reverse, spend, type Balance } from './points.js';
 import { tenantTimezone, trigger } from './rewards.js';
 import { randomToken } from '../lib/crypto.js';
 import {
@@ -941,6 +941,46 @@ export async function reevaluateAll(
   return { contacts, promoted, badgesAwarded };
 }
 
+/**
+ * The rank a contact holds on one ladder, without writing anything.
+ *
+ * The single definition of the answer. `profile` used to derive its own from
+ * lifetime_earned against every rank in the tenant, which disagreed with this
+ * four ways: it ignored a rank pinned by hand, promoted people into
+ * manual_only tiers, ignored a band's max_points ceiling, and mixed the
+ * ladders of different point types together. A member reading their profile
+ * and a support agent reading the same account saw different answers.
+ */
+export async function rankFor(
+  tenantId: string,
+  contactId: string,
+  runner: Queryable = db(),
+  pointType?: string | null,
+): Promise<Rank | null> {
+  const type = await resolvePointType(tenantId, pointType, runner);
+
+  // A hand-assigned rank is a decision, not a calculation.
+  const pinned = await queryOne<{ rank_locked: boolean }>(
+    runner,
+    `SELECT rank_locked FROM points_balances
+      WHERE tenant_id = $1 AND contact_id = $2 AND point_type = $3`,
+    [tenantId, contactId, type.key],
+  );
+  if (pinned?.rank_locked) return currentRank(tenantId, contactId, runner, type.key);
+
+  const balance = await getBalance(tenantId, contactId, runner, type.key);
+  return queryOne<Rank>(
+    runner,
+    `SELECT * FROM ranks
+      WHERE tenant_id = $1 AND point_type = $3 AND enabled AND NOT manual_only
+        AND min_points <= $2
+        AND (max_points IS NULL OR max_points >= $2)
+      ORDER BY min_points DESC
+      LIMIT 1`,
+    [tenantId, balance.lifetime_earned, type.key],
+  );
+}
+
 export async function evaluateRank(
   tenantId: string,
   contactId: string,
@@ -950,32 +990,18 @@ export async function evaluateRank(
   const run = async (client: Queryable) => {
     const type = await resolvePointType(tenantId, pointType, client);
 
-    // A hand-assigned rank is a decision, not a calculation. myCred's Manual
-    // Mode exists because stores pin a VIP tier that no points total explains,
-    // and an automatic re-evaluation quietly undoing that is the bug.
-    const pinned = await queryOne<{ rank_locked: boolean }>(
+    // myCred's Manual Mode exists because stores pin a VIP tier that no points
+    // total explains, and an automatic re-evaluation quietly undoing that is
+    // the bug. rankFor knows that, and everything else about which rank
+    // applies; this function only decides whether to write it down.
+    const pinnedRow = await queryOne<{ rank_locked: boolean }>(
       client,
       `SELECT rank_locked FROM points_balances
         WHERE tenant_id = $1 AND contact_id = $2 AND point_type = $3`,
       [tenantId, contactId, type.key],
     );
-    if (pinned?.rank_locked) {
-      const held = await currentRank(tenantId, contactId, client, type.key);
-      return { rank: held, promoted: false };
-    }
-
-    const balance = await getBalance(tenantId, contactId, client, type.key);
-
-    const rank = await queryOne<Rank>(
-      client,
-      `SELECT * FROM ranks
-        WHERE tenant_id = $1 AND point_type = $3 AND enabled AND NOT manual_only
-          AND min_points <= $2
-          AND (max_points IS NULL OR max_points >= $2)
-        ORDER BY min_points DESC
-        LIMIT 1`,
-      [tenantId, balance.lifetime_earned, type.key],
-    );
+    const rank = await rankFor(tenantId, contactId, client, type.key);
+    if (pinnedRow?.rank_locked) return { rank, promoted: false };
     if (!rank) return { rank: null, promoted: false };
 
     const current = await queryOne<{ current_rank_id: string | null }>(
@@ -1044,6 +1070,13 @@ export async function recordStreak(
   runner?: Queryable,
 ): Promise<{ streak: Streak; counted: boolean; pointsAwarded: number }> {
   const run = async (client: Queryable) => {
+    // Before the streak row, because a rule may pay out and `award` takes the
+    // contact. Taking the streak first put this opposite a merge -- contact,
+    // then streaks -- which deadlocked two rounds in sixteen, and the loser,
+    // arriving after the merge had finished, failed on the foreign key instead
+    // because the contact it was writing for no longer existed.
+    await holdContact(client, tenantId, contactId);
+
     const existing = await queryOne<Streak>(
       client,
       `SELECT current_length, longest_length, total_days, last_day::text AS last_day
@@ -1193,14 +1226,23 @@ export async function transferPoints(
     // be handed to another member is not status, it is a second wallet.
     const type = await assertTransferable(tenantId, input.pointType, client);
 
-    // Lock both balances up front, in contact_id order.
+    // Both contacts, then both balances, each in contact_id order.
     //
     // `spend` locks the sender and `award` locks the recipient, so A sending to
     // B at the same moment B sends to A took the two locks in opposite orders
     // and deadlocked. A canonical order makes that impossible; the rows may not
     // exist yet, which is harmless — whichever transaction creates one wins and
     // the other sees it.
+    //
+    // The contacts have to come first for the same reason. Reaching for the
+    // balances and only then letting `spend` hold the contact put this the
+    // wrong way round against a merge, which takes the contact and then the
+    // balance: one round in sixteen deadlocked.
     const pair = [input.fromContactId, input.toContactId].sort();
+    for (const contactId of pair) {
+      await holdContact(client, tenantId, contactId);
+    }
+
     await client.query(
       `SELECT contact_id FROM points_balances
         WHERE tenant_id = $1 AND contact_id = ANY($2::uuid[]) AND point_type = $3
@@ -1257,6 +1299,8 @@ export async function transferPoints(
         refId: reference,
         idempotencyKey: `transfer-out:${reference}`,
         pointType: type.key,
+        // Moving points is not redeeming them; see `countsAsEarned`.
+        countsAsSpent: false,
         meta: { to_contact_id: input.toContactId, message: input.message ?? '' },
       },
       client,
@@ -1272,6 +1316,10 @@ export async function transferPoints(
         refId: reference,
         idempotencyKey: `transfer-in:${reference}`,
         pointType: type.key,
+        // Points that arrived, not points earned. Counting them let two
+        // accounts pass the same thousand back and forth to the top of the
+        // leaderboard and up every rank, having earned nothing.
+        countsAsEarned: false,
         meta: { from_contact_id: input.fromContactId, message: input.message ?? '' },
       },
       client,
@@ -1633,19 +1681,31 @@ export async function profile(
   tenantId: string,
   contactId: string,
   runner: Queryable = db(),
+  pointType?: string | null,
 ): Promise<GamificationProfile> {
-  const balance = await getBalance(tenantId, contactId, runner);
-  const ranks = await listRanks(tenantId, runner);
+  const type = await resolvePointType(tenantId, pointType, runner);
+  const balance = await getBalance(tenantId, contactId, runner, type.key);
 
-  const current =
-    [...ranks]
-      .filter((rank) => rank.enabled && rank.min_points <= balance.lifetime_earned)
-      .sort((a, b) => b.min_points - a.min_points)[0] ?? null;
+  // The rank this person actually holds, read rather than recomputed.
+  //
+  // This used to re-derive it from lifetime_earned against every rank in the
+  // tenant, which disagreed with `evaluateRank` four ways: it ignored a rank
+  // pinned by hand (rank_locked), promoted people into manual_only tiers they
+  // were never meant to reach, ignored a band's max_points ceiling, and mixed
+  // the ladders of every point type together. A member looking at their
+  // profile and a support agent looking at the same account saw different
+  // answers, and the profile's was the wrong one.
+  const current = await rankFor(tenantId, contactId, runner, type.key);
 
-  const next =
-    ranks
-      .filter((rank) => rank.enabled && rank.min_points > balance.lifetime_earned)
-      .sort((a, b) => a.min_points - b.min_points)[0] ?? null;
+  const next = await queryOne<Rank>(
+    runner,
+    `SELECT * FROM ranks
+      WHERE tenant_id = $1 AND point_type = $3 AND enabled AND NOT manual_only
+        AND min_points > $2
+      ORDER BY min_points
+      LIMIT 1`,
+    [tenantId, balance.lifetime_earned, type.key],
+  );
 
   const { rows: streaks } = await runner.query<{
     key: string;

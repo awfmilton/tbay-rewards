@@ -22,6 +22,9 @@ import {
   setRetentionPolicy,
 } from '../src/services/privacy.js';
 import { upsertPointType } from '../src/services/point-types.js';
+import { flushEmailQueue, outbox, queueEmail, setEmailTransport } from '../src/services/email.js';
+import { unsubscribeRequestUrl } from '../src/services/newsletter.js';
+import { preferencesUrl } from '../src/services/preferences.js';
 
 let tenant: TestTenant;
 
@@ -629,6 +632,54 @@ describe('retention deletes what the policy names, and no more', () => {
     expect(Number(left[0]!.n)).toBe(1);
   });
 
+  it('still sweeps a session that has no events to protect (MEDIUM)', async () => {
+    // Guarding the events turned into guarding everything: the leg was gated
+    // on an event policy existing at all, so a retailer who set sessions to
+    // thirty days and left events alone deleted nothing -- not even sessions
+    // with nothing in them to lose. The sweep reported no numbers either, so
+    // it looked like there was simply nothing to do.
+    const { runRetentionSweep } = await import('../src/services/privacy.js');
+    await authed('PUT', '/v1/privacy/retention', { sessionDays: 1, eventDays: null });
+
+    const { rows: visitor } = await db().query<{ id: string }>(
+      `INSERT INTO visitors (tenant_id, anon_id) VALUES ($1, gen_random_uuid()::text)
+       RETURNING id`,
+      [tenant.id],
+    );
+    // One empty session, and one that still holds an event we are keeping.
+    await db().query(
+      `INSERT INTO sessions (tenant_id, visitor_id, client_session_id, started_at, last_event_at)
+       VALUES ($1, $2, 'cs-empty', now() - interval '90 days', now() - interval '90 days')`,
+      [tenant.id, visitor[0]!.id],
+    );
+    const { rows: withEvent } = await db().query<{ id: string }>(
+      `INSERT INTO sessions (tenant_id, visitor_id, client_session_id, started_at, last_event_at)
+       VALUES ($1, $2, 'cs-full', now() - interval '90 days', now() - interval '90 days')
+       RETURNING id`,
+      [tenant.id, visitor[0]!.id],
+    );
+    await db().query(
+      `INSERT INTO events (tenant_id, session_id, type, occurred_at)
+       VALUES ($1, $2, 'pageview', now() - interval '90 days')`,
+      [tenant.id, withEvent[0]!.id],
+    );
+
+    const swept = await runRetentionSweep();
+
+    expect(swept.sessions).toBe(1);
+    const { rows: left } = await db().query<{ client_session_id: string }>(
+      'SELECT client_session_id FROM sessions WHERE tenant_id = $1',
+      [tenant.id],
+    );
+    expect(left.map((row) => row.client_session_id)).toEqual(['cs-full']);
+    // And the event it was protecting is still there.
+    const { rows: events } = await db().query<{ n: string }>(
+      'SELECT count(*) AS n FROM events WHERE tenant_id = $1',
+      [tenant.id],
+    );
+    expect(Number(events[0]!.n)).toBe(1);
+  });
+
   it('removes the session once its events are out of retention too', async () => {
     const { runRetentionSweep } = await import('../src/services/privacy.js');
     await authed('PUT', '/v1/privacy/retention', { sessionDays: 30, eventDays: 30 });
@@ -658,5 +709,172 @@ describe('retention deletes what the policy names, and no more', () => {
       [tenant.id],
     );
     expect(Number(left[0]!.n)).toBe(0);
+  });
+});
+
+describe('an erased address does not survive in a click-tracked link (HIGH)', () => {
+  /**
+   * The sweep above searches for the address in plaintext, which is exactly
+   * why this got past it. Every marketing body carries {{unsubscribe_url}} and
+   * {{preferences_url}}; the click tracker rewrote both because the exclusion
+   * list named `/n/confirm` and `/n/unsubscribe` while the real routes are
+   * `/n/u/` and `/n/prefs/`; and the token in each is base64url JSON with the
+   * address inside it. So `email_messages.tracked_links` held the erased
+   * person's address, keyed by their contact id, decodable by anyone with the
+   * row and no key at all.
+   */
+  it('never wraps a consent link in the first place', async () => {
+    const contact = await upsertContact(tenant.id, {
+      email: 'tracked@example.com',
+      marketingConsent: true,
+    });
+
+    const unsubscribeUrl = unsubscribeRequestUrl(tenant.id, 'tracked@example.com');
+    const preferenceUrl = preferencesUrl(tenant.id, 'tracked@example.com');
+    await queueEmail({
+      tenantId: tenant.id,
+      contactId: contact.id,
+      templateKey: 'promo',
+      to: 'tracked@example.com',
+      subject: 'Sale',
+      html: `<p><a href="https://shop.example/sale">Shop</a>
+             <a href="${unsubscribeUrl}">Unsubscribe</a>
+             <a href="${preferenceUrl}">Preferences</a></p>`,
+      dedupeKey: 'tracked-1',
+      track: true,
+      unsubscribeUrl,
+    });
+
+    const { rows } = await db().query<{ tracked_links: string[]; html: string }>(
+      'SELECT tracked_links, html FROM email_messages WHERE tenant_id = $1',
+      [tenant.id],
+    );
+
+    // The shop link is tracked; neither consent link is.
+    expect(rows[0]!.tracked_links).toEqual(['https://shop.example/sale']);
+    // And the unsubscribe link in the body still points straight at us, so
+    // one-click unsubscribe does not depend on the redirect service being up.
+    expect(rows[0]!.html).toContain(unsubscribeUrl);
+  });
+
+  it('leaves nothing decodable behind after an erasure', async () => {
+    const email = 'decodable@example.com';
+    const contact = await upsertContact(tenant.id, { email, marketingConsent: true });
+
+    // A message whose tracked links do carry tokens, as any older row would.
+    await queueEmail({
+      tenantId: tenant.id,
+      contactId: contact.id,
+      templateKey: 'promo',
+      to: email,
+      subject: 'Sale',
+      html: '<p><a href="https://shop.example/sale">Shop</a></p>',
+      dedupeKey: 'decodable-1',
+      track: true,
+      unsubscribeUrl: unsubscribeRequestUrl(tenant.id, email),
+    });
+    await db().query(
+      `UPDATE email_messages
+          SET tracked_links = $2::jsonb, status = 'sent'
+        WHERE tenant_id = $1`,
+      [
+        tenant.id,
+        JSON.stringify([
+          'https://shop.example/sale',
+          unsubscribeRequestUrl(tenant.id, email),
+          preferencesUrl(tenant.id, email),
+        ]),
+      ],
+    );
+
+    await eraseContact(tenant.id, contact.id);
+
+    const { rows } = await db().query<{ tracked_links: unknown; tracking_token: string | null }>(
+      'SELECT tracked_links, tracking_token FROM email_messages WHERE tenant_id = $1',
+      [tenant.id],
+    );
+    expect(rows[0]!.tracked_links).toEqual([]);
+    expect(rows[0]!.tracking_token).toBeNull();
+
+    // Decode every base64url run left anywhere in the row, not just the
+    // plaintext: hiding in an encoding is how this got past the sweep.
+    const { rows: all } = await db().query<Record<string, unknown>>(
+      'SELECT * FROM email_messages WHERE tenant_id = $1',
+      [tenant.id],
+    );
+    const blob = JSON.stringify(all);
+    for (const candidate of blob.match(/[A-Za-z0-9_-]{16,}/g) ?? []) {
+      let decoded = '';
+      try {
+        decoded = Buffer.from(candidate, 'base64url').toString('utf8');
+      } catch {
+        continue;
+      }
+      expect(decoded).not.toContain(email);
+    }
+  });
+
+  it('does not hand the transport an erased recipient', async () => {
+    // A message still queued when the erasure ran had its to_email blanked and
+    // was left queued, so the next flush asked SMTP to deliver to "" -- which
+    // answers "No recipients defined", retries, and writes a suppression row
+    // keyed on the empty string.
+    const contact = await upsertContact(tenant.id, { email: 'inflight@example.com' });
+    await queueEmail({
+      tenantId: tenant.id,
+      contactId: contact.id,
+      templateKey: 'receipt',
+      to: 'inflight@example.com',
+      subject: 'Your order',
+      html: '<p>Thanks</p>',
+      dedupeKey: 'inflight-erase',
+    });
+
+    await eraseContact(tenant.id, contact.id);
+
+    setEmailTransport(null);
+    outbox().length = 0;
+    expect(await flushEmailQueue(50)).toBe(0);
+    expect(outbox()).toHaveLength(0);
+
+    const { rows } = await db().query<{ status: string; error: string | null }>(
+      'SELECT status, error FROM email_messages WHERE tenant_id = $1',
+      [tenant.id],
+    );
+    expect(rows[0]!.status).toBe('suppressed');
+    expect(rows[0]!.error).toBe('Contact erased');
+  });
+});
+
+describe('the erase request does not log the address it erased (MEDIUM)', () => {
+  it('records the contact id, not what the operator typed', async () => {
+    // eraseContact rewrites audit targets inside its transaction, but this
+    // request's own audit row is written by the onResponse hook afterwards --
+    // so the one action guaranteed to mention the address was the one entry
+    // the scrub could never reach.
+    const email = 'audited@example.com';
+    await authed('POST', '/v1/contacts', { email });
+    await authed('POST', '/v1/privacy/erase', { email });
+
+    // The audit row is written in an onResponse hook, which runs after the
+    // response is delivered -- so it may not be there the instant inject()
+    // resolves. Wait for it rather than assuming.
+    let rows: Array<{ action: string; target: string | null }> = [];
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      rows = (
+        await db().query<{ action: string; target: string | null }>(
+          'SELECT action, target FROM audit_log WHERE tenant_id = $1',
+          [tenant.id],
+        )
+      ).rows;
+      if (rows.some((row) => row.action.includes('/v1/privacy/erase'))) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+
+    expect(rows.length).toBeGreaterThan(0);
+    for (const row of rows) {
+      expect(row.target ?? '').not.toContain(email);
+    }
+    expect(rows.some((row) => row.action.includes('/v1/privacy/erase'))).toBe(true);
   });
 });

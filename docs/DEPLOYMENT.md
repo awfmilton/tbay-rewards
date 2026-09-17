@@ -83,12 +83,21 @@ server {
     location / {
         proxy_pass http://127.0.0.1:4000;
         proxy_set_header Host              $host;
-        # The app trusts one proxy hop for the client IP.
+        # $proxy_add_x_forwarded_for appends the peer address to any header
+        # the caller already sent, so the rightmost entry is the only one
+        # nginx wrote. TRUST_PROXY_HOPS=1 (the default) tells the app to read
+        # that one and ignore whatever the caller put to its left.
         proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 }
 ```
+
+Set `TRUST_PROXY_HOPS` to the number of proxies actually in front of the app —
+1 here, 2 behind Cloudflare in front of nginx, 0 with nothing in front. Setting
+it higher than the real number hands the client address to the caller: they
+send their own `X-Forwarded-For`, and that is what lands in the rate limiter,
+the audit log and consent records.
 
 Behind Cloudflare, `CF-IPCountry` is read automatically for country reporting.
 

@@ -14,6 +14,14 @@ interface Window {
 const windows = new Map<string, Window>();
 let lastSweep = Date.now();
 
+/**
+ * Sweep on size as well as on time, so a burst of distinct keys inside one
+ * window cannot grow the map unchecked between scheduled sweeps. The tenant
+ * and address ceilings bound how many keys a caller can mint, so this is
+ * belt-and-braces rather than the actual defence.
+ */
+const SWEEP_AT_SIZE = 50_000;
+
 export interface RateLimitResult {
   allowed: boolean;
   remaining: number;
@@ -24,7 +32,7 @@ export function rateLimit(key: string, limit: number, windowMs = 60_000): RateLi
   const now = Date.now();
 
   // Amortised cleanup so the map cannot grow without bound.
-  if (now - lastSweep > windowMs) {
+  if (now - lastSweep > windowMs || windows.size > SWEEP_AT_SIZE) {
     for (const [existing, window] of windows) {
       if (window.resetAt <= now) windows.delete(existing);
     }

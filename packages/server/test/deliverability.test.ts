@@ -221,7 +221,11 @@ describe('consent is re-checked when the message actually goes', () => {
       "SELECT status, error FROM email_messages WHERE dedupe_key = 'late-unsub-1'",
     );
     expect(rows[0]!.status).toBe('suppressed');
-    expect(rows[0]!.error).toMatch(/consent_withdrawn/);
+    // The reason is now whichever answer the preference centre actually holds
+    // -- no_consent, paused or topic_off -- rather than one word covering all
+    // three, because the send-time re-check asks the same question the queue
+    // did instead of only reading the consent flag.
+    expect(rows[0]!.error).toMatch(/no_consent/);
   });
 
   it('still sends a receipt to somebody who unsubscribed from marketing', async () => {
@@ -386,5 +390,182 @@ describe('two workers do not send the same message twice', () => {
 
     expect(await flushEmailQueue(50)).toBe(0);
     expect(outbox()).toHaveLength(0);
+  });
+});
+
+describe('a stale worker cannot undo a delivery that already happened', () => {
+  it('ignores a late failure from a worker whose claim was taken away', async () => {
+    // The stall that produces this is ordinary: nodemailer's default socket
+    // timeout is ten minutes, twice the claim window, so a relay that accepts
+    // the connection and goes quiet mid-conversation is exactly it. Worker A
+    // is still waiting, B reclaims the row and delivers, then A's send finally
+    // fails -- and its `WHERE id = $1` wrote 'queued' over B's 'sent'. The
+    // next tick sent the message a second time.
+    await queueEmail({
+      tenantId: tenant.id,
+      templateKey: 'stale-writer',
+      to: 'stale@example.com',
+      subject: 'Exactly once',
+      html: '<p>Exactly once</p>',
+      dedupeKey: 'stale-writer-1',
+    });
+
+    const delivered: string[] = [];
+    let releaseWorkerA: (() => void) | null = null;
+    const workerAIsSending = new Promise<void>((resolve) => {
+      setEmailTransport({
+        async send(message) {
+          if (releaseWorkerA === null) {
+            // Worker A: hangs, then fails, like a relay that went quiet.
+            await new Promise<void>((release) => {
+              releaseWorkerA = release;
+              resolve();
+            });
+            throw new Error('550 5.7.1 Message blocked');
+          }
+          delivered.push(message.to);
+          return { providerId: `b-${delivered.length}` };
+        },
+      });
+    });
+
+    const workerA = flushEmailQueue(50);
+    await workerAIsSending;
+
+    // A's send outlives the claim window, so B is entitled to take the row.
+    await db().query(
+      `UPDATE email_messages SET claimed_at = now() - interval '6 minutes'
+        WHERE tenant_id = $1`,
+      [tenant.id],
+    );
+    expect(await flushEmailQueue(50)).toBe(1);
+    expect(delivered).toEqual(['stale@example.com']);
+
+    // Now A's send finally rejects and A writes what it believes happened.
+    releaseWorkerA!();
+    await workerA;
+
+    const { rows } = await db().query<{ status: string; error: string | null }>(
+      'SELECT status, error FROM email_messages WHERE tenant_id = $1',
+      [tenant.id],
+    );
+    expect(rows[0]!.status).toBe('sent');
+    expect(rows[0]!.error).toBeNull();
+
+    // And nothing is left for the next tick to send a second time.
+    expect(await flushEmailQueue(50)).toBe(0);
+    expect(delivered).toEqual(['stale@example.com']);
+  });
+
+  it('fails a message whose worker died on every one of its attempts', async () => {
+    // Each stale reclaim spends an attempt. Once they ran out, the claim's
+    // `attempts < MAX` skipped the row and nothing else looked at `sending`ever
+    // again: never sent, never failed, no error, and invisible to the retailer
+    // on a queue screen that only counts 'queued' and 'failed'.
+    await queueEmail({
+      tenantId: tenant.id,
+      templateKey: 'stuck',
+      to: 'stuck@example.com',
+      subject: 'Went nowhere',
+      html: '<p>Went nowhere</p>',
+      dedupeKey: 'stuck-1',
+    });
+    await db().query(
+      `UPDATE email_messages
+          SET status = 'sending', attempts = 99, claimed_at = now() - interval '6 minutes'
+        WHERE tenant_id = $1`,
+      [tenant.id],
+    );
+
+    setEmailTransport(null);
+    outbox().length = 0;
+    expect(await flushEmailQueue(50)).toBe(0);
+
+    const { rows } = await db().query<{ status: string; error: string | null }>(
+      'SELECT status, error FROM email_messages WHERE tenant_id = $1',
+      [tenant.id],
+    );
+    expect(rows[0]!.status).toBe('failed');
+    expect(rows[0]!.error).toMatch(/stopped responding/i);
+  });
+
+  it('does not reap a claim that is merely recent', async () => {
+    await queueEmail({
+      tenantId: tenant.id,
+      templateKey: 'busy',
+      to: 'busy@example.com',
+      subject: 'In flight',
+      html: '<p>In flight</p>',
+      dedupeKey: 'busy-1',
+    });
+    await db().query(
+      `UPDATE email_messages SET status = 'sending', attempts = 99, claimed_at = now()
+        WHERE tenant_id = $1`,
+      [tenant.id],
+    );
+
+    await flushEmailQueue(50);
+
+    const { rows } = await db().query<{ status: string }>(
+      'SELECT status FROM email_messages WHERE tenant_id = $1',
+      [tenant.id],
+    );
+    expect(rows[0]!.status).toBe('sending');
+  });
+});
+
+describe('a hung relay is our fault, not the recipient\'s', () => {
+  it('reads nodemailer\'s own timeout messages as transport failures', () => {
+    // Raised as a bare `Error('Timeout')` with the detail only in `err.code`.
+    // Classified on the message alone these looked like the recipient
+    // refusing us, so a quiet relay spent the attempt budget and suppressed
+    // the address for thirty days.
+    expect(classifyFailure('Timeout')).toBe('transport');
+    expect(classifyFailure('Timeout (ETIMEDOUT)')).toBe('transport');
+    expect(classifyFailure('Greeting never received')).toBe('transport');
+    expect(classifyFailure('Connection timeout')).toBe('transport');
+
+    // Still a real refusal when the far end actually says so.
+    expect(classifyFailure('550 5.1.1 no such user')).toBe('hard');
+  });
+
+  it('gives a blocked address hours to recover, not a quarter of an hour', async () => {
+    // 1, 2, 4, 8 minutes spent every attempt inside fifteen minutes, so an
+    // afternoon on a blocklist ended in a thirty-day suppression.
+    setEmailTransport({
+      async send() {
+        throw new Error('550 5.7.1 Our system has detected that this message is likely unsolicited mail; blocked');
+      },
+    });
+    await queueEmail({
+      tenantId: tenant.id,
+      templateKey: 'blocked',
+      to: 'blocked@example.com',
+      subject: 'Throttled',
+      html: '<p>Throttled</p>',
+      dedupeKey: 'blocked-1',
+    });
+
+    const waits: number[] = [];
+    for (let pass = 0; pass < 6; pass += 1) {
+      await flushEmailQueue(50);
+      const { rows } = await db().query<{ status: string; wait: string }>(
+        `SELECT status,
+                EXTRACT(EPOCH FROM (next_attempt_at - now()))::int::text AS wait
+           FROM email_messages WHERE tenant_id = $1`,
+        [tenant.id],
+      );
+      if (rows[0]!.status === 'failed') break;
+      waits.push(Number(rows[0]!.wait));
+      await db().query(
+        `UPDATE email_messages SET next_attempt_at = now() WHERE tenant_id = $1`,
+        [tenant.id],
+      );
+    }
+
+    // Five backoffs before giving up, and they add up to most of a day rather
+    // than to a coffee break.
+    expect(waits.length).toBeGreaterThanOrEqual(5);
+    expect(waits.reduce((a, b) => a + b, 0)).toBeGreaterThan(17 * 60 * 60);
   });
 });

@@ -173,6 +173,22 @@ describe('full customer journey', () => {
       headers: { 'user-agent': DESKTOP_UA },
     });
 
+    // The redirect alone pays nothing: it knows an address and a user agent,
+    // which cannot tell a stranger from the sharer in a private window. The
+    // credit lands when the landing page's tracker reports who arrived.
+    const clicker = ids();
+    await app.inject({
+      method: 'POST',
+      url: '/v1/collect',
+      headers: { 'x-tbay-key': tenant.publicKey, 'user-agent': DESKTOP_UA },
+      payload: {
+        visitor: clicker.visitor,
+        session: clicker.session,
+        url: 'https://shop.example.com/product/flag',
+        events: [{ type: 'share_click', linkCode: share.json().link_code }],
+      },
+    });
+
     balance = await authed('GET', `/v1/rewards/balance?contactId=${contactId}`);
     expect(balance.json().points.balance).toBe(125); // + 25 for the verified share
 
@@ -229,7 +245,10 @@ describe('full customer journey', () => {
 
     // 6. The reports reflect all of it.
     const reports = await authed('GET', '/v1/reports/overview');
-    expect(reports.json().overview).toMatchObject({ sessions: 1, orders: 1, revenue_cents: 4999 });
+    // Two sessions: the customer's own, and the person who arrived through
+    // their share. That second visit is the whole point of a share, and it is
+    // what earns the 25 points above.
+    expect(reports.json().overview).toMatchObject({ sessions: 2, orders: 1, revenue_cents: 4999 });
 
     const sources = await authed('GET', '/v1/reports/sources');
     expect(sources.json().sources[0]).toMatchObject({ source: 'instagram', medium: 'social', orders: 1 });

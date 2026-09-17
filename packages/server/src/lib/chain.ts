@@ -288,6 +288,13 @@ export function tokensToWei(tokens: number): bigint {
   if (!Number.isFinite(tokens) || tokens < 0) {
     throw ApiError.badRequest('amount must be a positive number');
   }
+  // Above 2^53 a double cannot hold whole numbers exactly, so the wei figure
+  // would be quietly wrong rather than merely large. Refuse it and say so,
+  // rather than minting an amount nobody asked for. TBAY's whole supply is a
+  // million, so nothing legitimate is anywhere near this.
+  if (tokens > Number.MAX_SAFE_INTEGER) {
+    throw ApiError.badRequest('amount is too large to represent exactly');
+  }
 
   const plain = toPlainDecimal(tokens);
   const [whole, fraction = ''] = plain.split('.');
@@ -299,9 +306,34 @@ function toPlainDecimal(value: number): string {
   const rendered = String(value);
   if (!rendered.includes('e') && !rendered.includes('E')) return rendered;
 
-  // toFixed(20) covers everything down to 1e-20; anything smaller is dust far
-  // below a single wei anyway.
-  return value.toFixed(20).replace(/0+$/, '').replace(/\.$/, '');
+  // Expanded by hand, in both directions.
+  //
+  // `toFixed(20)` was doing this, and it does not: the spec says toFixed
+  // returns String(x) unchanged once |x| >= 1e21, so the exponent survived and
+  // the replace chain then chewed on it. `1.5e21` came out as
+  // "5e+210000000000000" -- not an error, a different number, saved from being
+  // minted only because BigInt happened to reject the letter e.
+  const [mantissa, exponentText] = rendered.toLowerCase().split('e');
+  const exponent = Number(exponentText);
+  const negative = mantissa!.startsWith('-');
+  const [whole, fraction = ''] = mantissa!.replace(/^[+-]/, '').split('.');
+
+  let plain: string;
+  if (exponent >= 0) {
+    const shift = exponent - fraction.length;
+    plain =
+      shift >= 0
+        ? whole! + fraction + '0'.repeat(shift)
+        : `${whole!}${fraction.slice(0, exponent)}.${fraction.slice(exponent)}`;
+  } else {
+    const zeros = -exponent - whole!.length;
+    plain =
+      zeros >= 0
+        ? `0.${'0'.repeat(zeros)}${whole!}${fraction}`
+        : `${whole!.slice(0, exponent)}.${whole!.slice(exponent)}${fraction}`;
+  }
+
+  return negative ? `-${plain}` : plain;
 }
 
 export function weiToTokenString(wei: bigint, decimals = 6): string {

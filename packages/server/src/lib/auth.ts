@@ -34,16 +34,36 @@ export async function requirePublicKey(request: FastifyRequest): Promise<Tenant>
   const tenant = await resolvePublicKey(key);
   if (!tenant) throw ApiError.unauthorized('Unknown or revoked site key');
 
-  // Keyed per client, not per tenant. A tenant-wide bucket divided the whole
-  // allowance across every visitor at once: at the tracker's 8-second flush,
-  // the default 600/minute is 80 concurrent visitors for the entire store, and
-  // the tracker drops a 429 silently. The limit is there to stop one abusive
-  // client, so it belongs on the client.
-  const limit = rateLimit(
-    `ingest:${tenant.id}:${clientFingerprint(request)}`,
-    config().security.ingestRatePerMinute,
+  // Two buckets, because neither key works alone.
+  //
+  // Per tenant is too coarse: one allowance split across every visitor at once
+  // means, at the tracker's 8-second flush, that the default 600/minute is 80
+  // concurrent visitors for the entire store, and the tracker drops a 429
+  // silently. Per visitor is not a limit at all: the id comes out of the
+  // request body, so rotating it buys unlimited throughput -- measured at
+  // 800/800 requests through a 600/minute bucket.
+  //
+  // So the address, which the caller cannot choose, carries the ceiling, and
+  // the visitor id only subdivides it. Behind NAT everyone shares the ceiling
+  // but gets their own small bucket; rotating the id now just fills the
+  // address bucket faster.
+  const security = config().security;
+  const address = clientIp(request);
+
+  const addressLimit = rateLimit(
+    `ingest:${tenant.id}:i:${address}`,
+    security.ingestRatePerAddressPerMinute,
   );
-  if (!limit.allowed) throw ApiError.tooManyRequests();
+  if (!addressLimit.allowed) throw ApiError.tooManyRequests();
+
+  const visitor = visitorKey(request);
+  if (visitor !== null) {
+    const visitorLimit = rateLimit(
+      `ingest:${tenant.id}:i:${address}:a:${visitor}`,
+      security.ingestRatePerMinute,
+    );
+    if (!visitorLimit.allowed) throw ApiError.tooManyRequests();
+  }
 
   request.tenant = tenant;
   request.authScope = 'public';
@@ -76,30 +96,29 @@ export function tenantOf(request: FastifyRequest): Tenant {
   return request.tenant;
 }
 
-/** Client IP, trusting one layer of reverse proxy. */
+/**
+ * The client address.
+ *
+ * Reads request.ip rather than the header, because Fastify resolves that
+ * against the configured number of trusted proxy hops. Taking the leftmost
+ * X-Forwarded-For entry by hand -- which this used to do -- returns whatever
+ * the caller put there: nginx appends to the header rather than replacing it,
+ * so the left-hand end is the client's own claim. See
+ * config.security.trustProxyHops.
+ */
 export function clientIp(request: FastifyRequest): string {
-  const forwarded = request.headers['x-forwarded-for'];
-  if (typeof forwarded === 'string' && forwarded.length > 0) {
-    return forwarded.split(',')[0]!.trim();
-  }
   return request.ip;
 }
 
 /**
- * A best-effort per-client key for rate limiting.
+ * The visitor id the tracker sent, when it sent a usable one.
  *
- * The visitor id when the tracker sends one, falling back to the peer address.
- * Neither is trustworthy on its own — a visitor id is client-supplied and an
- * IP is shared behind NAT — but the tenant bucket above bounds total abuse, so
- * this only has to stop one client from spending everyone else's allowance.
+ * Only ever used to subdivide an address bucket, never as a bucket of its own:
+ * it is a string from the request body, so a caller who wants more allowance
+ * writes a different one. Rotating it used to buy unlimited throughput.
  */
-function clientFingerprint(request: FastifyRequest): string {
+function visitorKey(request: FastifyRequest): string | null {
   const body = request.body as Record<string, unknown> | undefined;
   const anonId = typeof body?.anonId === 'string' ? body.anonId : null;
-  if (anonId && anonId.length <= 64) return `a:${anonId}`;
-
-  const forwarded = request.headers['x-forwarded-for'];
-  const first = Array.isArray(forwarded) ? forwarded[0] : forwarded;
-  const ip = (first ?? '').split(',')[0]?.trim() || request.ip;
-  return `i:${ip}`;
+  return anonId !== null && anonId !== '' && anonId.length <= 64 ? anonId : null;
 }

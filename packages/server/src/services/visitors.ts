@@ -193,14 +193,32 @@ async function maybeRecordReferral(
   visitorId: string,
   contactId: string,
 ): Promise<void> {
-  const touch = await queryOne<{ link_code: string | null }>(
+  const touch = await queryOne<{ link_code: string | null; occurred_at: Date }>(
     runner,
-    `SELECT link_code FROM touchpoints
+    `SELECT link_code, occurred_at FROM touchpoints
       WHERE tenant_id = $1 AND visitor_id = $2 AND link_code IS NOT NULL
       ORDER BY occurred_at ASC LIMIT 1`,
     [tenantId, visitorId],
   );
   if (!touch?.link_code) return;
+
+  // The referee has to be somebody the link actually brought.
+  //
+  // This runs from `/v1/identify`, which takes the public site key — the one
+  // in every page's source — and any email address the caller types. Without
+  // this check, clicking a member's own referral link and then identifying as
+  // an existing customer attached a referral to that customer and paid the
+  // member for "introducing" somebody the store had known for years. The whole
+  // customer list could be harvested that way, one address at a time.
+  //
+  // A contact that predates the click was not brought by it. That is the whole
+  // rule, and it is the same rule a person would apply reading the two rows.
+  const referee = await queryOne<{ created_at: Date }>(
+    runner,
+    'SELECT created_at FROM contacts WHERE tenant_id = $1 AND id = $2',
+    [tenantId, contactId],
+  );
+  if (!referee || referee.created_at < touch.occurred_at) return;
 
   const link = await queryOne<{ id: string; owner_contact_id: string | null; kind: string }>(
     runner,

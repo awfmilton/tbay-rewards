@@ -32,8 +32,19 @@ export interface TrackingPlan {
 
 const HREF = /(<a\b[^>]*?\bhref\s*=\s*)(["'])(.*?)\2/gi;
 
-/** Paths that are ours and must never be wrapped, whatever the host. */
-const PLATFORM_PATHS = /^\/(?:n\/(?:confirm|unsubscribe)|e\/)/;
+/**
+ * Paths that are ours and must never be wrapped, whatever the host.
+ *
+ * The whole `/n/` namespace, not a list of the endpoints under it. Naming them
+ * individually missed two that were added later: `{{unsubscribe_url}}` renders
+ * as `/n/u/<token>` and `{{preferences_url}}` as `/n/prefs/<token>`, so every
+ * marketing email in the product had its unsubscribe link wrapped by the click
+ * tracker. That put the customer's opt-out behind a redirect, recorded
+ * unsubscribing as engagement, and -- because those tokens carry the address
+ * in plaintext -- left the address in `tracked_links` where erasure did not
+ * reach it. Anything under `/n/` is consent machinery by definition.
+ */
+const PLATFORM_PATHS = /^\/(?:n\/|e\/)/;
 
 /**
  * Should this href be rewritten?

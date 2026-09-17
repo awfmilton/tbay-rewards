@@ -162,10 +162,16 @@ export async function collect(
 
       if (event.productRef) {
         if (event.product) {
-          await upsertProduct(client, tenant.id, {
-            productRef: event.productRef,
-            ...event.product,
-          });
+          await upsertProduct(
+            client,
+            tenant.id,
+            { productRef: event.productRef, ...event.product },
+            // The site key is in every page's source, so these details are
+            // whatever the caller sent. Enough to introduce a product nobody
+            // has seen before; never enough to restate one the store already
+            // has -- least of all its categories, which decide what it earns.
+            { fillOnly: true },
+          );
         }
         const metric = productMetricFor(event.type);
         if (metric) {

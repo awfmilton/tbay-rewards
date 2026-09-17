@@ -48,6 +48,18 @@ export interface AwardInput {
   /** Which currency. Omit for the tenant's default. */
   pointType?: string;
   meta?: Record<string, unknown>;
+
+  /**
+   * Does this count as points the person *earned*?
+   *
+   * True for everything the rewards programme pays. False for points that
+   * merely arrived — a transfer from another member moves value, it does not
+   * create it. Counting one inflated `lifetime_earned`, which drives ranks,
+   * `lifetime_points` badges and the all-time leaderboard: two accounts
+   * passing the same thousand points back and forth climbed to the top
+   * without earning anything.
+   */
+  countsAsEarned?: boolean;
 }
 
 export interface AwardResult {
@@ -141,15 +153,25 @@ export async function getBalances(
  * Shared, so concurrent awards do not queue behind each other; only a merge,
  * which takes the row exclusively, waits or is waited for.
  */
-async function holdContact(
+export async function holdContact(
   client: Queryable,
   tenantId: string,
   contactId: string,
 ): Promise<void> {
-  await client.query(
+  const { rowCount } = await client.query(
     'SELECT 1 FROM contacts WHERE tenant_id = $1 AND id = $2 FOR SHARE',
     [tenantId, contactId],
   );
+
+  // No row means the contact was merged away or erased while this request was
+  // in flight -- FOR SHARE has nothing to wait on once the row is gone, so the
+  // caller would otherwise carry on writing rows that point at nobody and fail
+  // several statements later on a foreign key, naming a constraint instead of
+  // the thing that actually happened. This is the last moment the answer is
+  // still simple.
+  if (rowCount === 0) {
+    throw ApiError.notFound('That contact no longer exists — it may have just been merged');
+  }
 }
 
 export async function award(
@@ -230,7 +252,7 @@ export async function award(
       {
         balance: status === 'cleared' ? input.points : 0,
         pending: status === 'pending' ? input.points : 0,
-        earned: input.points,
+        earned: input.countsAsEarned === false ? 0 : input.points,
         spent: 0,
       },
       pointType,
@@ -263,6 +285,14 @@ export interface SpendInput {
   /** Which currency. Omit for the tenant's default. */
   pointType?: string;
   meta?: Record<string, unknown>;
+  /**
+   * Does this count as points the person *spent*?
+   *
+   * The mirror of `countsAsEarned`: sending points to another member moves
+   * value rather than redeeming it, so counting it would let the same
+   * thousand points inflate both sides of the books indefinitely.
+   */
+  countsAsSpent?: boolean;
 }
 
 /**
@@ -346,7 +376,12 @@ export async function spend(
       client,
       tenantId,
       input.contactId,
-      { balance: -input.points, pending: 0, earned: 0, spent: input.points },
+      {
+        balance: -input.points,
+        pending: 0,
+        earned: 0,
+        spent: input.countsAsSpent === false ? 0 : input.points,
+      },
       pointType,
     );
 
@@ -485,37 +520,65 @@ export async function reverse(
 /** Move matured `pending` awards into the spendable balance. */
 export async function releaseMaturedPoints(runner: Queryable = db()): Promise<number> {
   return withTransactionIfPool(runner, async (client) => {
-    const { rows } = await client.query<{
-      id: string;
-      tenant_id: string;
-      contact_id: string;
-      point_type: string;
-      delta_points: number;
-    }>(
-      `UPDATE points_ledger SET status = 'cleared'
-        WHERE id IN (
-          SELECT id FROM points_ledger
-           WHERE status = 'pending' AND available_at <= now()
-           ORDER BY available_at
-           LIMIT 500
-           FOR UPDATE SKIP LOCKED
-        )
-        RETURNING id, tenant_id, contact_id, point_type, delta_points`,
+    // Who has something to release, decided before anything is locked.
+    //
+    // Claiming the ledger rows first and only then reaching for the contact
+    // inverted the order the rest of the system locks in -- contact, balance,
+    // ledger -- so this sweep and a merge running at the same time each held
+    // what the other was waiting for. Four rounds in sixteen deadlocked.
+    // Reading first costs one extra query and puts the sweep back in line.
+    const { rows: owners } = await client.query<{ tenant_id: string; contact_id: string }>(
+      `SELECT DISTINCT tenant_id, contact_id
+         FROM points_ledger
+        WHERE status = 'pending' AND available_at <= now()
+        ORDER BY tenant_id, contact_id
+        LIMIT 200`,
     );
 
-    for (const row of rows) {
-      // Same ordering as everywhere else. This sweep already holds the ledger
-      // rows it claimed, so without it a merge holding those contacts would
-      // wait on the ledger while this waited on the balances.
-      await holdContact(client, row.tenant_id, row.contact_id);
-      await applyToBalance(client, row.tenant_id, row.contact_id, {
-        balance: row.delta_points,
-        pending: -row.delta_points,
-        earned: 0,
-        spent: 0,
-      }, row.point_type);
+    let released = 0;
+    for (const owner of owners) {
+      // A contact that was merged away between the read above and this hold is
+      // skipped, not fatal: the merge moved their ledger rows to the keeper, so
+      // the next pass releases them under the new owner. A sweep is not a
+      // request -- dropping 199 other people's points because one of them was
+      // merged a moment ago would be the worse answer.
+      const stillThere = await client.query(
+        'SELECT 1 FROM contacts WHERE tenant_id = $1 AND id = $2 FOR SHARE',
+        [owner.tenant_id, owner.contact_id],
+      );
+      if (stillThere.rowCount === 0) continue;
+
+      const { rows } = await client.query<{
+        id: string;
+        tenant_id: string;
+        contact_id: string;
+        point_type: string;
+        delta_points: number;
+      }>(
+        `UPDATE points_ledger SET status = 'cleared'
+          WHERE id IN (
+            SELECT id FROM points_ledger
+             WHERE tenant_id = $1 AND contact_id = $2
+               AND status = 'pending' AND available_at <= now()
+             ORDER BY available_at
+             LIMIT 500
+             FOR UPDATE SKIP LOCKED
+          )
+          RETURNING id, tenant_id, contact_id, point_type, delta_points`,
+        [owner.tenant_id, owner.contact_id],
+      );
+
+      for (const row of rows) {
+        await applyToBalance(client, row.tenant_id, row.contact_id, {
+          balance: row.delta_points,
+          pending: -row.delta_points,
+          earned: 0,
+          spent: 0,
+        }, row.point_type);
+      }
+      released += rows.length;
     }
-    return rows.length;
+    return released;
   });
 }
 

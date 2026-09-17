@@ -101,13 +101,38 @@ export async function subscribe(
   const run = async (client: Queryable): Promise<SubscribeResult> => {
     const list = await ensureList(tenant.id, input.listSlug ?? DEFAULT_LIST_SLUG, 'Newsletter', client);
 
+    // Has this person already said no?
+    //
+    // On a single-opt-in list, subscribing granted consent outright -- so a
+    // form in the page source, callable by anyone with the address, undid an
+    // unsubscribe that the person had made deliberately. The form may still
+    // invite them back; it may not answer for them. Confirming by email is
+    // exactly the right instrument: a returning subscriber clicks the link, a
+    // stranger typing somebody else's address accomplishes one email and no
+    // consent at all.
+    const priorOptOut = await client.query(
+      `SELECT 1
+         FROM subscriptions s
+         JOIN contacts c ON c.id = s.contact_id
+        WHERE c.tenant_id = $1 AND c.email_normalised = lower($2)
+          AND s.status IN ('unsubscribed', 'complained')
+        UNION ALL
+       SELECT 1
+         FROM contacts c
+        WHERE c.tenant_id = $1 AND c.email_normalised = lower($2)
+          AND c.marketing_consent = false AND c.consent_at IS NOT NULL
+        LIMIT 1`,
+      [tenant.id, email],
+    );
+    const mustConfirm = list.double_optin || (priorOptOut.rowCount ?? 0) > 0;
+
     const contact = await upsertContact(
       tenant.id,
       {
         email,
         name: input.name ?? null,
         attributes: input.attributes ?? {},
-        marketingConsent: !list.double_optin,
+        marketingConsent: !mustConfirm,
         consentSource: input.source ?? 'newsletter_form',
       },
       client,
@@ -137,7 +162,7 @@ export async function subscribe(
 
     const confirmToken = randomToken(24);
     const unsubToken = randomToken(24);
-    const needsConfirmation = list.double_optin;
+    const needsConfirmation = mustConfirm;
 
     const subscription = await queryOne<Subscription>(
       client,

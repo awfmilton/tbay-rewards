@@ -10,8 +10,8 @@ import {
   type TestTenant,
 } from './helpers.js';
 import { upsertContact } from '../src/services/contacts.js';
-import { award, getBalance, reverse, spend } from '../src/services/points.js';
-import { recordOrder } from '../src/services/commissions.js';
+import { award, getBalance, releaseMaturedPoints, reverse, spend } from '../src/services/points.js';
+import { recordOrder, refundOrder } from '../src/services/commissions.js';
 import { getTenantById } from '../src/services/tenants.js';
 import { findDuplicates, mergeContacts, previewMerge } from '../src/services/merge.js';
 import { upsertPointType } from '../src/services/point-types.js';
@@ -19,6 +19,7 @@ import { setFieldValues, upsertField } from '../src/services/contact-fields.js';
 import {
   awardBadgeManually,
   recordStreak,
+  transferPoints,
   upsertBadge,
 } from '../src/services/gamification.js';
 import { eraseContact } from '../src/services/privacy.js';
@@ -605,5 +606,110 @@ describe('a merge and a spend at the same moment', () => {
       [tenant.id, loser],
     );
     expect(left).toHaveLength(0);
+  });
+});
+
+describe('every writer reaches for the contact before anything else', () => {
+  /**
+   * The ordering rule the merge depends on: contact, then balance, then
+   * ledger. Five writers still broke it -- a refund took the order row first,
+   * a transfer the balances, the maturity sweep the ledger, a streak its own
+   * streaks row -- and each of them deadlocked against a merge often enough to
+   * see in sixteen tries.
+   *
+   * Tested by holding the contact and watching each writer stop there, rather
+   * than by racing: a race that passes tells you nothing about the next run.
+   */
+  async function blocksOnTheContact(
+    contactId: string,
+    start: () => Promise<unknown>,
+  ): Promise<string> {
+    const holder = await db().connect();
+    try {
+      await holder.query('BEGIN');
+      await holder.query('SELECT 1 FROM contacts WHERE tenant_id = $1 AND id = $2 FOR UPDATE', [
+        tenant.id,
+        contactId,
+      ]);
+
+      const running = start().catch(() => 'failed');
+      const outcome = await Promise.race([
+        running.then(() => 'finished'),
+        new Promise<string>((resolve) => setTimeout(() => resolve('waited'), 600)),
+      ]);
+
+      await holder.query('ROLLBACK');
+      await running;
+      return outcome;
+    } finally {
+      holder.release();
+    }
+  }
+
+  it('makes a refund wait for the contact, not the order row', async () => {
+    const contact = await upsertContact(tenant.id, { email: 'refund-order@example.com' });
+    const tenantRow = (await getTenantById(tenant.id))!;
+    await recordOrder(tenantRow, {
+      orderRef: 'lock-refund',
+      totalCents: 5_000,
+      contactId: contact.id,
+      email: 'refund-order@example.com',
+    });
+
+    expect(await blocksOnTheContact(contact.id, () =>
+      refundOrder(tenantRow, 'lock-refund'),
+    )).toBe('waited');
+  });
+
+  it('makes a transfer wait for the contact, not the balances', async () => {
+    const from = await upsertContact(tenant.id, { email: 'from@example.com' });
+    const to = await upsertContact(tenant.id, { email: 'to@example.com' });
+    await award(tenant.id, {
+      contactId: from.id, points: 500, reason: 'seed', idempotencyKey: 'lock-transfer-seed',
+    });
+
+    expect(await blocksOnTheContact(from.id, () =>
+      transferPoints(tenant.id, { fromContactId: from.id, toContactId: to.id, points: 100 }),
+    )).toBe('waited');
+  });
+
+  it('makes a streak wait for the contact, not the streaks row', async () => {
+    const contact = await upsertContact(tenant.id, { email: 'streaker@example.com' });
+
+    expect(await blocksOnTheContact(contact.id, () =>
+      recordStreak(tenant.id, contact.id, 'daily_login'),
+    )).toBe('waited');
+  });
+
+  it('makes the maturity sweep wait for the contact, not the ledger', async () => {
+    const contact = await upsertContact(tenant.id, { email: 'maturing@example.com' });
+    await award(tenant.id, {
+      contactId: contact.id,
+      points: 300,
+      reason: 'held',
+      idempotencyKey: 'lock-release-seed',
+      holdSeconds: 0,
+    });
+    await db().query(
+      `UPDATE points_ledger SET status = 'pending', available_at = now() - interval '1 minute'
+        WHERE tenant_id = $1 AND contact_id = $2`,
+      [tenant.id, contact.id],
+    );
+
+    expect(await blocksOnTheContact(contact.id, () => releaseMaturedPoints())).toBe('waited');
+  });
+
+  it('says what happened when the contact was merged away mid-flight', async () => {
+    // FOR SHARE has nothing to wait on once the row is gone, so the writer
+    // carried on and failed several statements later on a foreign key --
+    // reporting a constraint name to somebody who just wanted to know why
+    // their points did not arrive.
+    const keep = await upsertContact(tenant.id, { email: 'keeper@example.com' });
+    const loser = await upsertContact(tenant.id, { email: 'goner@example.com' });
+    await mergeContacts(tenant.id, keep.id, loser.id);
+
+    await expect(recordStreak(tenant.id, loser.id, 'daily_login')).rejects.toThrow(
+      /no longer exists/i,
+    );
   });
 });

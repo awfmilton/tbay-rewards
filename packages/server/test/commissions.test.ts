@@ -342,7 +342,7 @@ describe('attribution from browsing', () => {
 });
 
 describe('social shares', () => {
-  it('pays only once someone actually clicks the shared link', async () => {
+  it('pays only once somebody else actually lands on the shared link', async () => {
     const sharer = await upsertContact(tenant.id, { email: 'sharer@example.com' });
     const tenantRow = await tenantObject();
 
@@ -362,6 +362,25 @@ describe('social shares', () => {
       method: 'GET',
       url: `/r/${share.link.code}`,
       headers: { 'user-agent': DESKTOP_UA },
+    });
+
+    // Nor does the redirect. It knows an address and a user agent and nothing
+    // else, so it cannot tell a stranger from the sharer in a private window
+    // -- and one click is all a share needs to be paid.
+    expect((await getBalance(tenant.id, sharer.id)).balance).toBe(0);
+
+    // The landing page's tracker is the first thing that knows who arrived.
+    const { visitor, session } = ids();
+    await app.inject({
+      method: 'POST',
+      url: '/v1/collect',
+      headers: { 'x-tbay-key': tenant.publicKey, 'user-agent': DESKTOP_UA },
+      payload: {
+        visitor,
+        session,
+        url: 'https://shop.example.com/product/flag',
+        events: [{ type: 'share_click', linkCode: share.link.code }],
+      },
     });
 
     expect((await getBalance(tenant.id, sharer.id)).balance).toBe(25);
@@ -395,7 +414,19 @@ describe('social shares', () => {
 
     const app = await testApp();
     for (let i = 0; i < 4; i += 1) {
+      const { visitor, session } = ids();
       await app.inject({ method: 'GET', url: `/r/${share.link.code}`, headers: { 'user-agent': DESKTOP_UA } });
+      await app.inject({
+        method: 'POST',
+        url: '/v1/collect',
+        headers: { 'x-tbay-key': tenant.publicKey, 'user-agent': DESKTOP_UA },
+        payload: {
+          visitor,
+          session,
+          url: 'https://shop.example.com/product/flag',
+          events: [{ type: 'share_click', linkCode: share.link.code }],
+        },
+      });
     }
 
     expect((await getBalance(tenant.id, sharer.id)).balance).toBe(25);
@@ -410,5 +441,80 @@ describe('social shares', () => {
         targetUrl: 'https://shop.example.com/',
       }),
     ).rejects.toMatchObject({ statusCode: 400 });
+  });
+});
+
+describe('a refund takes back what the order paid out (MEDIUM)', () => {
+  it('unwinds the referral bonus its qualifying order earned', async () => {
+    // Refer yourself, place an order, collect the referrer's bonus, refund the
+    // order. The purchase points went back; the 250-point referral bonus did
+    // not, because it is keyed on the referral rather than on the order. The
+    // loop paid out every time it was run.
+    const referrer = await upsertContact(tenant.id, { email: 'referrer@example.com' });
+    const referee = await upsertContact(tenant.id, { email: 'referee@example.com' });
+    await db().query(
+      `INSERT INTO referrals (tenant_id, referrer_contact_id, referee_contact_id, status)
+       VALUES ($1, $2, $3, 'pending')`,
+      [tenant.id, referrer.id, referee.id],
+    );
+
+    const tenantRow = await tenantObject();
+    await recordOrder(tenantRow, {
+      orderRef: 'referred-1',
+      totalCents: 5_000,
+      contactId: referee.id,
+      email: 'referee@example.com',
+    });
+
+    // Measured as a change, because qualifying also earns the referrer a
+    // badge -- which a refund leaves alone, the same way it leaves the buyer's
+    // first-purchase badge alone.
+    const earned = await getBalance(tenant.id, referrer.id);
+    const held = earned.balance + earned.pending;
+    expect(held).toBeGreaterThanOrEqual(250);
+
+    await refundOrder(tenantRow, 'referred-1');
+
+    const after = await getBalance(tenant.id, referrer.id);
+    expect(after.balance + after.pending).toBe(held - 250);
+
+    const { rows } = await db().query<{ status: string }>(
+      'SELECT status FROM referrals WHERE tenant_id = $1',
+      [tenant.id],
+    );
+    expect(rows[0]!.status).toBe('pending');
+  });
+
+  it('leaves the referral alone when another order still stands', async () => {
+    // One kept order is reason enough for the referral on its own.
+    const referrer = await upsertContact(tenant.id, { email: 'referrer2@example.com' });
+    const referee = await upsertContact(tenant.id, { email: 'referee2@example.com' });
+    await db().query(
+      `INSERT INTO referrals (tenant_id, referrer_contact_id, referee_contact_id, status)
+       VALUES ($1, $2, $3, 'pending')`,
+      [tenant.id, referrer.id, referee.id],
+    );
+
+    const tenantRow = await tenantObject();
+    await recordOrder(tenantRow, {
+      orderRef: 'referred-2a', totalCents: 5_000, contactId: referee.id, email: 'referee2@example.com',
+    });
+    await recordOrder(tenantRow, {
+      orderRef: 'referred-2b', totalCents: 3_000, contactId: referee.id, email: 'referee2@example.com',
+    });
+
+    const before = await getBalance(tenant.id, referrer.id);
+    const held = before.balance + before.pending;
+
+    await refundOrder(tenantRow, 'referred-2a');
+
+    const after = await getBalance(tenant.id, referrer.id);
+    expect(after.balance + after.pending).toBe(held);
+
+    const { rows } = await db().query<{ status: string }>(
+      'SELECT status FROM referrals WHERE tenant_id = $1',
+      [tenant.id],
+    );
+    expect(rows[0]!.status).toBe('qualified');
   });
 });

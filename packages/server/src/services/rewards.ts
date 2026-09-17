@@ -502,7 +502,15 @@ export async function trigger(
         ruleKey: rule.key,
         refType: input.refType ?? 'reward_rule',
         refId: input.refId,
-        idempotencyKey: `rule:${rule.key}:${input.refId}`,
+        // The contact is part of the key.
+        //
+        // Without it, any rule whose `refId` is not already unique per person
+        // became one award for the whole store. A streak's ref is
+        // `<key>:<date>`, so the first member to log in each day was paid and
+        // every other member hit the borrowed-key guard — a 409 that, because
+        // `recordStreak` runs the award in its own transaction, also rolled
+        // back their streak. Their day simply vanished.
+        idempotencyKey: `rule:${rule.key}:${input.contactId}:${input.refId}`,
         holdSeconds: rule.hold_seconds,
         pointType: rule.point_type,
         meta: input.meta,
@@ -646,6 +654,11 @@ export async function leaderboard(
             AND l.point_type = $2
             AND l.delta_points > 0
             AND l.status <> 'reversed'
+            -- Points that arrived from another member are not points earned
+            -- this month, for the same reason they do not count towards a
+            -- rank: otherwise a pair of accounts tops the board by passing the
+            -- same points back and forth.
+            AND (l.ref_type IS DISTINCT FROM 'transfer')
             AND l.created_at >= date_trunc($3, now())
             AND ${notExcluded}
           GROUP BY l.contact_id, c.name
