@@ -53,6 +53,57 @@ async function keyFor(role: 'owner' | 'manager' | 'support' | 'readonly'): Promi
   return JSON.parse(res.body).secret as string;
 }
 
+describe('the guard matches the route, not the spelling', () => {
+  it('refuses an owner-only route however the path is encoded', async () => {
+    // The router percent-decodes before it dispatches, so `/v1/%6beys` reached
+    // the `/v1/keys` handler while the guard — matching the raw target —
+    // saw no rule and fell through to "a write needs manager". A manager
+    // minted itself an owner key through it.
+    const manager = await keyFor('manager');
+
+    for (const path of ['/v1/keys', '/v1/%6beys', '/v1/ke%79s', '/v1/%6B%65%79%73']) {
+      const res = await call(manager, 'POST', path, { label: 'sneaky', role: 'owner' });
+      expect(res.statusCode, path).toBe(403);
+    }
+
+    for (const path of ['/v1/operators', '/v1/%6fperators']) {
+      expect((await call(manager, 'GET', path)).statusCode, path).toBe(403);
+    }
+
+    for (const path of ['/v1/settings', '/v1/%73ettings']) {
+      const res = await call(manager, 'PUT', path, { transferMinimum: 5 });
+      expect(res.statusCode, path).toBe(403);
+    }
+  });
+
+  it('records the route it matched, not what the caller typed', async () => {
+    // An encoded path written into the audit log verbatim is an entry nobody
+    // searching for the real one will find.
+    const manager = await keyFor('manager');
+    await call(manager, 'POST', '/v1/%6beys', { label: 'sneaky', role: 'owner' });
+
+    const { rows } = await db().query<{ action: string }>(
+      "SELECT action FROM audit_log WHERE tenant_id = $1 AND action LIKE '%keys%'",
+      [tenant.id],
+    );
+    expect(rows.map((row) => row.action)).toContain('POST /v1/keys');
+  });
+
+  it('still lets each role do its own work', async () => {
+    const manager = await keyFor('manager');
+    const support = await keyFor('support');
+    const readonly = await keyFor('readonly');
+
+    expect((await call(manager, 'POST', '/v1/contacts', { email: 'm@example.com' })).statusCode)
+      .toBe(200);
+    expect((await call(support, 'POST', '/v1/contacts', { email: 's@example.com' })).statusCode)
+      .toBe(200);
+    expect((await call(readonly, 'GET', '/v1/contacts/fields')).statusCode).toBe(200);
+    expect((await call(readonly, 'POST', '/v1/contacts', { email: 'r@example.com' })).statusCode)
+      .toBe(403);
+  });
+});
+
 describe('the role ladder', () => {
   it('contains everything below it', () => {
     expect(atLeast('owner', 'manager')).toBe(true);

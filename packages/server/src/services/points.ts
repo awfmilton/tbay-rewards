@@ -117,6 +117,33 @@ export async function getBalances(
 }
 
 /** Credit points. Re-running with the same idempotency key is a no-op. */
+/**
+ * Hold the contact still while their points move.
+ *
+ * A merge locks the two contact rows, then sums their balances and moves their
+ * ledger entries onto the survivor. Award and spend lock the *balance* row, so
+ * nothing made the two serialise against each other: a spend that landed
+ * between the merge reading a balance and moving the ledger left the survivor
+ * with a balance that no longer equalled its own history — spendable points
+ * that were never earned. An award landing after the move went onto a contact
+ * row about to be deleted, and vanished with it.
+ *
+ * Shared, so concurrent awards for different people, or for the same person,
+ * do not queue behind each other; only a merge, which takes the row
+ * exclusively, waits or is waited for. Taken before any balance lock, so the
+ * two paths acquire in the same order and cannot deadlock.
+ */
+async function holdContact(
+  client: Queryable,
+  tenantId: string,
+  contactId: string,
+): Promise<void> {
+  await client.query(
+    'SELECT 1 FROM contacts WHERE tenant_id = $1 AND id = $2 FOR SHARE',
+    [tenantId, contactId],
+  );
+}
+
 export async function award(
   tenantId: string,
   input: AwardInput,
@@ -127,6 +154,8 @@ export async function award(
   }
 
   const run = async (client: Queryable): Promise<AwardResult> => {
+    await holdContact(client, tenantId, input.contactId);
+
     const hold = Math.max(0, input.holdSeconds ?? 0);
     const status = hold > 0 ? 'pending' : 'cleared';
     const pointType = (await resolvePointType(tenantId, input.pointType, client)).key;
@@ -244,6 +273,8 @@ export async function spend(
   }
 
   const run = async (client: Queryable): Promise<AwardResult> => {
+    await holdContact(client, tenantId, input.contactId);
+
     const pointType = (await resolvePointType(tenantId, input.pointType, client)).key;
 
     const locked = await queryOne<{ balance: number }>(

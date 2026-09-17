@@ -291,29 +291,44 @@ class TBAY_Rewards_Manage {
 	 * Carried in the redirect rather than kept in a transient so two admins
 	 * working at once never see each other's messages.
 	 */
+	/** Where a one-shot notice waits between the POST and the redirect. */
+	private function notice_key(): string {
+		return 'tbay_notice_' . get_current_user_id();
+	}
+
+	/**
+	 * Show what the last action said, once.
+	 *
+	 * Carried in a transient rather than the URL. A message read out of a query
+	 * string is a message anybody can write: a link to
+	 * `…&tbay_msg=Your+key+was+compromised,+email+it+to+support` shows an admin
+	 * whatever the sender chose, in the site's own voice. It was escaped, so
+	 * never a scripting hole — but "the admin screen said so" is most of what a
+	 * convincing pretext needs.
+	 */
 	private function render_notice(): void {
-		$message = isset( $_GET['tbay_msg'] ) ? sanitize_text_field( wp_unslash( $_GET['tbay_msg'] ) ) : '';
-		if ( '' === $message ) {
+		$notice = get_transient( $this->notice_key() );
+		if ( ! is_array( $notice ) || empty( $notice['message'] ) ) {
 			return;
 		}
-		$is_error = isset( $_GET['tbay_err'] ) && '1' === $_GET['tbay_err'];
+		delete_transient( $this->notice_key() );
+
 		printf(
 			'<div class="notice notice-%s is-dismissible"><p>%s</p></div>',
-			$is_error ? 'error' : 'success',
-			esc_html( $message )
+			empty( $notice['error'] ) ? 'success' : 'error',
+			esc_html( (string) $notice['message'] )
 		);
 	}
 
 	private function redirect_back( string $screen, string $message, bool $error = false, array $extra = array() ): void {
+		set_transient(
+			$this->notice_key(),
+			array( 'message' => $message, 'error' => $error ),
+			MINUTE_IN_SECONDS
+		);
+
 		$url = add_query_arg(
-			array_merge(
-				array(
-					'page'     => 'tbay-manage-' . $screen,
-					'tbay_msg' => rawurlencode( $message ),
-					'tbay_err' => $error ? '1' : '0',
-				),
-				$extra
-			),
+			array_merge( array( 'page' => 'tbay-manage-' . $screen ), $extra ),
 			admin_url( 'admin.php' )
 		);
 		wp_safe_redirect( $url );
@@ -1743,7 +1758,15 @@ class TBAY_Rewards_Manage {
 			// they are rendered.
 			$payload['blocks'] = $blocks;
 		} else {
-			$html = isset( $_POST['html'] ) ? wp_kses_post( wp_unslash( $_POST['html'] ) ) : '';
+			// Not `wp_kses_post`. An email is a whole document — `<html>`,
+			// `<head>`, `<style>` — none of which are allowed post tags, so
+			// kses stripped the tags and left the CSS behind as visible text at
+			// the top of every message. It was not buying anything either: this
+			// form needs `manage_options`, which can already edit plugin files,
+			// and the only place the HTML is rendered in wp-admin is the
+			// sandboxed preview iframe.
+			$posted = $_POST['html'] ?? ''; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput
+			$html   = is_string( $posted ) ? trim( wp_unslash( $posted ) ) : '';
 			if ( '' === $html ) {
 				return new WP_Error( 'tbay_bad_input', __( 'An email needs a body.', 'tbay-rewards' ) );
 			}
@@ -2740,8 +2763,15 @@ class TBAY_Rewards_Manage {
 		</form>
 
 		<h2><?php esc_html_e( 'Keys', 'tbay-rewards' ); ?></h2>
-		<?php $issued = $this->query( 'tbay_key' ); ?>
-		<?php if ( '' !== $issued ) : ?>
+		<?php
+		// Shown once and then gone, so a reload or a shared screenshot of the
+		// URL does not carry it.
+		$issued = get_transient( 'tbay_issued_key_' . get_current_user_id() );
+		if ( is_string( $issued ) && '' !== $issued ) {
+			delete_transient( 'tbay_issued_key_' . get_current_user_id() );
+		}
+		?>
+		<?php if ( is_string( $issued ) && '' !== $issued ) : ?>
 			<div class="notice notice-success">
 				<p><strong><?php esc_html_e( 'Copy this now — it is stored as a hash and cannot be shown again.', 'tbay-rewards' ); ?></strong></p>
 				<p><code><?php echo esc_html( $issued ); ?></code></p>
@@ -2921,17 +2951,17 @@ class TBAY_Rewards_Manage {
 			return $result;
 		}
 
-		wp_safe_redirect(
-			add_query_arg(
-				array(
-					'page'     => 'tbay-manage-access',
-					'tbay_msg' => rawurlencode( __( 'Key issued.', 'tbay-rewards' ) ),
-					'tbay_key' => rawurlencode( (string) ( $result['secret'] ?? '' ) ),
-				),
-				admin_url( 'admin.php' )
-			)
+		// Held for this admin for one minute, not put in the URL. A secret in a
+		// query string lands in browser history and in the access log of every
+		// server, proxy and CDN between here and the browser — places nobody
+		// rotates a key out of.
+		set_transient(
+			'tbay_issued_key_' . get_current_user_id(),
+			(string) ( $result['secret'] ?? '' ),
+			MINUTE_IN_SECONDS
 		);
-		exit;
+
+		$this->redirect_back( 'access', __( 'Key issued.', 'tbay-rewards' ) );
 	}
 
 	private function do_revoke_key(): string|WP_Error {

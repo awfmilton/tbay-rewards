@@ -467,3 +467,45 @@ describe('over the API', () => {
     expect(res.statusCode).toBe(400);
   });
 });
+
+describe('a merge and a spend at the same moment', () => {
+  it('leaves the survivor with a balance that equals its own ledger', async () => {
+    // The merge locked the two contact rows; award and spend locked the
+    // balance row. Nothing made the two serialise, so a spend landing between
+    // the merge reading the loser's balance and moving their ledger left the
+    // survivor holding points that were never earned.
+    const keep = (await upsertContact(tenant.id, { email: 'keep-race@example.com' })).id;
+    const loser = (await upsertContact(tenant.id, { email: 'loser-race@example.com' })).id;
+
+    await award(tenant.id, {
+      contactId: loser,
+      points: 100,
+      reason: 'seed',
+      idempotencyKey: 'race-seed',
+    });
+
+    await Promise.allSettled([
+      mergeContacts(tenant.id, { keepId: keep, mergeId: loser }),
+      spend(tenant.id, {
+        contactId: loser,
+        points: 50,
+        reason: 'race spend',
+        idempotencyKey: 'race-spend',
+      }),
+    ]);
+
+    const { rows } = await db().query<{ balance: string; ledger: string }>(
+      `SELECT b.balance,
+              COALESCE((SELECT SUM(l.delta_points) FROM points_ledger l
+                         WHERE l.tenant_id = b.tenant_id AND l.contact_id = b.contact_id
+                           AND l.point_type = b.point_type), 0) AS ledger
+         FROM points_balances b
+        WHERE b.tenant_id = $1 AND b.contact_id = $2`,
+      [tenant.id, keep],
+    );
+
+    for (const row of rows) {
+      expect(Number(row.balance)).toBe(Number(row.ledger));
+    }
+  });
+});

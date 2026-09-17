@@ -360,6 +360,86 @@ describe('a tenant cannot name another tenant’s contact (HIGH)', () => {
   });
 });
 
+describe('the public site key cannot rewrite a known customer (MEDIUM)', () => {
+  // The site key is in every page's source, so anyone who can view source
+  // holds it. Knowing a customer's email was enough to rewrite the retailer's
+  // own record of them — and to add tags, which drive segments, which drive
+  // broadcasts and the visibility of conditional email blocks.
+  const identify = async (body: Record<string, unknown>) =>
+    (await testApp()).inject({
+      method: 'POST',
+      url: '/v1/identify',
+      headers: { 'x-tbay-key': tenant.publicKey },
+      payload: { key: tenant.publicKey, ...body },
+    });
+
+  it('leaves the fields the store already has alone', async () => {
+    await authed('POST', '/v1/contacts', {
+      email: 'known@example.com',
+      name: 'Real Name',
+      phone: '111',
+      tags: ['customer'],
+    });
+
+    const res = await identify({
+      email: 'known@example.com',
+      name: 'HACKED',
+      phone: '66666',
+      tags: ['vip'],
+      attributes: { plan: 'injected' },
+    });
+    expect(res.statusCode).toBe(200);
+
+    const { rows } = await db().query<{
+      name: string; phone: string; tags: string[]; attributes: Record<string, unknown>;
+    }>(
+      "SELECT name, phone, tags, attributes FROM contacts WHERE email_normalised = 'known@example.com'",
+    );
+    expect(rows[0]!.name).toBe('Real Name');
+    expect(rows[0]!.phone).toBe('111');
+    expect(rows[0]!.tags).toEqual(['customer']);
+    expect(rows[0]!.attributes.plan).toBeUndefined();
+  });
+
+  it('still fills in what the store does not have', async () => {
+    // The case this endpoint exists for: somebody logs in for the first time.
+    await authed('POST', '/v1/contacts', { email: 'blank@example.com' });
+
+    await identify({ email: 'blank@example.com', name: 'First Login', phone: '222' });
+
+    const { rows } = await db().query<{ name: string; phone: string }>(
+      "SELECT name, phone FROM contacts WHERE email_normalised = 'blank@example.com'",
+    );
+    expect(rows[0]!.name).toBe('First Login');
+    expect(rows[0]!.phone).toBe('222');
+  });
+
+  it('still introduces somebody the store has never seen', async () => {
+    const res = await identify({ email: 'brand-new@example.com', name: 'New Person' });
+    expect(res.statusCode).toBe(200);
+
+    const { rows } = await db().query<{ name: string }>(
+      "SELECT name FROM contacts WHERE email_normalised = 'brand-new@example.com'",
+    );
+    expect(rows[0]!.name).toBe('New Person');
+  });
+
+  it('applies the same rule to the newsletter form', async () => {
+    await authed('POST', '/v1/contacts', { email: 'sub@example.com', name: 'Subscriber' });
+    await (await testApp()).inject({
+      method: 'POST',
+      url: '/v1/newsletter/subscribe',
+      headers: { 'x-tbay-key': tenant.publicKey },
+      payload: { key: tenant.publicKey, email: 'sub@example.com', name: 'OVERWRITTEN' },
+    });
+
+    const { rows } = await db().query<{ name: string }>(
+      "SELECT name FROM contacts WHERE email_normalised = 'sub@example.com'",
+    );
+    expect(rows[0]!.name).toBe('Subscriber');
+  });
+});
+
 describe('the public site key cannot rewrite reward roles (HIGH)', () => {
   const identify = async (attributes: unknown) =>
     (await testApp()).inject({
@@ -404,7 +484,10 @@ describe('the public site key cannot rewrite reward roles (HIGH)', () => {
     expect(order.points_awarded).toBe(0);
   });
 
-  it('keeps other attributes while dropping the reserved one', async () => {
+  it('writes no attribute at all onto a contact the store already has', async () => {
+    // Stronger than stripping the reserved key: attributes drive segments the
+    // same way tags do, so an unauthenticated assertion about somebody the
+    // store already knows changes nothing about them.
     expect((await identify({ roles: [], plan: 'gold' })).statusCode).toBe(200);
     expect(await rolesOf()).toEqual(['administrator']);
 
@@ -413,7 +496,29 @@ describe('the public site key cannot rewrite reward roles (HIGH)', () => {
         WHERE tenant_id = $1 AND email = 'staff@example.com'`,
       [tenant.id],
     );
+    expect(rows[0]!.plan).toBeNull();
+  });
+
+  it('still carries attributes when it introduces somebody new', async () => {
+    // The first-touch case this endpoint exists for. There is no prior record
+    // to corrupt, and `roles` is still stripped.
+    await (await testApp()).inject({
+      method: 'POST',
+      url: '/v1/identify',
+      payload: {
+        key: tenant.publicKey,
+        email: 'fresh@example.com',
+        attributes: { roles: ['administrator'], plan: 'gold' },
+      },
+    });
+
+    const { rows } = await db().query(
+      `SELECT attributes ->> 'plan' AS plan, attributes -> 'roles' AS roles
+         FROM contacts WHERE tenant_id = $1 AND email = 'fresh@example.com'`,
+      [tenant.id],
+    );
     expect(rows[0]!.plan).toBe('gold');
+    expect(rows[0]!.roles).toBeNull();
   });
 
   it('survives a roles value that is not an array, whatever wrote it', async () => {

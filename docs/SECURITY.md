@@ -81,6 +81,33 @@ Verification requires a real Transfer to the retailer's payout wallet, from the
 declared sender, for at least the promised amount, with confirmations.
 `(chain_id, tx_hash)` is unique.
 
+### A role is a role however the path is spelled
+
+The guard that decides what a key may do matches the route the **router**
+resolved, not the string the caller sent. Those differ: the router
+percent-decodes before it dispatches, so `POST /v1/%6beys` reaches the
+`/v1/keys` handler while a raw-string match against `/v1/keys` finds nothing,
+falls through to the default for a write — manager — and lets a manager mint
+itself an owner key.
+
+Matching the registered pattern closes the whole class rather than the one
+spelling: there is no list of encodings, cases or trailing slashes to keep
+complete. The audit log records the matched route too, so an action cannot be
+hidden from a search by encoding the path it was performed on.
+
+### The site key can introduce somebody, not rewrite them
+
+The public key is in every page's source, so anything it can write is
+world-writable. It may create a contact, and fill in a field the retailer does
+not have yet — a first login supplying a name. It may not change a name, phone,
+locale or country the store already holds, and it may not add tags or
+attributes to an existing contact at all.
+
+Tags and attributes are what segments are built from, and segments decide who
+receives a campaign and which blocks of it they see. Letting an unauthenticated
+assertion write them is letting anyone who knows an email address put that
+person into, or out of, a mailing.
+
 ### An email cannot attack the admin who previews it
 
 A message composed in wp-admin is a list of typed blocks with typed fields, not
@@ -116,6 +143,10 @@ wallet address.
 | Output | WordPress output escaped at every boundary (`esc_html`, `esc_attr`, `esc_url`) |
 | Email templates | All interpolated values HTML-escaped unconditionally |
 | Composed email | Built from typed blocks, never from admin-authored HTML; every field escaped, and links restricted to `http`, `https` and `mailto` |
+| Role checks | Matched against the router's resolved route, so no encoding of the path reaches a weaker rule |
+| Third-party scripts | The wallet library is pinned to an exact version and checked with Subresource Integrity; the ESM module it cannot check is pinned to an exact build |
+| Analytics URLs | The tracker reports origin + path plus an allow-list of campaign parameters, so order keys, reset keys and session fragments are never stored |
+| Consent | No identifier is written — cookie or localStorage — until consent is given, and withdrawing it removes what was written |
 | Email preview | Rendered server-side and shown in a `sandbox=""` iframe, so a message cannot run script in the admin's session |
 | CSRF | WordPress REST nonces on every member action; nonce checks on form posts |
 | Webhooks | HMAC-SHA256 over `timestamp.body`, with a 5-minute freshness window to stop replay |

@@ -66,6 +66,37 @@ export function requiredRole(method: string, path: string): Role {
 }
 
 /**
+ * The path to match the rules against.
+ *
+ * The router percent-decodes before it dispatches, so `/v1/%6beys` reaches the
+ * `/v1/keys` handler. Matching the *raw* target against `/v1/keys` therefore
+ * failed, the request fell through to the defaults — a write needs `manager` —
+ * and a manager minted itself an owner key. Case and trailing slashes were
+ * never the hole; the encoding was, and any list of variants to normalise is a
+ * list somebody has to keep complete.
+ *
+ * So this asks the router what it matched. `routeOptions.url` is the registered
+ * pattern (`/v1/keys`, `/v1/point-types/:key`) — already decoded, already
+ * canonical, and the same string however the caller spelled it.
+ *
+ * The fallbacks are for a request that matched no route, where there is no
+ * pattern to read. Decoding can itself throw on a malformed escape, and the
+ * safe answer to "I cannot tell what this is" is the strictest rule, not the
+ * loosest.
+ */
+export function guardPath(request: FastifyRequest): string {
+  const pattern = request.routeOptions?.url;
+  if (typeof pattern === 'string' && pattern !== '') return pattern;
+
+  const raw = request.url.split('?')[0] ?? '';
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return '';
+  }
+}
+
+/**
  * Which of a request's fields are worth keeping.
  *
  * Deliberately a short allow-list rather than the whole body. An audit log that
@@ -131,7 +162,10 @@ export function withAuthorisation(app: FastifyInstance): void {
     // Only credentialed routes. Public ingest has no operator and no role.
     if (request.authScope !== 'secret') return;
 
-    const need = requiredRole(request.method, request.url.split('?')[0] ?? '');
+    const path = guardPath(request);
+    // A request that matched no route and will not decode: there is no way to
+    // know which rule covers it, so it gets the strictest one.
+    const need = path === '' ? 'owner' : requiredRole(request.method, path);
     const have = request.role ?? 'owner';
 
     if (!atLeast(have, need)) {
@@ -157,7 +191,9 @@ export function withAuthorisation(app: FastifyInstance): void {
       keyId: request.keyId ?? null,
       actorLabel: request.actorLabel ?? '',
       role: request.role ?? null,
-      action: `${request.method} ${request.url.split('?')[0]}`,
+      // The matched route, not what the caller typed: an encoded path recorded
+      // verbatim is an entry nobody searching for the real one will find.
+      action: `${request.method} ${guardPath(request)}`,
       status: reply.statusCode,
       target: targetOf(request),
       detail: summarise(request.body),

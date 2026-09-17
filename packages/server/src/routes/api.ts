@@ -157,7 +157,9 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
     const tenant = tenantOf(request);
     const { rowCount } = await db().query(
       'DELETE FROM webhooks WHERE tenant_id = $1 AND id = $2',
-      [tenant.id, request.params.id],
+      // Checked here rather than left to the uuid column, which raised
+      // "invalid input syntax for type uuid" and came back as a 500.
+      [tenant.id, uuidOf(request.params.id, 'id')!],
     );
     if (!rowCount) throw ApiError.notFound('Webhook not found');
     return { deleted: true };
@@ -747,7 +749,12 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
     );
     const contact = await requireContact(tenant.id, input);
 
-    const claim = await attachClaimTx(tenant.id, request.params.claimId, input.txHash, contact.id);
+    const claim = await attachClaimTx(
+      tenant.id,
+      uuidOf(request.params.claimId, 'claimId')!,
+      input.txHash,
+      contact.id,
+    );
     if (!claim) throw ApiError.notFound('Claim not found');
     return { claim_id: claim.id, status: claim.status, tx_hash: claim.tx_hash };
   });
@@ -843,10 +850,20 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
     const input = parse(contactHandleSchema, request.body);
     const contact = await requireContact(tenant.id, input);
 
-    const credit = await queryOne<{ code: string; amount_cents: number; currency: string }>(
+    const credit = await queryOne<{
+      code: string;
+      amount_cents: string;
+      remaining_cents: string;
+      currency: string;
+    }>(
       db(),
-      `SELECT code, amount_cents, currency FROM store_credits
+      // What is LEFT, not the face value: a credit is drawn down across orders,
+      // and a storefront quoting the face value of a half-spent one offers a
+      // discount the platform will refuse.
+      `SELECT code, amount_cents, amount_cents - redeemed_cents AS remaining_cents, currency
+         FROM store_credits
         WHERE tenant_id = $1 AND contact_id = $2 AND status = 'active'
+          AND amount_cents > redeemed_cents
           AND (expires_at IS NULL OR expires_at > now())
         ORDER BY expires_at NULLS LAST, created_at
         LIMIT 1`,
@@ -854,16 +871,36 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
     );
     if (!credit) throw ApiError.notFound('No active store credit');
 
-    return credit;
+    return {
+      code: credit.code,
+      // `amount_cents` keeps meaning "what this is worth now" for every caller
+      // that already reads it; `remaining_cents` says the same thing plainly.
+      amount_cents: Number(credit.remaining_cents),
+      face_value_cents: Number(credit.amount_cents),
+      remaining_cents: Number(credit.remaining_cents),
+      currency: credit.currency,
+    };
   });
 
   app.post('/v1/token/credit/redeem', async (request) => {
     const tenant = tenantOf(request);
     const input = parse(
-      z.object({ code: z.string().max(64), orderRef: z.string().max(128) }),
+      z.object({
+        code: z.string().max(64),
+        orderRef: z.string().max(128),
+        // How much of the credit this order actually used. Omitted means the
+        // whole remaining balance, which is what every caller before partial
+        // redemption meant.
+        amountCents: z.number().int().positive().max(100_000_000).optional(),
+      }),
       request.body,
     );
-    const credit = await redeemStoreCredit(tenant.id, input.code, input.orderRef);
+    const credit = await redeemStoreCredit(
+      tenant.id,
+      input.code,
+      input.orderRef,
+      input.amountCents,
+    );
     if (!credit) throw ApiError.notFound('No active store credit with that code');
     return credit;
   });

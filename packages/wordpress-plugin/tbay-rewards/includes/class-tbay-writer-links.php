@@ -53,8 +53,12 @@ class TBAY_Rewards_Writer_Links {
 			return (string) $content;
 		}
 
+		// `url` comes from shortcode text, which a Contributor can put in a draft
+		// and see rendered in preview. A tracked link becomes a `/r/<code>`
+		// redirect on the rewards domain, so an off-site destination would make
+		// that domain a redirector to anywhere; those are linked plainly.
 		$target = '' !== $atts['url']
-			? esc_url_raw( $atts['url'] )
+			? $this->own_url( $atts['url'] )
 			: ( '' !== $atts['product'] ? (string) get_permalink( (int) $atts['product'] ) : '' );
 
 		if ( '' === $target ) {
@@ -330,6 +334,31 @@ class TBAY_Rewards_Writer_Links {
 	}
 
 	/** Mint a link from the editor sidebar. */
+	/**
+	 * A URL on this site, or an empty string.
+	 *
+	 * The destination of a tracked link has to be a fact about this site, not
+	 * something anybody who can write a shortcode chooses.
+	 */
+	private function own_url( string $candidate ): string {
+		$url = esc_url_raw( trim( $candidate ) );
+		if ( '' === $url ) {
+			return '';
+		}
+
+		$host   = wp_parse_url( $url, PHP_URL_HOST );
+		$home   = wp_parse_url( home_url(), PHP_URL_HOST );
+		$scheme = wp_parse_url( $url, PHP_URL_SCHEME );
+		if ( ! is_string( $host ) || ! is_string( $home ) ) {
+			return '';
+		}
+		if ( ! in_array( $scheme, array( 'http', 'https' ), true ) ) {
+			return '';
+		}
+
+		return strtolower( $host ) === strtolower( $home ) ? $url : '';
+	}
+
 	public function ajax_mint_link(): void {
 		check_ajax_referer( 'tbay_mint_link', 'nonce' );
 
@@ -341,6 +370,14 @@ class TBAY_Rewards_Writer_Links {
 		$product_id = isset( $_POST['product'] ) ? absint( wp_unslash( $_POST['product'] ) ) : 0;
 		if ( ! $product_id ) {
 			wp_send_json_error( array( 'message' => __( 'Enter a product ID.', 'tbay-rewards' ) ), 400 );
+		}
+
+		// Any post id, not only a product: the `edit_post` check above covers
+		// the post being written, and without this a Contributor could read
+		// back the title of somebody else's draft by guessing ids.
+		$product = get_post( $product_id );
+		if ( ! $product instanceof WP_Post || 'publish' !== $product->post_status ) {
+			wp_send_json_error( array( 'message' => __( 'No published product with that ID.', 'tbay-rewards' ) ), 404 );
 		}
 
 		$target = (string) get_permalink( $product_id );

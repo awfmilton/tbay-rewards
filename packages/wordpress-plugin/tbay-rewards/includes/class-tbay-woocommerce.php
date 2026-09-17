@@ -22,6 +22,7 @@ class TBAY_Rewards_WooCommerce {
 
 	private const ORDER_SYNCED_META = '_tbay_synced';
 	private const ORDER_LINK_META   = '_tbay_link_code';
+	private const CREDIT_CENTS_META = '_tbay_credit_cents';
 	private const CREDIT_META       = '_tbay_store_credit_code';
 
 	public function __construct( private TBAY_Rewards_API $api ) {
@@ -44,6 +45,9 @@ class TBAY_Rewards_WooCommerce {
 
 		// Redeem TBAY store credit as a Woo coupon-equivalent discount.
 		add_action( 'woocommerce_cart_calculate_fees', array( $this, 'apply_store_credit' ), 20 );
+		// Before the order exists, so a credit that is gone stops the checkout
+		// instead of discounting an order nothing pays for.
+		add_action( 'woocommerce_after_checkout_validation', array( $this, 'validate_store_credit' ), 10, 2 );
 		add_action( 'woocommerce_checkout_order_processed', array( $this, 'consume_store_credit' ), 20 );
 		add_action( 'woocommerce_before_cart_totals', array( $this, 'render_credit_form' ) );
 		add_action( 'woocommerce_review_order_before_payment', array( $this, 'render_credit_form' ) );
@@ -134,7 +138,25 @@ class TBAY_Rewards_WooCommerce {
 				return 'guest-' . $customer_id;
 			}
 		}
-		return 'guest-' . md5( (string) wp_get_session_token() );
+		// A logged-out visitor has no WordPress session token, so this used to
+		// be md5('') for every one of them — one shared cart token, and every
+		// guest's abandoned cart merged into one stranger's.
+		$visitor = isset( $_COOKIE['tbay_visitor'] )
+			? sanitize_text_field( wp_unslash( $_COOKIE['tbay_visitor'] ) )
+			: '';
+		if ( '' !== $visitor ) {
+			return 'guest-' . md5( $visitor );
+		}
+
+		$token = (string) wp_get_session_token();
+		if ( '' !== $token ) {
+			return 'guest-' . md5( $token );
+		}
+
+		// Nothing identifies this browser. A per-request token means the cart
+		// is not tracked, which is right: better no record than everybody's
+		// record in one.
+		return 'guest-' . wp_generate_uuid4();
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────
@@ -455,13 +477,89 @@ class TBAY_Rewards_WooCommerce {
 			return;
 		}
 
-		// Never discount below zero: credit beyond the basket stays on the account.
+		// Never discount below zero: credit beyond the basket stays on the
+		// account, and now genuinely does — the platform draws the credit down
+		// by what was used rather than consuming the whole code.
 		$amount = min( (float) $credit['amount_cents'] / 100, (float) $cart->get_subtotal() );
 		if ( $amount <= 0 ) {
 			return;
 		}
 
 		$cart->add_fee( __( 'TBAY store credit', 'tbay-rewards' ), -$amount, false );
+	}
+
+	/**
+	 * How many cents of credit this cart is currently discounting.
+	 *
+	 * Read back off the fee rather than recomputed, so the amount burned is the
+	 * amount the customer was actually given.
+	 */
+	private function applied_credit_cents(): int {
+		$cart = function_exists( 'WC' ) && WC() ? WC()->cart : null;
+		if ( ! $cart ) {
+			return 0;
+		}
+
+		$label = __( 'TBAY store credit', 'tbay-rewards' );
+		foreach ( (array) $cart->get_fees() as $fee ) {
+			if ( isset( $fee->name ) && $fee->name === $label ) {
+				return (int) round( abs( (float) $fee->amount ) * 100 );
+			}
+		}
+		return 0;
+	}
+
+	/**
+	 * Refuse the checkout if the credit will not cover the discount.
+	 *
+	 * The discount used to be applied as a cart fee and burned only after the
+	 * order had been written with it. A credit already spent in another tab, or
+	 * a platform that did not answer, left the order complete and discounted
+	 * with nothing burned against it — the same value given away twice.
+	 *
+	 * Checked here, where adding an error stops the checkout and the customer
+	 * sees why.
+	 *
+	 * @param array    $data   Posted checkout fields.
+	 * @param WP_Error $errors Errors to add to.
+	 */
+	public function validate_store_credit( $data, $errors ): void {
+		if ( ! function_exists( 'WC' ) || ! WC()->session || ! $errors instanceof WP_Error ) {
+			return;
+		}
+
+		$credit = WC()->session->get( 'tbay_store_credit' );
+		if ( ! is_array( $credit ) || empty( $credit['code'] ) ) {
+			return;
+		}
+
+		$wanted = $this->applied_credit_cents();
+		if ( $wanted <= 0 ) {
+			return;
+		}
+
+		$contact_id = $this->api->contact_id_for_user( get_current_user_id() );
+		$fresh      = null === $contact_id
+			? null
+			: $this->api->post( '/v1/token/credit/reserve', array( 'contactId' => $contact_id ) );
+
+		if ( is_wp_error( $fresh ) || ! is_array( $fresh ) ) {
+			// The platform did not answer. Better a checkout the customer can
+			// retry without the credit than an order nobody is paid for.
+			$errors->add(
+				'tbay_credit',
+				__( 'We could not confirm your store credit just now. Please remove it and try again, or come back in a moment.', 'tbay-rewards' )
+			);
+			return;
+		}
+
+		$remaining = (int) ( $fresh['remaining_cents'] ?? $fresh['amount_cents'] ?? 0 );
+		if ( (string) ( $fresh['code'] ?? '' ) !== (string) $credit['code'] || $remaining < $wanted ) {
+			$errors->add(
+				'tbay_credit',
+				__( 'Your store credit has changed since you added it. Please refresh the checkout.', 'tbay-rewards' )
+			);
+		}
 	}
 
 	/**
@@ -484,28 +582,48 @@ class TBAY_Rewards_WooCommerce {
 			return;
 		}
 
+		// The amount actually discounted, not the credit's face value. Burning
+		// the whole code for a $10 discount on a $50 credit threw $40 of the
+		// customer's money away.
+		$used = (int) $order->get_meta( self::CREDIT_CENTS_META );
+		if ( $used <= 0 ) {
+			$used = $this->applied_credit_cents();
+		}
+		if ( $used <= 0 ) {
+			WC()->session->set( 'tbay_store_credit', null );
+			return;
+		}
+
 		$result = $this->api->post(
 			'/v1/token/credit/redeem',
 			array(
-				'code'     => (string) $credit['code'],
-				'orderRef' => (string) $order->get_order_number(),
+				'code'        => (string) $credit['code'],
+				// Keyed on the order, so a retry after a timeout burns once.
+				'orderRef'    => (string) $order->get_order_number(),
+				'amountCents' => $used,
 			)
 		);
 
 		WC()->session->set( 'tbay_store_credit', null );
 
 		if ( is_wp_error( $result ) ) {
+			// The order already carries the discount, and nothing was burned
+			// against it. Held rather than left to fulfil: somebody has to
+			// decide whether to honour it, and that somebody is not this hook.
 			$order->add_order_note(
 				sprintf(
-					/* translators: %s: error message. */
-					__( 'TBAY store credit could not be redeemed: %s', 'tbay-rewards' ),
+					/* translators: 1: amount in cents, 2: error message. */
+					__( 'TBAY store credit of %1$d cents could not be redeemed: %2$s. The order is on hold until this is settled.', 'tbay-rewards' ),
+					$used,
 					$result->get_error_message()
 				)
 			);
+			$order->update_status( 'on-hold' );
 			return;
 		}
 
 		$order->update_meta_data( self::CREDIT_META, (string) $credit['code'] );
+		$order->update_meta_data( self::CREDIT_CENTS_META, $used );
 		$order->save();
 	}
 

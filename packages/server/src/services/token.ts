@@ -1016,21 +1016,111 @@ export function creditQuote(
   };
 }
 
+/**
+ * Spend some or all of a store credit against an order.
+ *
+ * Drawn down, not consumed. The storefront discounts the smaller of the credit
+ * and the basket, so marking the whole thing redeemed destroyed the difference
+ * — a $50 credit spent on a $10 basket took $10 off and threw $40 of the
+ * customer's money away.
+ *
+ * `amountCents` omitted means the whole remaining balance, which is what every
+ * caller before this meant.
+ *
+ * Idempotent per order: a checkout retried after a timeout, or two tabs
+ * finishing at once, asks twice and is answered once. The storefront cannot
+ * tell "that did not go through" from "that went through and the reply was
+ * lost", so the unique index decides and the second call is told what the
+ * first one did.
+ */
 export async function redeemStoreCredit(
   tenantId: string,
   code: string,
   orderRef: string,
-  runner: Queryable = db(),
-): Promise<{ amount_cents: number; currency: string } | null> {
-  return queryOne<{ amount_cents: number; currency: string }>(
-    runner,
-    `UPDATE store_credits
-        SET status = 'redeemed', redeemed_at = now(), order_ref = $3
-      WHERE tenant_id = $1 AND code = $2 AND status = 'active'
-        AND (expires_at IS NULL OR expires_at > now())
-      RETURNING amount_cents, currency`,
-    [tenantId, code, orderRef],
-  );
+  amountCents?: number,
+  runner?: Queryable,
+): Promise<{
+  amount_cents: number;
+  currency: string;
+  remaining_cents: number;
+  already_redeemed: boolean;
+} | null> {
+  const run = async (client: Queryable) => {
+    const credit = await queryOne<{
+      id: string;
+      amount_cents: string;
+      redeemed_cents: string;
+      currency: string;
+      status: string;
+    }>(
+      client,
+      `SELECT id, amount_cents, redeemed_cents, currency, status
+         FROM store_credits
+        WHERE tenant_id = $1 AND code = $2
+          AND (expires_at IS NULL OR expires_at > now())
+        FOR UPDATE`,
+      [tenantId, code],
+    );
+    if (!credit) return null;
+
+    // Asked again for an order already paid: report what was taken, and take
+    // nothing more.
+    const prior = await queryOne<{ amount_cents: string }>(
+      client,
+      `SELECT amount_cents FROM store_credit_redemptions
+        WHERE credit_id = $1 AND order_ref = $2`,
+      [credit.id, orderRef],
+    );
+    if (prior) {
+      return {
+        amount_cents: Number(prior.amount_cents),
+        currency: credit.currency,
+        remaining_cents: Number(credit.amount_cents) - Number(credit.redeemed_cents),
+        already_redeemed: true,
+      };
+    }
+
+    if (credit.status !== 'active') return null;
+
+    const remaining = Number(credit.amount_cents) - Number(credit.redeemed_cents);
+    const wanted = amountCents === undefined ? remaining : Math.trunc(amountCents);
+    if (!Number.isFinite(wanted) || wanted <= 0) {
+      throw ApiError.badRequest('An amount to redeem must be a positive number of cents');
+    }
+    if (wanted > remaining) {
+      throw ApiError.badRequest(
+        `That credit has ${remaining} cents left; ${wanted} was asked for`,
+      );
+    }
+
+    await client.query(
+      `INSERT INTO store_credit_redemptions (tenant_id, credit_id, order_ref, amount_cents)
+       VALUES ($1, $2, $3, $4)`,
+      [tenantId, credit.id, orderRef, wanted],
+    );
+
+    const left = remaining - wanted;
+    await client.query(
+      `UPDATE store_credits
+          SET redeemed_cents = redeemed_cents + $2,
+              status = CASE WHEN $3 = 0 THEN 'redeemed' ELSE status END,
+              redeemed_at = CASE WHEN $3 = 0 THEN now() ELSE redeemed_at END,
+              order_ref = COALESCE(order_ref, $4)
+        WHERE id = $1`,
+      [credit.id, wanted, left, orderRef],
+    );
+
+    return {
+      amount_cents: wanted,
+      currency: credit.currency,
+      remaining_cents: left,
+      already_redeemed: false,
+    };
+  };
+
+  // The caller's transaction when there is one — a redemption belongs with the
+  // order that used it, not beside it.
+  return runner ? run(runner) : withTransaction(run);
 }
 
 export async function walletSummary(
@@ -1066,7 +1156,10 @@ export async function walletSummary(
 
   const credit = await queryOne<{ total: string }>(
     db(),
-    `SELECT COALESCE(SUM(amount_cents), 0) AS total FROM store_credits
+    // What is left, not the face value: a partly spent credit is worth the
+    // difference, and a wallet page showing the whole thing is a promise the
+    // checkout will not keep.
+    `SELECT COALESCE(SUM(amount_cents - redeemed_cents), 0) AS total FROM store_credits
       WHERE tenant_id = $1 AND contact_id = $2 AND status = 'active'`,
     [tenant.id, contact.id],
   );
