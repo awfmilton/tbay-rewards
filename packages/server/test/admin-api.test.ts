@@ -253,6 +253,79 @@ describe('actions the admin forms post', () => {
   });
 });
 
+describe('the WordPress admin\'s own HTTP habits (HIGH)', () => {
+  /** Exactly what class-tbay-api.php used to send on every request. */
+  async function asPlugin(method: 'GET' | 'DELETE', url: string) {
+    const app = await testApp();
+    return app.inject({
+      method,
+      url,
+      headers: {
+        authorization: `Bearer ${tenant.secretKey}`,
+        'content-type': 'application/json',
+        accept: 'application/json',
+      },
+    });
+  }
+
+  it('answers a DELETE that declares JSON and sends no body', async () => {
+    // Nine admin buttons were dead. The plugin set Content-Type on every
+    // request and attached a body only to POST, PUT and PATCH, so every
+    // DELETE announced JSON and carried nothing -- and Fastify's default
+    // parser rejected it with "Body cannot be empty when content-type is set
+    // to 'application/json'" before any route ran. Proved against a running
+    // server before it was fixed: the same DELETE was 400 with the header and
+    // 200 without it.
+    await call('PUT', '/v1/gamification/badges/doomed', {
+      name: 'Doomed',
+      criteria: { type: 'points_total' },
+      tiers: [{ level: 1, threshold: 10 }],
+    });
+
+    const deleted = await asPlugin('DELETE', '/v1/gamification/badges/doomed');
+    expect(deleted.statusCode).toBe(200);
+
+    const listed = await call('GET', '/v1/gamification/badges/admin');
+    expect(listed.body).not.toContain('doomed');
+  });
+
+  it('still rejects a body that is malformed rather than absent', async () => {
+    // The tolerance must not turn a syntax error into a 500, or into a
+    // silently empty object that a write then acts on.
+    const app = await testApp();
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/v1/gamification/badges/broken',
+      headers: {
+        authorization: `Bearer ${tenant.secretKey}`,
+        'content-type': 'application/json',
+      },
+      payload: '{"name": "unterminated',
+    });
+    expect(response.statusCode).toBe(400);
+  });
+
+  it('still refuses a write whose required fields are missing', async () => {
+    // An empty body parses to an empty object now, so the schema is what has
+    // to reject it -- not the parser. If this ever returns 2xx, the tolerance
+    // has started creating records out of nothing.
+    const response = await asPlugin('GET', '/v1/gamification/badges/admin');
+    expect(response.statusCode).toBe(200);
+
+    const app = await testApp();
+    const empty = await app.inject({
+      method: 'PUT',
+      url: '/v1/gamification/badges/nameless',
+      headers: {
+        authorization: `Bearer ${tenant.secretKey}`,
+        'content-type': 'application/json',
+      },
+      payload: '',
+    });
+    expect(empty.statusCode).toBe(400);
+  });
+});
+
 describe('the site key cannot reach any of it', () => {
   it('refuses every admin route without the secret key', async () => {
     const app = await testApp();

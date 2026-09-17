@@ -71,6 +71,67 @@ export async function buildApp(): Promise<FastifyInstance> {
     },
   );
 
+  /** Methods with no request body of their own. */
+  const BODYLESS = new Set(['GET', 'HEAD', 'DELETE', 'OPTIONS']);
+
+  /**
+   * An empty `application/json` body is nothing, not a syntax error.
+   *
+   * Fastify's default JSON parser answers an empty body with
+   * "Body cannot be empty when content-type is set to 'application/json'" --
+   * a 400 before any route runs. That is defensible for a POST and wrong for
+   * a DELETE, which has no body to send, and it made every DELETE button in
+   * the WordPress admin dead: the plugin sets `Content-Type: application/json`
+   * on every request and attaches a body only to POST, PUT and PATCH. Nine
+   * admin actions -- deleting a badge, a rank, a segment, a custom field, an
+   * email template, an operator -- returned 400 and reported a failure the
+   * retailer could do nothing about. Proved against a running server: the same
+   * DELETE is 400 with the header and 200 without it.
+   *
+   * The plugin's habit is fixed too, but the server should not have been
+   * brittle about it in the first place: declaring a content type you then
+   * send none of is common enough that Fastify has an option for it, and a
+   * handler that needs a body already rejects `{}` on its own terms through
+   * the schema. So an empty body parses as an empty object, and nothing
+   * downstream has to know the difference.
+   */
+  app.addContentTypeParser(
+    'application/json',
+    { parseAs: 'string', bodyLimit: 1_048_576 },
+    (request, body, done) => {
+      const text = String(body).trim();
+      if (text === '') {
+        // Only for a method that has no body to send. The first version of
+        // this parser accepted an empty body on any method, and the test
+        // written to catch that caught it: `PUT /v1/gamification/badges/:key`
+        // with no body returned 200 and created a nameless badge, because the
+        // upsert takes an object and `{}` is an object. The parser had been
+        // the only thing rejecting it. So the tolerance is exactly as wide as
+        // the bug it fixes and no wider -- everything else still gets
+        // Fastify's own answer.
+        if (BODYLESS.has(request.method.toUpperCase())) {
+          done(null, Object.create(null) as Record<string, unknown>);
+          return;
+        }
+        const empty = new Error(
+          "Body cannot be empty when content-type is set to 'application/json'",
+        ) as Error & { statusCode?: number };
+        empty.statusCode = 400;
+        done(empty, undefined);
+        return;
+      }
+      try {
+        done(null, JSON.parse(text));
+      } catch (err) {
+        // Shape it the way Fastify does, so a malformed body is still a 400
+        // and not a 500 -- the one thing this parser must not change.
+        const error = err as Error & { statusCode?: number };
+        error.statusCode = 400;
+        done(error, undefined);
+      }
+    },
+  );
+
   /**
    * Ingest has to work from any customer storefront, so it is open CORS by
    * design — the site key is public and only authorises writes. The credentialed

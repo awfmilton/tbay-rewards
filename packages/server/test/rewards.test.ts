@@ -226,6 +226,67 @@ describe('reward rules', () => {
   });
 });
 
+describe('editing one field of a rule does not reset the rest (HIGH)', () => {
+  it('keeps points, mode and event key when a partial update arrives', async () => {
+    // The WordPress earning-rules screen edits one field at a time, which is a
+    // PUT carrying that field and nothing else. Every default was applied in
+    // JavaScript before the statement ran -- points to zero, mode to fixed,
+    // event_key to custom.<key> -- so the COALESCE in the DO UPDATE had no
+    // NULL left to fall back from, and the omitted fields were overwritten.
+    // Toggling a rule on set its points to zero and rewrote the event it
+    // listens for: purchase earning stopped on a Save that looked harmless
+    // and reported success.
+    await upsertRule(tenant.id, {
+      key: 'purchase',
+      name: 'Purchase reward',
+      event_key: 'order.completed',
+      mode: 'per_currency_unit',
+      points_per_unit: 5,
+      points: 100,
+      cooldown_seconds: 60,
+      daily_cap: 500,
+      enabled: true,
+    });
+
+    const toggled = await upsertRule(tenant.id, { key: 'purchase', enabled: false });
+
+    expect(toggled.enabled).toBe(false);
+    expect(toggled.name).toBe('Purchase reward');
+    expect(toggled.event_key).toBe('order.completed');
+    expect(toggled.mode).toBe('per_currency_unit');
+    expect(Number(toggled.points)).toBe(100);
+    expect(Number(toggled.points_per_unit)).toBe(5);
+    expect(Number(toggled.cooldown_seconds)).toBe(60);
+
+    // And an edit still edits, rather than the fix turning into "ignore
+    // everything the caller sent".
+    const repriced = await upsertRule(tenant.id, { key: 'purchase', points: 250 });
+    expect(Number(repriced.points)).toBe(250);
+    expect(repriced.event_key).toBe('order.completed');
+    expect(repriced.enabled).toBe(false);
+  });
+
+  it('still lets an admin remove a cap by passing null', async () => {
+    // The caps are deliberately pass-through: null is how a cap is *removed*,
+    // so they must not be swept into the COALESCE treatment with the rest.
+    await upsertRule(tenant.id, {
+      key: 'capped_rule',
+      name: 'Capped',
+      event_key: 'thing',
+      points: 10,
+      daily_cap: 50,
+    });
+    const uncapped = await upsertRule(tenant.id, {
+      key: 'capped_rule',
+      name: 'Capped',
+      event_key: 'thing',
+      points: 10,
+      daily_cap: null,
+    });
+    expect(uncapped.daily_cap).toBeNull();
+  });
+});
+
 describe('concurrency', () => {
   it('never lets parallel redemptions overdraw a balance', async () => {
     const person = await contact();
