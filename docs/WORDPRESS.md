@@ -44,6 +44,12 @@ Two admin screens were added alongside the rest: **Currencies**, and
 Erasing one person is done from their own customer page, where whoever is
 doing it can see who they are erasing.
 
+**Reports** has its own screen: pick what the report is about, what to group
+by and what to measure, then have it emailed daily, weekly or monthly. The
+lists of what can be grouped and measured come from the platform rather than
+being hard-coded in the plugin, so a measure added server-side appears without
+a plugin update.
+
 **Merging a duplicate** is done from the customer page of the record that
 survives, so "which one am I keeping" is never a guess. Possible duplicates are
 listed there when the platform has found any.

@@ -45,6 +45,9 @@ Built for [tbay.tk LLC](https://tbay.tk).
   the surviving record's id so existing links still resolve
 - Named operators, four roles enforced in one place, and an append-only audit
   log that records refusals as well as changes
+- Reports a retailer composes — revenue by campaign, points by rule — over a
+  closed catalogue, emailed on a cadence so the weekly numbers arrive without
+  being asked for
 
   *Not yet:* buying points for money. See [docs/ROADMAP.md](docs/ROADMAP.md).
 

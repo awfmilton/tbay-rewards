@@ -32,6 +32,7 @@ class TBAY_Rewards_Manage {
 		'currencies'   => 'Currencies',
 		'privacy'      => 'Privacy',
 		'access'       => 'Access & audit',
+		'reports'      => 'Reports',
 	);
 
 	public function __construct( private TBAY_Rewards_API $api ) {
@@ -123,6 +124,9 @@ class TBAY_Rewards_Manage {
 			case 'access':
 				$this->screen_access();
 				break;
+			case 'reports':
+				$this->screen_reports();
+				break;
 			default:
 				$this->screen_customers();
 		}
@@ -212,6 +216,10 @@ class TBAY_Rewards_Manage {
 			'delete_operator'  => $this->do_delete_operator(),
 			'issue_key'        => $this->do_issue_key(),
 			'revoke_key'       => $this->do_revoke_key(),
+			'save_report'      => $this->do_save_report(),
+			'delete_report'    => $this->do_delete_report(),
+			'schedule_report'  => $this->do_schedule_report(),
+			'send_report'      => $this->do_send_report(),
 			'erase_contact'    => $this->do_erase_contact(),
 			'export_contact'   => $this->do_export_contact(),
 			'save_retention'   => $this->do_save_retention(),
@@ -2564,6 +2572,418 @@ class TBAY_Rewards_Manage {
 		}
 		$result = $this->api->request( 'DELETE', '/v1/keys/' . rawurlencode( $key_id ) );
 		return is_wp_error( $result ) ? $result : __( 'Key revoked.', 'tbay-rewards' );
+	}
+
+
+	// ── Reports ──────────────────────────────────────────────────────────────
+
+	/**
+	 * Build a report, run it, and have it arrive on Monday.
+	 *
+	 * The dimension and measure lists come from the platform, not from here —
+	 * a hard-coded copy in the plugin is a copy that goes stale the first time
+	 * a new measure is added server-side.
+	 */
+	private function screen_reports(): void {
+		$catalogue = $this->api->request( 'GET', '/v1/saved-reports/catalogue' );
+		$sources   = is_wp_error( $catalogue ) ? array() : ( $catalogue['sources'] ?? array() );
+
+		$saved = $this->api->request( 'GET', '/v1/saved-reports' );
+		$reports   = is_wp_error( $saved ) ? array() : ( $saved['reports'] ?? array() );
+		$schedules = is_wp_error( $saved ) ? array() : ( $saved['schedules'] ?? array() );
+
+		$by_report = array();
+		foreach ( $schedules as $schedule ) {
+			$by_report[ (string) ( $schedule['report_key'] ?? '' ) ] = $schedule;
+		}
+
+		$viewing = $this->query( 'report' );
+		if ( '' !== $viewing ) {
+			$this->render_report_results( $viewing );
+		}
+		?>
+		<h2><?php esc_html_e( 'Saved reports', 'tbay-rewards' ); ?></h2>
+		<?php if ( empty( $reports ) ) : ?>
+			<p class="description">
+				<?php esc_html_e( 'None yet. Build one below — revenue by campaign, points by rule, whatever you need to see each week.', 'tbay-rewards' ); ?>
+			</p>
+		<?php else : ?>
+			<table class="widefat striped">
+				<thead><tr>
+					<th><?php esc_html_e( 'Report', 'tbay-rewards' ); ?></th>
+					<th><?php esc_html_e( 'Shows', 'tbay-rewards' ); ?></th>
+					<th><?php esc_html_e( 'Emailed', 'tbay-rewards' ); ?></th>
+					<th></th>
+				</tr></thead>
+				<tbody>
+				<?php foreach ( $reports as $report ) : ?>
+					<?php
+					$key        = (string) ( $report['key'] ?? '' );
+					$definition = is_array( $report['definition'] ?? null ) ? $report['definition'] : array();
+					$schedule   = $by_report[ $key ] ?? null;
+					?>
+					<tr>
+						<td>
+							<strong><?php echo esc_html( (string) ( $report['name'] ?? $key ) ); ?></strong><br />
+							<code><?php echo esc_html( $key ); ?></code>
+						</td>
+						<td>
+							<?php
+							echo esc_html(
+								sprintf(
+									/* translators: 1: source, 2: measures, 3: dimensions */
+									__( '%1$s — %2$s by %3$s', 'tbay-rewards' ),
+									(string) ( $definition['source'] ?? '' ),
+									implode( ', ', (array) ( $definition['measures'] ?? array() ) ),
+									implode( ', ', (array) ( $definition['dimensions'] ?? array() ) ) ?: __( 'nothing', 'tbay-rewards' )
+								)
+							);
+							?>
+						</td>
+						<td>
+							<?php if ( $schedule && ! empty( $schedule['enabled'] ) ) : ?>
+								<?php
+								echo esc_html(
+									sprintf(
+										/* translators: 1: cadence, 2: recipient count */
+										__( '%1$s to %2$s', 'tbay-rewards' ),
+										(string) ( $schedule['cadence'] ?? '' ),
+										implode( ', ', (array) ( $schedule['recipients'] ?? array() ) )
+									)
+								);
+								?>
+							<?php else : ?>
+								—
+							<?php endif; ?>
+						</td>
+						<td>
+							<a class="button button-small"
+								href="<?php echo esc_url( add_query_arg( array( 'page' => 'tbay-manage-reports', 'report' => $key ), admin_url( 'admin.php' ) ) ); ?>">
+								<?php esc_html_e( 'View', 'tbay-rewards' ); ?>
+							</a>
+							<?php if ( $schedule ) : ?>
+								<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="tbay-row-form">
+									<?php wp_nonce_field( 'tbay_manage' ); ?>
+									<input type="hidden" name="action" value="tbay_manage" />
+									<input type="hidden" name="tbay_action" value="send_report" />
+									<input type="hidden" name="tbay_screen" value="reports" />
+									<input type="hidden" name="key" value="<?php echo esc_attr( $key ); ?>" />
+									<?php submit_button( __( 'Send now', 'tbay-rewards' ), 'small', '', false ); ?>
+								</form>
+							<?php endif; ?>
+							<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="tbay-row-form"
+								onsubmit="return confirm(<?php echo esc_attr( wp_json_encode( __( 'Delete this report?', 'tbay-rewards' ) ) ); ?>);">
+								<?php wp_nonce_field( 'tbay_manage' ); ?>
+								<input type="hidden" name="action" value="tbay_manage" />
+								<input type="hidden" name="tbay_action" value="delete_report" />
+								<input type="hidden" name="tbay_screen" value="reports" />
+								<input type="hidden" name="key" value="<?php echo esc_attr( $key ); ?>" />
+								<?php submit_button( __( 'Delete', 'tbay-rewards' ), 'small', '', false ); ?>
+							</form>
+						</td>
+					</tr>
+
+					<tr>
+						<td colspan="4">
+							<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="tbay-row-form">
+								<?php wp_nonce_field( 'tbay_manage' ); ?>
+								<input type="hidden" name="action" value="tbay_manage" />
+								<input type="hidden" name="tbay_action" value="schedule_report" />
+								<input type="hidden" name="tbay_screen" value="reports" />
+								<input type="hidden" name="key" value="<?php echo esc_attr( $key ); ?>" />
+								<label>
+									<?php esc_html_e( 'Email', 'tbay-rewards' ); ?>
+									<select name="cadence">
+										<?php foreach ( array( 'daily', 'weekly', 'monthly' ) as $cadence ) : ?>
+											<option value="<?php echo esc_attr( $cadence ); ?>"
+												<?php selected( (string) ( $schedule['cadence'] ?? 'weekly' ), $cadence ); ?>>
+												<?php echo esc_html( $cadence ); ?>
+											</option>
+										<?php endforeach; ?>
+									</select>
+								</label>
+								<label>
+									<?php esc_html_e( 'at', 'tbay-rewards' ); ?>
+									<input type="number" name="hour" min="0" max="23" class="small-text"
+										value="<?php echo esc_attr( (string) ( $schedule['hour'] ?? 7 ) ); ?>" />
+									<?php esc_html_e( 'o’clock, your time', 'tbay-rewards' ); ?>
+								</label>
+								<label class="screen-reader-text" for="tbay-rep-to-<?php echo esc_attr( $key ); ?>">
+									<?php esc_html_e( 'Recipients', 'tbay-rewards' ); ?>
+								</label>
+								<input type="text" id="tbay-rep-to-<?php echo esc_attr( $key ); ?>" name="recipients"
+									class="regular-text"
+									placeholder="<?php esc_attr_e( 'owner@shop.example, finance@shop.example', 'tbay-rewards' ); ?>"
+									value="<?php echo esc_attr( implode( ', ', (array) ( $schedule['recipients'] ?? array() ) ) ); ?>" />
+								<?php submit_button( __( 'Save schedule', 'tbay-rewards' ), 'small', '', false ); ?>
+							</form>
+						</td>
+					</tr>
+				<?php endforeach; ?>
+				</tbody>
+			</table>
+		<?php endif; ?>
+
+		<h3><?php esc_html_e( 'Build a report', 'tbay-rewards' ); ?></h3>
+		<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
+			<?php wp_nonce_field( 'tbay_manage' ); ?>
+			<input type="hidden" name="action" value="tbay_manage" />
+			<input type="hidden" name="tbay_action" value="save_report" />
+			<input type="hidden" name="tbay_screen" value="reports" />
+			<table class="form-table">
+				<tr>
+					<th scope="row"><label for="tbay-rep-key"><?php esc_html_e( 'Key', 'tbay-rewards' ); ?></label></th>
+					<td><input type="text" id="tbay-rep-key" name="key" class="regular-text"
+						pattern="[a-z0-9_]{2,64}" required /></td>
+				</tr>
+				<tr>
+					<th scope="row"><label for="tbay-rep-name"><?php esc_html_e( 'Name', 'tbay-rewards' ); ?></label></th>
+					<td><input type="text" id="tbay-rep-name" name="name" class="regular-text" /></td>
+				</tr>
+				<tr>
+					<th scope="row"><label for="tbay-rep-source"><?php esc_html_e( 'About', 'tbay-rewards' ); ?></label></th>
+					<td>
+						<select id="tbay-rep-source" name="source">
+							<?php foreach ( $sources as $source ) : ?>
+								<option value="<?php echo esc_attr( (string) ( $source['key'] ?? '' ) ); ?>">
+									<?php echo esc_html( (string) ( $source['label'] ?? '' ) ); ?>
+								</option>
+							<?php endforeach; ?>
+						</select>
+					</td>
+				</tr>
+				<tr>
+					<th scope="row"><label for="tbay-rep-dims"><?php esc_html_e( 'Grouped by', 'tbay-rewards' ); ?></label></th>
+					<td>
+						<input type="text" id="tbay-rep-dims" name="dimensions" class="regular-text"
+							placeholder="month, campaign" />
+						<p class="description"><?php esc_html_e( 'Up to four, separated by commas. Leave empty for one total row.', 'tbay-rewards' ); ?></p>
+					</td>
+				</tr>
+				<tr>
+					<th scope="row"><label for="tbay-rep-measures"><?php esc_html_e( 'Showing', 'tbay-rewards' ); ?></label></th>
+					<td>
+						<input type="text" id="tbay-rep-measures" name="measures" class="regular-text"
+							placeholder="orders, revenue" required />
+					</td>
+				</tr>
+				<tr>
+					<th scope="row"><label for="tbay-rep-days"><?php esc_html_e( 'Covering', 'tbay-rewards' ); ?></label></th>
+					<td>
+						<input type="number" id="tbay-rep-days" name="days" min="1" max="3650" class="small-text" value="90" />
+						<?php esc_html_e( 'days. Empty for everything.', 'tbay-rewards' ); ?>
+					</td>
+				</tr>
+			</table>
+			<?php submit_button( __( 'Save report', 'tbay-rewards' ) ); ?>
+		</form>
+
+		<?php $this->render_report_catalogue( $sources ); ?>
+		<?php
+	}
+
+	/**
+	 * @param array<int,array<string,mixed>> $sources The catalogue.
+	 */
+	private function render_report_catalogue( array $sources ): void {
+		?>
+		<h3><?php esc_html_e( 'What you can ask for', 'tbay-rewards' ); ?></h3>
+		<table class="widefat striped">
+			<thead><tr>
+				<th><?php esc_html_e( 'About', 'tbay-rewards' ); ?></th>
+				<th><?php esc_html_e( 'Can be grouped by', 'tbay-rewards' ); ?></th>
+				<th><?php esc_html_e( 'Can show', 'tbay-rewards' ); ?></th>
+			</tr></thead>
+			<tbody>
+			<?php foreach ( $sources as $source ) : ?>
+				<tr>
+					<td>
+						<strong><?php echo esc_html( (string) ( $source['label'] ?? '' ) ); ?></strong><br />
+						<code><?php echo esc_html( (string) ( $source['key'] ?? '' ) ); ?></code>
+					</td>
+					<td>
+						<?php
+						echo esc_html(
+							implode(
+								', ',
+								array_map(
+									static fn( $one ) => (string) ( $one['key'] ?? '' ),
+									(array) ( $source['dimensions'] ?? array() )
+								)
+							)
+						);
+						?>
+					</td>
+					<td>
+						<?php
+						echo esc_html(
+							implode(
+								', ',
+								array_map(
+									static fn( $one ) => (string) ( $one['key'] ?? '' ),
+									(array) ( $source['measures'] ?? array() )
+								)
+							)
+						);
+						?>
+					</td>
+				</tr>
+			<?php endforeach; ?>
+			</tbody>
+		</table>
+		<?php
+	}
+
+	private function render_report_results( string $key ): void {
+		$result = $this->api->request( 'GET', '/v1/saved-reports/' . rawurlencode( $key ) . '/run' );
+		if ( is_wp_error( $result ) ) {
+			printf( '<div class="notice notice-error"><p>%s</p></div>', esc_html( $result->get_error_message() ) );
+			return;
+		}
+
+		$columns = (array) ( $result['columns'] ?? array() );
+		$rows    = (array) ( $result['rows'] ?? array() );
+		?>
+		<h2><?php echo esc_html( $key ); ?></h2>
+		<?php if ( ! empty( $result['truncated'] ) ) : ?>
+			<div class="notice notice-warning inline"><p>
+				<?php esc_html_e( 'Showing the first rows only. Narrow the window or add a limit.', 'tbay-rewards' ); ?>
+			</p></div>
+		<?php endif; ?>
+		<table class="widefat striped">
+			<thead><tr>
+				<?php foreach ( $columns as $column ) : ?>
+					<th><?php echo esc_html( (string) ( $column['label'] ?? '' ) ); ?></th>
+				<?php endforeach; ?>
+			</tr></thead>
+			<tbody>
+			<?php foreach ( $rows as $row ) : ?>
+				<tr>
+					<?php foreach ( $columns as $column ) : ?>
+						<?php
+						$field = (string) ( $column['key'] ?? '' );
+						$value = $row[ $field ] ?? '';
+						?>
+						<td>
+							<?php
+							echo esc_html(
+								'money' === ( $column['format'] ?? '' )
+									? $this->money( (int) $value )
+									: (string) $value
+							);
+							?>
+						</td>
+					<?php endforeach; ?>
+				</tr>
+			<?php endforeach; ?>
+			</tbody>
+		</table>
+		<p class="description">
+			<?php
+			printf(
+				/* translators: %s: number of rows */
+				esc_html__( '%s rows.', 'tbay-rewards' ),
+				esc_html( number_format_i18n( count( $rows ) ) )
+			);
+			?>
+		</p>
+		<?php
+	}
+
+	private function do_save_report(): string|WP_Error {
+		$key = $this->post( 'key' );
+		if ( ! preg_match( '/^[a-z0-9_]{2,64}$/', $key ) ) {
+			return new WP_Error(
+				'tbay_bad_input',
+				__( 'A report key is 2-64 characters of a-z, 0-9 or underscore.', 'tbay-rewards' )
+			);
+		}
+
+		$split = static fn( string $raw ): array => array_values(
+			array_filter( array_map( 'trim', explode( ',', $raw ) ) )
+		);
+
+		$days = trim( $this->post( 'days' ) );
+
+		$definition = array(
+			'source'     => $this->post( 'source', 'orders' ),
+			'dimensions' => $split( $this->post( 'dimensions' ) ),
+			'measures'   => $split( $this->post( 'measures' ) ),
+			// An empty field means "everything", which the API expresses as
+			// null rather than zero — a zero-day window would report on
+			// nothing at all.
+			'days'       => '' === $days ? null : (int) $days,
+		);
+
+		if ( empty( $definition['measures'] ) ) {
+			return new WP_Error( 'tbay_bad_input', __( 'A report needs at least one measure.', 'tbay-rewards' ) );
+		}
+
+		$payload = array( 'definition' => $definition );
+		$name = $this->post( 'name' );
+		if ( '' !== $name ) {
+			$payload['name'] = $name;
+		}
+
+		$result = $this->api->request( 'PUT', '/v1/saved-reports/' . rawurlencode( $key ), $payload );
+		return is_wp_error( $result ) ? $result : __( 'Report saved.', 'tbay-rewards' );
+	}
+
+	private function do_delete_report(): string|WP_Error {
+		$key = $this->post( 'key' );
+		if ( '' === $key ) {
+			return new WP_Error( 'tbay_bad_input', __( 'Which report?', 'tbay-rewards' ) );
+		}
+		$result = $this->api->request( 'DELETE', '/v1/saved-reports/' . rawurlencode( $key ) );
+		return is_wp_error( $result ) ? $result : __( 'Report deleted.', 'tbay-rewards' );
+	}
+
+	private function do_schedule_report(): string|WP_Error {
+		$key = $this->post( 'key' );
+		if ( '' === $key ) {
+			return new WP_Error( 'tbay_bad_input', __( 'Which report?', 'tbay-rewards' ) );
+		}
+
+		$recipients = array_values(
+			array_filter(
+				array_map( 'trim', explode( ',', $this->post( 'recipients' ) ) ),
+				static fn( string $address ): bool => is_email( $address ) !== false
+			)
+		);
+		if ( empty( $recipients ) ) {
+			return new WP_Error(
+				'tbay_bad_input',
+				__( 'Give at least one email address to send it to.', 'tbay-rewards' )
+			);
+		}
+
+		$result = $this->api->request(
+			'PUT',
+			'/v1/saved-reports/' . rawurlencode( $key ) . '/schedule',
+			array(
+				'cadence'    => $this->post( 'cadence', 'weekly' ),
+				'hour'       => (int) $this->post( 'hour', '7' ),
+				'recipients' => $recipients,
+				'enabled'    => true,
+			)
+		);
+		return is_wp_error( $result ) ? $result : __( 'Schedule saved.', 'tbay-rewards' );
+	}
+
+	private function do_send_report(): string|WP_Error {
+		$key = $this->post( 'key' );
+		if ( '' === $key ) {
+			return new WP_Error( 'tbay_bad_input', __( 'Which report?', 'tbay-rewards' ) );
+		}
+		$result = $this->api->post( '/v1/saved-reports/' . rawurlencode( $key ) . '/send', array() );
+		if ( is_wp_error( $result ) ) {
+			return $result;
+		}
+		return sprintf(
+			/* translators: %s: number of recipients */
+			__( 'Sent to %s.', 'tbay-rewards' ),
+			number_format_i18n( (int) ( $result['sent'] ?? 0 ) )
+		);
 	}
 
 }

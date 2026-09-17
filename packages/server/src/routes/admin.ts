@@ -36,6 +36,20 @@ import {
 } from '../services/operators.js';
 import { hashToken, randomToken } from '../lib/crypto.js';
 import {
+  deleteReport,
+  describeSources,
+  listReports,
+  runReport,
+  toCsv,
+  upsertReport,
+} from '../services/reports.js';
+import {
+  deleteSchedule,
+  listSchedules,
+  sendNow,
+  upsertSchedule,
+} from '../services/report-schedules.js';
+import {
   deletePointType,
   listPointTypes,
   upsertPointType,
@@ -113,6 +127,25 @@ import {
  *
  * All of it sits behind the tenant's secret key — never the public site key.
  */
+
+/**
+ * The shape of a report definition.
+ *
+ * Shape only — every name inside is checked against the catalogue in
+ * services/reports.ts, which is where "is this a real dimension" is decided.
+ * Zod cannot know that, and duplicating the catalogue here would be two lists
+ * to keep in step.
+ */
+const reportDefinitionSchema = z.object({
+  source: z.string().max(40),
+  dimensions: z.array(z.string().max(60)).max(4).default([]),
+  measures: z.array(z.string().max(60)).min(1).max(8),
+  filters: z.record(z.unknown()).optional(),
+  days: z.number().int().min(1).max(3650).nullable().optional(),
+  sort: z.string().max(60).nullish(),
+  sortAsc: z.boolean().optional(),
+  limit: z.number().int().min(1).max(50_000).optional(),
+});
 
 const keySchema = z.string().regex(/^[a-z0-9_]{2,64}$/, 'Use 2-64 chars of a-z, 0-9 or underscore');
 
@@ -344,6 +377,132 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
         })),
       ],
     };
+  });
+
+  // ── Saved reports ──────────────────────────────────────────────────────────
+  //
+  // `/v1/saved-reports`, not `/v1/reports`. The latter is the fixed analytics
+  // — overview, pages, products, traffic sources — and a `:key` parameter
+  // mounted there would shadow every one of them, including the
+  // `/v1/reports/sources` this very endpoint nearly collided with.
+
+  /** Everything a report can be built from: sources, dimensions, measures. */
+  app.get('/v1/saved-reports/catalogue', async () => ({ sources: describeSources() }));
+
+  app.get('/v1/saved-reports', async (request) => {
+    const tenant = tenantOf(request);
+    return {
+      reports: await listReports(tenant.id),
+      schedules: await listSchedules(tenant.id),
+    };
+  });
+
+  app.put<{ Params: { key: string } }>('/v1/saved-reports/:key', async (request) => {
+    const tenant = tenantOf(request);
+    const schema = z.object({
+      name: z.string().min(1).max(200).optional(),
+      description: z.string().max(500).optional(),
+      definition: reportDefinitionSchema,
+    });
+    const input = parse(schema, request.body);
+    return {
+      report: await upsertReport(tenant.id, {
+        key: request.params.key,
+        ...input,
+        // The filter tree's *shape* is checked by the segment filter compiler,
+        // which is where every field name and operator is looked up. Zod only
+        // knows it is an object.
+        definition: input.definition as never,
+      }),
+    };
+  });
+
+  app.delete<{ Params: { key: string } }>('/v1/saved-reports/:key', async (request) => {
+    const tenant = tenantOf(request);
+    return { removed: await deleteReport(tenant.id, request.params.key) };
+  });
+
+  /**
+   * Run a definition without saving it, so the admin screen can show the
+   * numbers while somebody is still deciding what to ask for.
+   */
+  app.post('/v1/saved-reports/run', async (request) => {
+    const tenant = tenantOf(request);
+    const input = parse(z.object({ definition: reportDefinitionSchema }), request.body);
+    return runReport(tenant.id, input.definition as never);
+  });
+
+  app.get<{ Params: { key: string } }>('/v1/saved-reports/:key/run', async (request) => {
+    const tenant = tenantOf(request);
+    const report = await queryOne<{ definition: unknown }>(
+      db(),
+      'SELECT definition FROM reports WHERE tenant_id = $1 AND key = $2',
+      [tenant.id, request.params.key],
+    );
+    if (!report) throw ApiError.notFound(`No report "${request.params.key}"`);
+    return runReport(tenant.id, report.definition as never);
+  });
+
+  app.get<{ Params: { key: string } }>('/v1/saved-reports/:key/run.csv', async (request, reply) => {
+    const tenant = tenantOf(request);
+    const report = await queryOne<{ definition: unknown; name: string }>(
+      db(),
+      'SELECT definition, name FROM reports WHERE tenant_id = $1 AND key = $2',
+      [tenant.id, request.params.key],
+    );
+    if (!report) throw ApiError.notFound(`No report "${request.params.key}"`);
+
+    const result = await runReport(tenant.id, report.definition as never);
+    const stamp = new Date().toISOString().slice(0, 10);
+    return reply
+      .header('content-type', 'text/csv; charset=utf-8')
+      .header(
+        'content-disposition',
+        `attachment; filename="${request.params.key}-${stamp}.csv"`,
+      )
+      .send(toCsv(result));
+  });
+
+  app.put<{ Params: { key: string } }>('/v1/saved-reports/:key/schedule', async (request) => {
+    const tenant = tenantOf(request);
+    const schema = z.object({
+      cadence: z.enum(['daily', 'weekly', 'monthly']).optional(),
+      hour: z.number().int().min(0).max(23).optional(),
+      dayOfWeek: z.number().int().min(0).max(6).optional(),
+      // 28 rather than 31, so February never silently skips a send.
+      dayOfMonth: z.number().int().min(1).max(28).optional(),
+      recipients: z.array(z.string().email().max(254)).max(20).optional(),
+      enabled: z.boolean().optional(),
+    });
+    const input = parse(schema, request.body ?? {});
+    return {
+      schedule: await upsertSchedule(tenant.id, { reportKey: request.params.key, ...input }),
+    };
+  });
+
+  app.delete<{ Params: { key: string } }>('/v1/saved-reports/:key/schedule', async (request) => {
+    const tenant = tenantOf(request);
+    return { removed: await deleteSchedule(tenant.id, request.params.key) };
+  });
+
+  /** Send one now, without consuming the scheduled send. */
+  app.post<{ Params: { key: string } }>('/v1/saved-reports/:key/send', async (request) => {
+    const tenant = tenantOf(request);
+    return sendNow(tenant.id, request.params.key);
+  });
+
+  app.get<{ Querystring: { limit?: string } }>('/v1/saved-reports/runs', async (request) => {
+    const tenant = tenantOf(request);
+    const limit = limitOf(request.query.limit, 50, 500);
+    const { rows } = await db().query(
+      `SELECT rr.*, r.key AS report_key, r.name AS report_name
+         FROM report_runs rr
+         LEFT JOIN reports r ON r.id = rr.report_id
+        WHERE rr.tenant_id = $1
+        ORDER BY rr.created_at DESC LIMIT ${limit}`,
+      [tenant.id],
+    );
+    return { runs: rows };
   });
 
   // ── Operators, keys and the record ─────────────────────────────────────────
