@@ -1344,6 +1344,58 @@ describe('a key flood cannot buy anybody a fresh window (HIGH)', () => {
     expect(after.remaining).toBe(0);
   });
 
+  it('keeps blocking every rejected caller, not the first fifty thousand (HIGH)', async () => {
+    // The carry was capped at a quarter of the ceiling, and rotate walks in
+    // insertion order -- so the at-limit bucket past the cap was dropped, and
+    // the scheduled sweep then emptied the previous generation *including
+    // unexpired windows*, so it could be gone within one sixty-second sweep
+    // rather than two generations. That is a ranking again, in disguise, and
+    // it produced the same outcome as the four designs before it: at limit,
+    // refused; after an unrelated flood, allowed with a full allowance.
+    const { rateLimit, resetRateLimits } = await import('../src/lib/ratelimit.js');
+    resetRateLimits();
+
+    // A crowd of blocked callers ahead of the victim, larger than any cap
+    // expressed as a fraction of the ceiling.
+    for (let n = 0; n < 60_000; n += 1) {
+      for (let i = 0; i < 11; i += 1) {
+        rateLimit(`ingest:crowd:i:10.1.${n % 256}.${n % 251}:a:c${n}`, 10);
+      }
+    }
+    for (let n = 0; n < 12; n += 1) rateLimit('ingest:victim:i:1.2.3.4', 10);
+    expect(rateLimit('ingest:victim:i:1.2.3.4', 10).allowed).toBe(false);
+
+    for (let n = 0; n < 400_000; n += 1) rateLimit(`ingest:flooder:i:10.0.0.1:a:f${n}`, 1_000_000);
+
+    const after = rateLimit('ingest:victim:i:1.2.3.4', 10);
+    expect(after.allowed).toBe(false);
+    expect(after.remaining).toBe(0);
+  });
+
+  it('does not reset a caller\'s count when the sweep runs (MEDIUM)', async () => {
+    // The scheduled sweep emptied the previous generation outright, unexpired
+    // windows and all, so a bucket a rotation had just demoted lost its count
+    // to the next sweep rather than surviving two full generations. For an
+    // at-limit bucket the carry above makes that unreachable; for an ordinary
+    // caller accumulating toward their limit it is the difference between a
+    // limiter that counts and one that keeps starting again.
+    const { rateLimit, resetRateLimits } = await import('../src/lib/ratelimit.js');
+    resetRateLimits();
+
+    // A steady caller, well short of their limit.
+    for (let n = 0; n < 5; n += 1) rateLimit('ingest:steady:i:9.9.9.9:a:v1', 600);
+    // Enough fresh keys to rotate them into the previous generation.
+    for (let n = 0; n < 100_050; n += 1) rateLimit(`ingest:noise:i:8.8.8.8:a:n${n}`, 600);
+
+    // Force the scheduled sweep: its trigger is the window of the call that
+    // notices, so a one-millisecond window fires it without touching anybody
+    // else's sixty-second windows.
+    rateLimit('other:sweep-probe', 10, 1);
+
+    // Their count survived: the sixth request is the sixth, not the first.
+    expect(600 - rateLimit('ingest:steady:i:9.9.9.9:a:v1', 600).remaining).toBe(6);
+  });
+
   it('cannot reach the tenant bucket from the ingest class at all', async () => {
     const { rateLimit, resetRateLimits, rateLimitSizes } = await import(
       '../src/lib/ratelimit.js'
@@ -1366,8 +1418,11 @@ describe('a key flood cannot buy anybody a fresh window (HIGH)', () => {
 
     // And the flood is held at its own ceiling rather than growing without
     // bound: sweeping alone frees nothing while the keys are still live.
+    // Distinct keys, not live.size + old.size -- a carried window is in both
+    // maps, so adding them reported more keys than exist and made this
+    // assertion unfailable.
     const sizes = rateLimitSizes();
-    expect(sizes.ingest).toBeLessThanOrEqual(400_000); // two generations
+    expect(sizes.ingest).toBeLessThanOrEqual(200_000); // two generations at the ceiling
     expect(sizes.admin).toBe(20);
   });
 

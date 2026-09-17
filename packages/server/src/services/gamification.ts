@@ -957,6 +957,7 @@ export async function reevaluateAll(
     for (const row of rows) {
       contacts += 1;
       let badgeFailed = false;
+      let rankFailed = false;
 
       // One transaction per contact. `runner` here is the pool, so handing it
       // straight to evaluateBadges made its ledger INSERT and the balance
@@ -1027,11 +1028,15 @@ export async function reevaluateAll(
         } else if (problems.length < 20) {
           problems.push(`${row.id}: ${error.message}`);
         }
-        badgeFailed = true;
+        rankFailed = true;
       }
 
-      // One contact counts once, however many of its two halves refused.
-      if (badgeFailed) skipped += 1;
+      // Skipped means nothing was written for this contact, not "something
+      // went wrong somewhere". Counting the badge half alone reported a member
+      // as skipped whose rank had just been written -- and the whole purpose of
+      // splitting the transactions was that one half failing no longer costs
+      // the other. `problems` is where a half-failure is visible.
+      if ((!doBadges || badgeFailed) && (!doRanks || rankFailed)) skipped += 1;
     }
 
     after = rows[rows.length - 1]!.id;

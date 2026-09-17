@@ -166,8 +166,29 @@ const TRANSPORT_WORDS =
  * statement about our credentials. Suppressing a customer because our SMTP
  * password expired is the worst failure mode this file has.
  */
-const AUTH_FAILURE =
-  /\bauthentication\b|invalid login|username and password not accepted|\bbad credentials\b|\b5\.7\.8\b/i;
+const AUTH_FAILURE = new RegExp(
+  [
+    // Qualified, never the bare word. Gmail's standard policy block reads
+    // "This message does not have authentication information or fails to pass
+    // authentication checks. The message has been blocked" -- a permanent
+    // refusal about our sending domain, which as `transport` never gives up
+    // and is retried every sixty seconds until the three-day reaper: about
+    // 4,320 attempts per recipient, aimed at the provider already refusing us
+    // on reputation grounds.
+    'authentication (?:failed|required|unsuccessful|not enabled)',
+    'invalid login',
+    'username and password not accepted',
+    '\\bbad credentials\\b',
+    // Lookarounds for the same reason ENHANCED_STATUS has them: an IP address
+    // contains three-part runs. Postfix embeds "host NAME[IP]" in a relayed
+    // bounce, so a dead mailbox behind relay 192.5.7.8 read as an
+    // authentication failure -- never suppressed, attempt refunded, retried
+    // for three days. That is the failure removing the bare code set was
+    // meant to end.
+    '(?<![\\d.])5\\.7\\.8(?![\\d.])',
+  ].join('|'),
+  'i',
+);
 
 /**
  * Rejections that are about the message or about our sending domain.
@@ -242,6 +263,31 @@ const MAILBOX_GONE = new RegExp(
     'account has been (?:disabled|discontinued|deactivated)',
     // Exim.
     'unroute?able address',
+  ].join('|'),
+  'i',
+);
+
+/**
+ * The subset that names the recipient, for overriding a policy status.
+ *
+ * A 5.7.x reply is about security or policy, and only wording that says a
+ * *person's mailbox* is gone may outrank that. "Account", "address" and
+ * "user" are not interchangeable here: a relay says "this account has been
+ * disabled" about the account we authenticate with, and Exim says
+ * "unrouteable address" about a domain -- neither is evidence that the
+ * recipient's mailbox does not exist, and both arrive identically for every
+ * recipient of the same broadcast.
+ */
+const RECIPIENT_GONE = new RegExp(
+  [
+    'no such (?:user|recipient|mailbox)',
+    '(?:user|recipient|mailbox) unknown',
+    'unknown (?:user|recipient|mailbox)',
+    'mailbox (?:not found|unavailable|does not exist|disabled)',
+    '(?:user|recipient|mailbox) (?:does not exist|not found|no longer exists)',
+    'invalid (?:recipient|mailbox)',
+    'no mailbox',
+    'user (?:is )?(?:disabled|terminated|suspended)',
   ].join('|'),
   'i',
 );
@@ -423,7 +469,21 @@ export function classifyFailure(message: string): FailureKind {
         // address rejected" wraps blocks and dead mailboxes alike, so it is
         // deliberately not enough -- that wrapper is what made a Spamhaus
         // listing suppress a whole batch.
-        return MAILBOX_GONE.test(said) ? 'hard' : 'soft';
+        //
+        // Two guards, both load-bearing. Without the severity check this arm
+        // returned before the transient fall-through could reach it, so
+        // "450 4.7.1 Recipient address rejected: mailbox unavailable, try
+        // again later" -- a deferral -- came back `hard`, and `hard`
+        // suppresses on the first attempt, permanently, without consulting
+        // `saysSomethingAboutTheMailbox` at all. Every other subject arm
+        // checks severity; these two did not.
+        //
+        // And the wording has to name a *recipient*. "This account has been
+        // disabled" is how a relay refuses our own sending account, which hits
+        // every recipient of a broadcast identically -- the exact batch
+        // disaster the gate exists to prevent, arriving through the one verdict
+        // that never reaches the gate.
+        return reply.severity === 5 && RECIPIENT_GONE.test(said) ? 'hard' : 'soft';
       default:
         break; // 4, 5 and anything unregistered fall through to the wording.
     }

@@ -949,6 +949,10 @@ describe('every writer reaches for the contact before anything else', () => {
     expect(swept.problems.length).toBe(1);
     expect(swept.problems[0]).toContain(people[5]!);
     expect(swept.problems[0]).toMatch(/currency is turned off/i);
+    // And nobody was reported as skipped, because nobody was: the rank half
+    // ran and committed for all ten. "Skipped" has to mean nothing was
+    // written, or the count it replaced is no more actionable than before.
+    expect(swept.skipped).toBe(0);
     // Everybody was re-ranked -- including the member whose badge refused,
     // whose rank has nothing to do with that badge, and including everyone
     // after them, which is what the aborting version left on stale tiers.

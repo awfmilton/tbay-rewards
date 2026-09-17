@@ -28,6 +28,29 @@ export function hashToken(token: string): string {
 }
 
 /**
+ * A wallet address in a form the database cannot turn back into a wallet.
+ *
+ * Keyed with TOKEN_SECRET rather than the tenant's `pii_salt`, and that is the
+ * whole point. `pii_salt` is a column in the same database as
+ * `members.wallet_address`, which is a *small* table holding every wallet the
+ * platform knows -- so an adversary at the database, which is the adversary
+ * this exists for, reads the salt, hashes five thousand candidate wallets and
+ * matches the digest in a tenth of a millisecond. Measured. There is no
+ * 160-bit space to search when the answers are sitting in the next table.
+ *
+ * The tenant id is still mixed in, so the same wallet at two retailers gives
+ * two digests and the erasure does not create a cross-retailer join of its
+ * own. Within one retailer it is deliberately stable: settling a transfer by
+ * hand means comparing a candidate address against it.
+ */
+export function walletDigest(address: string, tenantId: string): string {
+  return createHmac('sha256', config().security.tokenSecret)
+    .update(`wallet:${tenantId}:${address.trim().toLowerCase()}`)
+    .digest('hex')
+    .slice(0, 32);
+}
+
+/**
  * Hash PII (IP, user agent) with a per-tenant salt. Lets us count uniques and
  * detect abuse without ever storing the raw value.
  */

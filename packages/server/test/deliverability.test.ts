@@ -56,6 +56,84 @@ describe('classifying a delivery failure', () => {
     }
   });
 
+  it('never suppresses on a transient, whatever wording it carries (HIGH)', async () => {
+    // `hard` suppresses on the first attempt, permanently, and never consults
+    // saysSomethingAboutTheMailbox. So an arm that can return `hard` for a 4xx
+    // is a hole straight through the gate -- and the subject 6/7 arm had no
+    // severity check, while every other arm did. A deferral quoting mailbox
+    // wording took a live customer off the list forever on one reply.
+    for (const message of [
+      '450 4.7.1 Recipient address rejected: mailbox unavailable, try again later',
+      '451 4.7.1 <them@example.com>: Recipient address rejected: User unknown, retrying',
+      '450 4.6.0 Message content deferred, mailbox not found in cache',
+    ]) {
+      const address = `transient-${Math.random().toString(36).slice(2)}@example.com`;
+      expect(await recordFailure(tenant.id, address, message, 1, 6), message).not.toBe('hard');
+      expect(await isSuppressed(tenant.id, address), message).toBeNull();
+    }
+
+    // The control: the same wording at a permanent severity is a dead mailbox
+    // and is still suppressed immediately.
+    const dead = `dead-${Math.random().toString(36).slice(2)}@example.com`;
+    expect(await recordFailure(tenant.id, dead, '550 5.7.1 No such user!', 1, 6)).toBe('hard');
+    expect(await isSuppressed(tenant.id, dead)).not.toBeNull();
+  });
+
+  it('does not read a refusal about our own account as a dead mailbox (HIGH)', async () => {
+    // "This account has been disabled" is how a relay refuses the account we
+    // authenticate with. It arrives identically for every recipient of a
+    // broadcast, so reading it as a hard bounce suppressed the whole audience
+    // permanently on the first attempt -- through `hard`, which never reaches
+    // the gate that exists to stop exactly this.
+    for (const message of [
+      '550 5.7.1 This account has been disabled',
+      '550 5.7.0 Your account has been deactivated for policy reasons',
+    ]) {
+      const address = `ours-${Math.random().toString(36).slice(2)}@example.com`;
+      expect(await recordFailure(tenant.id, address, message, 1, 6), message).toBe('soft');
+      expect(await isSuppressed(tenant.id, address), message).toBeNull();
+    }
+
+    // The control: wording that names the *recipient* still decides.
+    expect(classifyFailure('550 5.7.1 <them@example.com>: mailbox unavailable')).toBe('hard');
+  });
+
+  it('does not read a policy block as an authentication failure (MEDIUM)', () => {
+    // Gmail's standard block for an unauthenticated sender contains the word
+    // "authentication" twice, and the bare word was enough to call it
+    // transport -- which never gives up and retries every sixty seconds until
+    // the three-day reaper: about 4,320 attempts per recipient, aimed at the
+    // provider already refusing us on reputation grounds.
+    expect(
+      classifyFailure(
+        '550-5.7.1 [209.85.220.41] This message does not have authentication information\n' +
+          '550 5.7.1 or fails to pass authentication checks. The message has been blocked.',
+      ),
+    ).toBe('soft');
+    expect(
+      classifyFailure('550 5.7.26 Your message is not accepted because the sender is unauthenticated'),
+    ).toBe('soft');
+
+    // The controls: a real refusal of our credentials is still about us.
+    expect(classifyFailure('Invalid login: 535 5.7.8 Error: authentication failed')).toBe(
+      'transport',
+    );
+    expect(classifyFailure('535 5.7.3 Authentication unsuccessful')).toBe('transport');
+  });
+
+  it('does not read an enhanced status out of a relay IP address (MEDIUM)', () => {
+    // The same class of bug the reply parser was written to end -- an IP
+    // address contains three-part runs -- reintroduced by an unguarded
+    // `\b5\.7\.8\b`. Postfix embeds "host NAME[IP]" in a relayed bounce, so a
+    // dead mailbox behind relay 192.5.7.8 read as an authentication failure:
+    // never suppressed, attempt refunded, retried for three days.
+    const dead = (relay: string) =>
+      `550 5.1.1 host mx.example.com[${relay}] said: 550 5.1.1 <them@example.com>: User unknown in virtual mailbox table`;
+    expect(classifyFailure(dead('192.5.7.8'))).toBe('hard');
+    // The control, one digit different, which always worked.
+    expect(classifyFailure(dead('192.5.7.9'))).toBe('hard');
+  });
+
   it('does not count a reputation block toward suppression either (HIGH)', async () => {
     // Classifying a block as soft is only half of it. A soft failure still
     // suppresses for thirty days once the attempts run out, so the gate that
