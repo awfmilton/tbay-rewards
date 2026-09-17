@@ -1,6 +1,6 @@
 import { db, queryOne, withTransaction, type Queryable } from '../db/pool.js';
 import { ApiError } from '../lib/errors.js';
-import { hashPii } from '../lib/crypto.js';
+import { hashPii, walletDigest } from '../lib/crypto.js';
 import { getTenantById, type Tenant } from './tenants.js';
 import { SPEND_SETTLEMENT_DAYS } from './token.js';
 
@@ -355,16 +355,28 @@ export async function eraseContact(
     //
     // A keyed digest settles the question without answering it. A retailer
     // with an unexplained transfer at their payout wallet hashes the sending
-    // address and compares; the digest is salted per tenant and 160 bits of
-    // address are not enumerable, so it cannot be turned back into a wallet or
-    // joined against one. Nothing needs revisiting later, because nothing
-    // identifying is left to remove.
-    const digest = (address: string): string => `erased:${hashPii(address.toLowerCase(), tenant.pii_salt)}`;
+    // address and compares. Its key lives outside the database -- see
+    // walletDigest, and the reason it is not the tenant's pii_salt -- so the
+    // join above cannot be rebuilt by anybody holding only the data. Nothing
+    // needs revisiting later, because nothing identifying is left to remove.
+    const digest = (address: string): string => `erased:${walletDigest(address, tenantId)}`;
     const openIntents = await client.query<{ id: string; from_address: string }>(
       `SELECT id, from_address FROM token_spend_intents
         WHERE tenant_id = $1 AND contact_id = $2
           AND from_address NOT LIKE 'erased:%'
-          AND status = 'expired' AND expires_at > now() - ($3 || ' days')::interval`,
+          -- The same predicate verifySpendIntent claims on, deliberately, and
+          -- written next to it for that reason. It used to name only the
+          -- expired rows while the claim named the pending ones too, and the
+          -- gap between them was destroying money: nothing moves an intent out
+          -- of pending except a five-minute worker that does not run at all
+          -- when RUN_WORKERS=false, while the erasure refusal lifts the
+          -- instant expires_at passes. A retailer retrying the erasure until it
+          -- stops answering "checkout in progress" lands in that gap almost
+          -- every time, and the address is overwritten rather than digested --
+          -- so the customer's TBAY sits at the payout wallet and the credit
+          -- can never be issued by any route.
+          AND status IN ('pending', 'expired')
+          AND expires_at > now() - ($3 || ' days')::interval`,
       [tenantId, contactId, String(SPEND_SETTLEMENT_DAYS)],
     );
     for (const intent of openIntents.rows) {
@@ -388,27 +400,32 @@ export async function eraseContact(
       [tenantId, contactId, ERASED_ADDRESS],
     );
 
-    // A released or rejected bridge withdrawal owes nothing, so its addresses
-    // go. One still in flight has to keep them: those L2 tokens are burned and
-    // the L1 release can only reach the wallet that burned them, so a digest
-    // is no use -- somebody has to send to that address.
-    await client.query(
-      `UPDATE bridge_withdrawals
-          SET from_address = $3, l1_recipient = $3
-        WHERE tenant_id = $1 AND contact_id = $2
-          AND status IN ('released', 'rejected')`,
-      [tenantId, contactId, ERASED_ADDRESS],
-    );
-    // So the *link* goes instead, `contact_id` included. What is left is a
-    // debt to a wallet with nothing in this system saying whose it was --
-    // which is the only shape that both honours the obligation and answers
-    // the erasure. The retailer finds it the way they find every other
-    // outstanding release, by listing burn_verified withdrawals.
+    // A bridge withdrawal's addresses go too, unsettled or not -- and the
+    // chain is what makes that safe.
+    //
+    // Keeping them and nulling the links instead did not work: the
+    // re-identification join never used the links. It runs
+    // `bridge_withdrawals.from_address -> members.wallet_address -> contacts`,
+    // and `members.wallet_address` is plaintext, unique and platform-wide, so
+    // the kept address led straight to that person's live, named record at
+    // another retailer. Reproduced: one join, one row, name and email, with
+    // contact_id and member_id already null.
+    //
+    // Encrypting the address would have been theatre, because `burn_tx_hash`
+    // stays and anybody can read the sender off that transaction. The honest
+    // reading is that a burn is a public record and the address is not ours to
+    // hide -- what is ours is whether *this database* offers the join, and it
+    // no longer does. The obligation survives intact: recordWithdrawal already
+    // says the burn event proves who owned the tokens and nothing else does,
+    // so the operator recovers the payable address from the chain, from the
+    // same authority that put it here. See recipientFor in bridge.ts.
     const stillOwed = await client.query<{ status: string }>(
-      `UPDATE bridge_withdrawals SET member_id = NULL, contact_id = NULL
+      `UPDATE bridge_withdrawals
+          SET member_id = NULL, contact_id = NULL,
+              from_address = $3, l1_recipient = $3
         WHERE tenant_id = $1 AND contact_id = $2
         RETURNING status`,
-      [tenantId, contactId],
+      [tenantId, contactId, ERASED_ADDRESS],
     );
     const obligationsKept = stillOwed.rows.filter(
       (row) => row.status === 'pending' || row.status === 'burn_verified',

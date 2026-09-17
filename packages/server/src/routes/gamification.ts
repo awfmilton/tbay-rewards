@@ -27,6 +27,7 @@ import {
   getWithdrawal,
   listWithdrawals,
   markReleased,
+  recipientFor,
   recordWithdrawal,
   rejectWithdrawal,
   withdrawalInstructions,
@@ -354,7 +355,11 @@ export async function gamificationRoutes(app: FastifyInstance): Promise<void> {
     if (!withdrawal || withdrawal.tenant_id !== tenant.id) {
       throw ApiError.notFound('Withdrawal not found');
     }
-    return { withdrawal };
+    // The address to actually pay, recovered from the burn transaction when
+    // the stored one was erased. See recipientFor: an erasure drops the wallet
+    // because keeping it left a join back to the person, and the chain is the
+    // authority for it either way.
+    return { withdrawal, payable_to: await recipientFor(withdrawal) };
   });
 
   /**

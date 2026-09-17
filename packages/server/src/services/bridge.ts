@@ -250,6 +250,37 @@ export async function getWithdrawal(
  * credential at the route layer), because it asserts that L1 tokens have
  * actually moved — something this service cannot observe from L2.
  */
+/**
+ * The wallet an L1 release must actually reach.
+ *
+ * Normally `l1_recipient`, which recordWithdrawal derived from the burn. After
+ * an erasure it is the sentinel address, because keeping the real one left a
+ * join from this row to the erased person's live record at another retailer --
+ * `members.wallet_address` is plaintext, unique and platform-wide.
+ *
+ * Nothing is lost by dropping it: the burn transaction is on a public chain
+ * and its sender is the authority for who owned those tokens, which is exactly
+ * how it got here. Recovering it costs one RPC call at the moment somebody is
+ * about to send money, which is the right moment to be reading the chain
+ * anyway.
+ */
+export async function recipientFor(
+  withdrawal: Pick<BridgeWithdrawal, 'l1_recipient' | 'burn_tx_hash'>,
+): Promise<string | null> {
+  if (!ERASED_RECIPIENT.test(withdrawal.l1_recipient)) return withdrawal.l1_recipient;
+
+  const client = chain();
+  if (!client) return null;
+  const transfers = await client.transfersInTx(withdrawal.burn_tx_hash);
+  const burn = transfers.find(
+    (transfer) => transfer.to.toLowerCase() === BURN_ADDRESS && transfer.value > 0n,
+  );
+  return burn ? burn.from.toLowerCase() : null;
+}
+
+/** The address privacy.ts writes over an erased person's wallet. */
+const ERASED_RECIPIENT = /^0x0{38}ff$/i;
+
 export async function markReleased(
   id: string,
   l1TxHash: string,

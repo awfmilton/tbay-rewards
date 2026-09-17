@@ -65,20 +65,42 @@ interface Klass {
  * limit, which is the only eviction that would actually buy anybody throughput.
  */
 const CEILINGS: Record<string, number> = {
-  admin: 100_000,
-  ingest: 200_000,
-  other: 50_000,
+  admin: 50_000,
+  ingest: 100_000,
+  other: 25_000,
 };
 
 /**
- * How much of a generation may be carried over for being at its limit.
+ * Halved when the second generation arrived, on purpose.
  *
- * A bucket only qualifies by exceeding its own limit, which costs the caller
- * that many requests, so in practice this is far out of reach -- 200,000
- * blocked ingest buckets would take 120 million requests inside one window. It
- * is here so that a full carry cannot rotate the generation on every insert.
+ * Two generations hold up to twice the ceiling between them, so leaving these
+ * at their single-map values would have quietly doubled the limiter's own
+ * footprint -- about 58 MB for ingest alone, on API containers that are often
+ * sized in hundreds. Halving keeps the worst case where it was. A node busier
+ * than the ceiling is not an error and loses nothing: it simply rotates more
+ * often, at the same amortised cost, and a caller at their limit is carried
+ * across every rotation however many there are.
  */
-const CARRY_FRACTION = 0.25;
+
+/**
+ * The backstop on the carry, not a budget.
+ *
+ * It was a quarter of the ceiling, and that quarter was a ranking in disguise:
+ * rotate walks in insertion order and stops when it fills, so the fifty
+ * thousand and first blocked caller was dropped -- and the scheduled sweep
+ * discarded the whole previous generation unexpired, so they could be gone
+ * inside sixty seconds rather than two generations. Measured: with 50,000
+ * at-limit buckets ahead of them, a blocked caller came back allowed with a
+ * full 3,000 allowance. The same failure as the four designs before it, moved
+ * behind a threshold.
+ *
+ * Nine tenths, and only so that a carry cannot fill a generation outright and
+ * rotate on every insert. Reaching it means 180,000 ingest buckets are
+ * simultaneously over their limit, which costs about 108 million requests
+ * inside one window; at that point every key in the map is a caller being
+ * rejected and dropping the oldest of them is the only thing left to do.
+ */
+const CARRY_FRACTION = 0.9;
 
 const classes = new Map<string, Klass>();
 let lastSweep = Date.now();
@@ -106,6 +128,12 @@ export interface RateLimitResult {
  * quadratic in practice. This runs once per ceiling-worth of inserts, so it is
  * one carried entry per insert amortised.
  */
+function unexpired(windows: Map<string, Window>, now: number): Map<string, Window> {
+  const keep = new Map<string, Window>();
+  for (const [key, window] of windows) if (window.resetAt > now) keep.set(key, window);
+  return keep;
+}
+
 function rotate(klass: Klass, ceiling: number, now: number): void {
   const carried = new Map<string, Window>();
   const carryCap = Math.floor(ceiling * CARRY_FRACTION);
@@ -126,12 +154,14 @@ export function rateLimit(key: string, limit: number, windowMs = 60_000): RateLi
   // did.
   if (now - lastSweep > windowMs) {
     for (const klass of classes.values()) {
-      klass.old = new Map();
-      const keep = new Map<string, Window>();
-      for (const [existing, window] of klass.live) {
-        if (window.resetAt > now) keep.set(existing, window);
-      }
-      klass.live = keep;
+      // Both generations, and by filtering rather than discarding. Emptying
+      // `old` outright threw away unexpired windows a rotation had only just
+      // demoted, so a bucket that should have survived two full generations
+      // could vanish inside one sweep -- which is how a blocked caller
+      // dropped by the carry cap got a fresh allowance sixty seconds later
+      // rather than after two turns of the map.
+      klass.live = unexpired(klass.live, now);
+      klass.old = unexpired(klass.old, now);
     }
     lastSweep = now;
   }
@@ -191,6 +221,14 @@ export function rateLimitSizes(): Record<string, number> {
   // confused with the method it is named after -- the same trap classOf sits
   // next to.
   const sizes: Record<string, number> = Object.create(null) as Record<string, number>;
-  for (const [name, klass] of classes) sizes[name] = klass.live.size + klass.old.size;
+  for (const [name, klass] of classes) {
+    // Distinct keys. A carried window is in both maps -- rotate builds the new
+    // live *from* live and then assigns the old one -- so adding the sizes
+    // reported 50,020 for 50,010 keys, and made the ceiling assertion in the
+    // tests unfailable.
+    let distinct = klass.live.size;
+    for (const key of klass.old.keys()) if (!klass.live.has(key)) distinct += 1;
+    sizes[name] = distinct;
+  }
   return sizes;
 }

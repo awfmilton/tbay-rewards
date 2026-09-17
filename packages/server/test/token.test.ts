@@ -765,6 +765,55 @@ describe('spending TBAY at a retailer', () => {
     );
   });
 
+  it('cannot have a live verification cancelled out from under it (HIGH)', async () => {
+    // Two rules were shipped together that cannot both be true: the settle
+    // says a proved transfer outranks the claim taken to look for it, and
+    // cancel says a claim older than ten minutes is abandoned and may be
+    // closed -- which the erasure error tells retailers to do. The settle's
+    // own justification was that the RPC can outlive that window, because
+    // transfersInTx makes several sequential ethers calls whose default
+    // timeout is five minutes each. So a cancel taken in good faith voided a
+    // transfer already proved on the chain: tokens at the payout wallet,
+    // credit unissuable, no reopen path.
+    //
+    // The RPC is bounded well inside the claim window now, so a stale claim
+    // means what the other three places assume. This asserts the bound rather
+    // than the race, because the bound is what makes the race impossible.
+    await updateTenantSettings(db(), tenant.id, { payoutWallet: PAYOUT });
+    const contact = await fundedContact(0, 'slow-rpc@example.com');
+    const tenantRow = await tenantObject();
+    const { intent } = await createSpendIntent(tenantRow, {
+      contact,
+      amountTokens: 5,
+      fromAddress: CUSTOMER,
+    });
+
+    setChainClient(
+      stubChain({
+        transfersInTx: async () => new Promise(() => {}) as never, // never answers
+      }),
+    );
+    // The relationship is the fix, asserted directly rather than by waiting
+    // two minutes for it: the RPC bound has to be a fraction of the window
+    // after which everything else treats the claim as abandoned.
+    const { VERIFY_RPC_TIMEOUT_MS, STALE_VERIFY_CLAIM_MS } = await import(
+      '../src/services/token.js'
+    );
+    expect(VERIFY_RPC_TIMEOUT_MS).toBeLessThan(STALE_VERIFY_CLAIM_MS / 2);
+
+    await expect(
+      verifySpendIntent(tenantRow, intent.id, '0xhangs', { rpcTimeoutMs: 300 }),
+    ).rejects.toMatchObject({ statusCode: 504 });
+
+    // And it released the claim, so the customer can retry.
+    const { rows } = await db().query<{ status: string; verify_token: string | null }>(
+      'SELECT status, verify_token FROM token_spend_intents WHERE id = $1',
+      [intent.id],
+    );
+    expect(rows[0]!.status).toBe('pending');
+    expect(rows[0]!.verify_token).toBeNull();
+  });
+
   it('can close an intent stranded mid-verification (MEDIUM)', async () => {
     // Erasure refuses while an intent is being verified and names the cancel
     // route as the remedy -- and the cancel route refused a `verifying` row,

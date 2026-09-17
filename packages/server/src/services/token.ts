@@ -12,7 +12,7 @@ import {
 } from '../lib/chain.js';
 import { getBalance, getBalances, reverse, spend, type Balance } from './points.js';
 import { assertConvertible } from './point-types.js';
-import { hashPii, randomCode } from '../lib/crypto.js';
+import { randomCode, walletDigest } from '../lib/crypto.js';
 import type { Tenant } from './tenants.js';
 import type { Contact } from './contacts.js';
 
@@ -615,6 +615,24 @@ export async function expireStaleSpendIntents(runner: Queryable = db()): Promise
 const STALE_VERIFY_CLAIM = '10 minutes';
 
 /**
+ * How long one verification may wait on the chain.
+ *
+ * Deliberately a fraction of STALE_VERIFY_CLAIM; see the call site.
+ */
+export const VERIFY_RPC_TIMEOUT_MS = 120_000;
+export const STALE_VERIFY_CLAIM_MS = 10 * 60_000;
+
+function withTimeout<T>(work: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: NodeJS.Timeout;
+  return Promise.race([
+    work,
+    new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new ApiError(504, 'chain_timeout', message)), ms);
+    }),
+  ]).finally(() => clearTimeout(timer)) as Promise<T>;
+}
+
+/**
  * How long after expiry a transfer can still be settled by hand.
  *
  * `expires_at` bounds the quote, not the money. A customer who sent their TBAY
@@ -935,7 +953,7 @@ export async function verifySpendIntent(
   tenant: Tenant,
   intentId: string,
   txHash: string,
-  opts: { minConfirmations?: number } = {},
+  opts: { minConfirmations?: number; rpcTimeoutMs?: number } = {},
 ): Promise<VerifySpendResult> {
   const client = chain();
   if (!client) throw new ApiError(503, 'chain_unavailable', 'No RPC endpoint configured');
@@ -1018,9 +1036,28 @@ export async function verifySpendIntent(
     );
   };
 
+  // Bounded, and bounded well inside STALE_VERIFY_CLAIM.
+  //
+  // Everything downstream treats a claim older than that window as a request
+  // that died -- the reaper releases it, and the retailer may cancel it, which
+  // is what the erasure error tells them to do. That is only true if a live
+  // request cannot still be sitting on the RPC. It could: transfersInTx makes
+  // several sequential ethers calls whose default fetch timeout is five
+  // minutes each, so a slow node put a real verification past the window and
+  // a cancel taken in good faith then voided a transfer that was already
+  // proved on the chain -- customer's TBAY at the payout wallet, credit
+  // unissuable, no reopen path. Reproduced.
+  //
+  // Two minutes is far more than a healthy node needs and a fifth of the
+  // window, so "the claim went stale" now means what the other three places
+  // assume it means.
   let transfers: Awaited<ReturnType<typeof client.transfersInTx>>;
   try {
-    transfers = await client.transfersInTx(txHash);
+    transfers = await withTimeout(
+      client.transfersInTx(txHash),
+      opts.rpcTimeoutMs ?? VERIFY_RPC_TIMEOUT_MS,
+      'The chain did not answer in time; try again',
+    );
   } catch (err) {
     await release();
     throw err;
@@ -1036,7 +1073,7 @@ export async function verifySpendIntent(
   // intent was opened for?" -- so a late settlement keeps working afterwards.
   const sentBy = (address: string): boolean =>
     intent.from_address.startsWith('erased:')
-      ? `erased:${hashPii(address.toLowerCase(), tenant.pii_salt)}` === intent.from_address
+      ? `erased:${walletDigest(address, tenant.id)}` === intent.from_address
       : address.toLowerCase() === intent.from_address.toLowerCase();
 
   const match = transfers.find(

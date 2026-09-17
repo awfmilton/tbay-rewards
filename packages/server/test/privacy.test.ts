@@ -999,20 +999,20 @@ describe('erasure never destroys money in flight (HIGH)', () => {
     return contact;
   }
 
-  it('keeps the payout wallet between the burn and the release (HIGH)', async () => {
+  it('leaves a burned withdrawal payable without leaving it linkable (HIGH)', async () => {
     // The worst moment to lose the recipient: the L2 tokens are gone and the
     // L1 payout has not happened yet.
     //
-    // Round five answered this by refusing the erasure, and the refusal named
-    // "releasing or rejecting" as the remedy -- both operator-only routes that
-    // answer 503 unless BRIDGE_OPERATOR_TOKEN is set, which ships empty. So
-    // the erasure could not be carried out by the retailer at all. Refusing
-    // forever is not a safer answer than destroying the record; it is a
-    // different way of not doing the job.
+    // Round five refused the erasure outright, and the refusal named
+    // operator-only routes that answer 503 unless BRIDGE_OPERATOR_TOKEN is
+    // set -- which ships empty -- so a retailer could not complete it at all.
+    // Round eight kept the addresses and nulled the links instead, which
+    // closed nothing, because the re-identification join never used the links.
     //
-    // The row is two things: a link to a person and a debt to a wallet. The
-    // link goes -- contact_id included, see the re-identification test below
-    // -- the debt stays payable, and the erasure reports it.
+    // The address goes, and the obligation survives anyway: recordWithdrawal
+    // derived it from the burn transaction, which is a public record, so the
+    // operator reads it back from the same authority. Nothing is destroyed;
+    // this database simply stops offering the join.
     const contact = await withWithdrawal('bridging@example.com', 'burn_verified');
 
     const result = await eraseContact(tenant.id, contact.id);
@@ -1026,13 +1026,27 @@ describe('erasure never destroys money in flight (HIGH)', () => {
          FROM bridge_withdrawals WHERE burn_tx_hash = $1`,
       ['0xburn-burn_verified'],
     );
-    // Still payable, to the wallet that actually burned the tokens.
-    expect(rows[0]!.l1_recipient).toBe(WALLET);
-    expect(rows[0]!.from_address).toBe(WALLET);
+    // Still owed, still findable by the retailer as an outstanding release.
     expect(rows[0]!.status).toBe('burn_verified');
-    // And nothing left in this system says whose wallet it was.
+    // But nothing about it says whose it was.
+    expect(rows[0]!.l1_recipient).not.toBe(WALLET);
+    expect(rows[0]!.from_address).not.toBe(WALLET);
     expect(rows[0]!.member_id).toBeNull();
     expect(rows[0]!.contact_id).toBeNull();
+
+    // And it is still payable, to the right wallet.
+    const { recipientFor, BURN_ADDRESS } = await import('../src/services/bridge.js');
+    const { setChainClient } = await import('../src/lib/chain.js');
+    setChainClient({
+      isNonceUsed: async () => false,
+      isPaused: async () => false,
+      balanceOf: async () => 0n,
+      transfersInTx: async () => [
+        { from: WALLET, to: BURN_ADDRESS, value: 1n, blockNumber: 1, confirmations: 3 },
+      ],
+    });
+    expect(await recipientFor(rows[0]!)).toBe(WALLET.toLowerCase());
+    setChainClient(null);
   });
 
   it('does not leave the kept wallet joinable back to the person (HIGH)', async () => {
@@ -1066,7 +1080,10 @@ describe('erasure never destroys money in flight (HIGH)', () => {
 
     await eraseContact(tenant.id, contact.id);
 
-    // The join the reviewer ran: kept address -> members -> a live contact.
+    // The join, asserted. An earlier version of this test built exactly this
+    // query into a variable and ended with `void relinked` -- it computed the
+    // vulnerability and threw the answer away, so it passed while the row was
+    // still one join from the person's name and email.
     const relinked = await db().query(
       `SELECT c.email, c.name FROM bridge_withdrawals w
          JOIN members m  ON m.wallet_address = w.from_address
@@ -1074,25 +1091,39 @@ describe('erasure never destroys money in flight (HIGH)', () => {
         WHERE w.burn_tx_hash = $1 AND w.tenant_id = $2`,
       ['0xburn-linkable', tenant.id],
     );
-    // The address is still there to be paid, but nothing ties this tenant's
-    // row to it: contact_id and member_id are gone, so the row is not
-    // reachable from the erased person and the person is not reachable from
-    // the row.
-    const kept = await db().query<{ contact_id: string | null; member_id: string | null }>(
-      'SELECT contact_id, member_id FROM bridge_withdrawals WHERE burn_tx_hash = $1',
+    expect(relinked.rowCount).toBe(0);
+
+    // Nor through the link columns.
+    const kept = await db().query<{
+      contact_id: string | null; member_id: string | null; l1_recipient: string;
+    }>(
+      'SELECT contact_id, member_id, l1_recipient FROM bridge_withdrawals WHERE burn_tx_hash = $1',
       ['0xburn-linkable'],
     );
     expect(kept.rows[0]!.contact_id).toBeNull();
     expect(kept.rows[0]!.member_id).toBeNull();
-    expect(
-      await db().query(
-        `SELECT 1 FROM bridge_withdrawals w
-           JOIN contacts c ON c.id = w.contact_id
-          WHERE w.burn_tx_hash = $1`,
-        ['0xburn-linkable'],
-      ).then((r) => r.rowCount),
-    ).toBe(0);
-    void relinked;
+    expect(kept.rows[0]!.l1_recipient).not.toBe(WALLET.toLowerCase());
+
+    // The control that makes this a fix rather than a deletion: the money is
+    // still payable, because the burn transaction says who owned the tokens
+    // and that is a public record. The wallet came out of the chain to begin
+    // with; it goes back to the chain to be read.
+    const { recipientFor, BURN_ADDRESS } = await import('../src/services/bridge.js');
+    const { setChainClient } = await import('../src/lib/chain.js');
+    setChainClient({
+      isNonceUsed: async () => false,
+      isPaused: async () => false,
+      balanceOf: async () => 0n,
+      transfersInTx: async () => [
+        { from: WALLET, to: BURN_ADDRESS, value: 1n, blockNumber: 1, confirmations: 3 },
+      ],
+    });
+    const withdrawal = await db().query<{ l1_recipient: string; burn_tx_hash: string }>(
+      'SELECT l1_recipient, burn_tx_hash FROM bridge_withdrawals WHERE burn_tx_hash = $1',
+      ['0xburn-linkable'],
+    );
+    expect(await recipientFor(withdrawal.rows[0]!)).toBe(WALLET.toLowerCase());
+    setChainClient(null);
   });
 
   it('erases a released withdrawal, and not at the burn address', async () => {
@@ -1178,6 +1209,78 @@ describe('erasure never destroys money in flight (HIGH)', () => {
     );
     expect(settled.intent.status).toBe('verified');
     setChainClient(null);
+  });
+
+  it('digests a lapsed intent the worker has not relabelled yet (HIGH)', async () => {
+    // The erasure's digest query named only the `expired` rows while
+    // verifySpendIntent claims `pending` ones too, and everything the digest
+    // query missed fell through to the outright scrub. A `pending` intent past
+    // its expiry is exactly that gap -- still settleable, wiped anyway.
+    //
+    // Not a narrow race: nothing moves an intent out of `pending` except a
+    // five-minute worker that does not run at all under RUN_WORKERS=false,
+    // while the erasure refusal lifts the instant `expires_at` passes. A
+    // retailer retrying the erasure until it stops saying "checkout in
+    // progress" lands here almost every time, and the customer's TBAY is
+    // already at the payout wallet.
+    const contact = await withSpendIntent('lapsed-pending@example.com', 'pending');
+    await db().query(
+      `UPDATE token_spend_intents SET expires_at = now() - interval '2 minutes'
+        WHERE contact_id = $1`,
+      [contact.id],
+    );
+
+    await eraseContact(tenant.id, contact.id);
+
+    const { rows } = await db().query<{ from_address: string }>(
+      'SELECT from_address FROM token_spend_intents WHERE contact_id = $1',
+      [contact.id],
+    );
+    // Digested, so it can still be settled -- not overwritten with the
+    // sentinel, which no transfer can ever match.
+    expect(rows[0]!.from_address).toMatch(/^erased:[0-9a-f]{32}$/);
+  });
+
+  it('does not key the digest with anything the database holds (HIGH)', async () => {
+    // The digest was keyed with `tenants.pii_salt`, which is a column in the
+    // same database as `members.wallet_address` -- a small table holding every
+    // wallet the platform knows. So the adversary the digest exists for reads
+    // the salt, hashes five thousand candidate wallets and matches it in a
+    // tenth of a millisecond. There is no 160-bit space to search when the
+    // answers are in the next table.
+    const contact = await withSpendIntent('keyed@example.com', 'expired');
+    await db().query(
+      `UPDATE token_spend_intents SET expires_at = now() - interval '2 hours'
+        WHERE contact_id = $1`,
+      [contact.id],
+    );
+    await eraseContact(tenant.id, contact.id);
+
+    const { rows } = await db().query<{ from_address: string }>(
+      'SELECT from_address FROM token_spend_intents WHERE contact_id = $1',
+      [contact.id],
+    );
+    const stored = rows[0]!.from_address;
+    expect(stored).toMatch(/^erased:[0-9a-f]{32}$/);
+
+    // Everything the database can offer, used the way the attack used it.
+    const { hashPii, walletDigest } = await import('../src/lib/crypto.js');
+    const salted = await db().query<{ pii_salt: string }>(
+      'SELECT pii_salt FROM tenants WHERE id = $1',
+      [tenant.id],
+    );
+    const fromDatabaseAlone = [
+      hashPii(WALLET.toLowerCase(), salted.rows[0]!.pii_salt),
+      hashPii(WALLET, salted.rows[0]!.pii_salt),
+      hashPii(WALLET.toLowerCase(), tenant.id),
+    ];
+    for (const attempt of fromDatabaseAlone) {
+      expect(stored).not.toBe(`erased:${attempt}`);
+    }
+
+    // The control: with the key that lives outside the database, it matches --
+    // which is what keeps a hand-settlement possible.
+    expect(stored).toBe(`erased:${walletDigest(WALLET, tenant.id)}`);
   });
 
   it('does not keep a wallet on an intent nobody can act on any more (HIGH)', async () => {
