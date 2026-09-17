@@ -617,14 +617,20 @@ describe('every writer reaches for the contact before anything else', () => {
    * streaks row -- and each of them deadlocked against a merge often enough to
    * see in sixteen tries.
    *
-   * Tested by holding the contact and watching each writer stop there, rather
-   * than by racing: a race that passes tells you nothing about the next run.
+   * Asserting "it waited" is not enough, and an earlier version of this suite
+   * did exactly that: the broken ordering waits too, just later and holding
+   * something else. So this holds the contact, waits for the writer to block,
+   * and then asks -- from a third connection, with NOWAIT -- whether the row
+   * it should not have reached yet is still free. If the writer already holds
+   * it, it did not stop at the contact.
    */
-  async function blocksOnTheContact(
+  async function stopsAtTheContact(
     contactId: string,
+    untouched: { sql: string; params: unknown[] },
     start: () => Promise<unknown>,
-  ): Promise<string> {
+  ): Promise<{ waited: boolean; tookTheOtherLockFirst: boolean }> {
     const holder = await db().connect();
+    const prober = await db().connect();
     try {
       await holder.query('BEGIN');
       await holder.query('SELECT 1 FROM contacts WHERE tenant_id = $1 AND id = $2 FOR UPDATE', [
@@ -638,11 +644,27 @@ describe('every writer reaches for the contact before anything else', () => {
         new Promise<string>((resolve) => setTimeout(() => resolve('waited'), 600)),
       ]);
 
+      // The row the writer must not have taken yet. NOWAIT turns "somebody
+      // else holds this" into an error instead of a wait.
+      let tookTheOtherLockFirst = false;
+      await prober.query('BEGIN');
+      try {
+        const probe = await prober.query(`${untouched.sql} FOR UPDATE NOWAIT`, untouched.params);
+        // A probe that matches nothing proves nothing, so insist it found the
+        // row it was asked about.
+        expect(probe.rowCount).toBeGreaterThan(0);
+      } catch (error) {
+        if ((error as { code?: string }).code !== '55P03') throw error;
+        tookTheOtherLockFirst = true;
+      }
+      await prober.query('ROLLBACK');
+
       await holder.query('ROLLBACK');
       await running;
-      return outcome;
+      return { waited: outcome === 'waited', tookTheOtherLockFirst };
     } finally {
       holder.release();
+      prober.release();
     }
   }
 
@@ -656,9 +678,16 @@ describe('every writer reaches for the contact before anything else', () => {
       email: 'refund-order@example.com',
     });
 
-    expect(await blocksOnTheContact(contact.id, () =>
-      refundOrder(tenantRow, 'lock-refund'),
-    )).toBe('waited');
+    expect(
+      await stopsAtTheContact(
+        contact.id,
+        {
+          sql: 'SELECT 1 FROM orders WHERE tenant_id = $1 AND order_ref = $2',
+          params: [tenant.id, 'lock-refund'],
+        },
+        () => refundOrder(tenantRow, 'lock-refund'),
+      ),
+    ).toEqual({ waited: true, tookTheOtherLockFirst: false });
   });
 
   it('makes a transfer wait for the contact, not the balances', async () => {
@@ -668,17 +697,36 @@ describe('every writer reaches for the contact before anything else', () => {
       contactId: from.id, points: 500, reason: 'seed', idempotencyKey: 'lock-transfer-seed',
     });
 
-    expect(await blocksOnTheContact(from.id, () =>
-      transferPoints(tenant.id, { fromContactId: from.id, toContactId: to.id, points: 100 }),
-    )).toBe('waited');
+    expect(
+      await stopsAtTheContact(
+        from.id,
+        {
+          sql: 'SELECT 1 FROM points_balances WHERE tenant_id = $1 AND contact_id = $2',
+          params: [tenant.id, from.id],
+        },
+        () => transferPoints(tenant.id, {
+          fromContactId: from.id, toContactId: to.id, points: 100,
+        }),
+      ),
+    ).toEqual({ waited: true, tookTheOtherLockFirst: false });
   });
 
   it('makes a streak wait for the contact, not the streaks row', async () => {
     const contact = await upsertContact(tenant.id, { email: 'streaker@example.com' });
+    // One run first, so there is a streaks row for the probe to ask about.
+    await recordStreak(tenant.id, contact.id, 'daily_login');
 
-    expect(await blocksOnTheContact(contact.id, () =>
-      recordStreak(tenant.id, contact.id, 'daily_login'),
-    )).toBe('waited');
+    expect(
+      await stopsAtTheContact(
+        contact.id,
+        {
+          sql: `SELECT 1 FROM streaks
+                 WHERE tenant_id = $1 AND contact_id = $2 AND key = 'daily_login'`,
+          params: [tenant.id, contact.id],
+        },
+        () => recordStreak(tenant.id, contact.id, 'daily_login'),
+      ),
+    ).toEqual({ waited: true, tookTheOtherLockFirst: false });
   });
 
   it('makes the maturity sweep wait for the contact, not the ledger', async () => {
@@ -696,7 +744,17 @@ describe('every writer reaches for the contact before anything else', () => {
       [tenant.id, contact.id],
     );
 
-    expect(await blocksOnTheContact(contact.id, () => releaseMaturedPoints())).toBe('waited');
+    expect(
+      await stopsAtTheContact(
+        contact.id,
+        {
+          sql: `SELECT 1 FROM points_ledger
+                 WHERE tenant_id = $1 AND contact_id = $2 AND status = 'pending'`,
+          params: [tenant.id, contact.id],
+        },
+        () => releaseMaturedPoints(),
+      ),
+    ).toEqual({ waited: true, tookTheOtherLockFirst: false });
   });
 
   it('says what happened when the contact was merged away mid-flight', async () => {
@@ -711,5 +769,41 @@ describe('every writer reaches for the contact before anything else', () => {
     await expect(recordStreak(tenant.id, loser.id, 'daily_login')).rejects.toThrow(
       /no longer exists/i,
     );
+  });
+});
+
+describe('two records that exchanged points can still be merged (MEDIUM)', () => {
+  it('collapses a gift between the two rather than failing', async () => {
+    // Reassigning both sides of a transfer to the survivor makes it a transfer
+    // from somebody to themselves, which `transfers_no_self` refuses -- so one
+    // gift between two duplicate records of the same person made them
+    // permanently unmergeable, and the merge died on a raw constraint name as
+    // a 500.
+    const keep = await upsertContact(tenant.id, { email: 'gifter@example.com' });
+    const lose = await upsertContact(tenant.id, { email: 'gifter.alt@example.com' });
+    await award(tenant.id, {
+      contactId: lose.id, points: 500, reason: 'seed', idempotencyKey: 'gift-seed',
+    });
+    await transferPoints(tenant.id, {
+      fromContactId: lose.id, toContactId: keep.id, points: 50,
+    });
+
+    const result = await mergeContacts(tenant.id, keep.id, lose.id);
+
+    expect(result.kept).toBe(keep.id);
+    // The transfer row goes; the points themselves are in the ledger, which
+    // survives and still reconciles.
+    const { rows: transfers } = await db().query<{ n: string }>(
+      'SELECT count(*) AS n FROM point_transfers WHERE tenant_id = $1',
+      [tenant.id],
+    );
+    expect(Number(transfers[0]!.n)).toBe(0);
+
+    const { rows: left } = await db().query<{ n: string }>(
+      'SELECT count(*) AS n FROM contacts WHERE tenant_id = $1',
+      [tenant.id],
+    );
+    expect(Number(left[0]!.n)).toBe(1);
+    expect((await getBalance(tenant.id, keep.id)).balance).toBe(500);
   });
 });

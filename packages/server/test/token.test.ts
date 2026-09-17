@@ -581,7 +581,7 @@ function stubChain(overrides: Partial<ChainClient>): ChainClient {
   };
 }
 
-describe('token amounts convert exactly or not at all (LOW)', () => {
+describe('token amounts convert exactly (LOW)', () => {
   /**
    * `String(n)` renders very large and very small numbers in exponent form,
    * which BigInt cannot parse, so this normalises first. `toFixed(20)` was
@@ -590,24 +590,49 @@ describe('token amounts convert exactly or not at all (LOW)', () => {
    * replace chain chewed on it -- `1.5e21` came out as "5e+210000000000000".
    * A different number, not an error, and only BigInt rejecting the letter e
    * kept it from being minted.
+   *
+   * The first version of this test asserted none of that: every value in it
+   * either had no exponent to expand or was caught by a ceiling that sat above
+   * where exponents even begin, so all nine assertions passed with the fix
+   * reverted. These are the values that actually go through the branch.
    */
-  it('expands exponent notation in both directions', () => {
-    expect(tokensToWei(1).toString()).toBe('1000000000000000000');
-    expect(tokensToWei(123.456).toString()).toBe('123456000000000000000');
-    // Small enough that String() reaches for an exponent.
-    expect(tokensToWei(1e-7).toString()).toBe('100000000000');
-    expect(tokensToWei(1e-18).toString()).toBe('1');
-    // Large, but still exact as a double.
-    expect(tokensToWei(9e15).toString()).toBe('9000000000000000000000000000000000');
-    expect(tokensToWei(0).toString()).toBe('0');
+  it('expands a positive exponent, which is where the bug was', () => {
+    // String(1e21) is "1e+21" and String(1.5e21) is "1.5e+21": both reach
+    // toPlainDecimal, and both were wrong before.
+    expect(tokensToWei(1e21).toString()).toBe(`1${'0'.repeat(21)}${'0'.repeat(18)}`);
+    expect(tokensToWei(1.5e21).toString()).toBe(`15${'0'.repeat(20)}${'0'.repeat(18)}`);
+    expect(tokensToWei(1.234e22).toString()).toBe(`1234${'0'.repeat(19)}${'0'.repeat(18)}`);
   });
 
-  it('refuses an amount a double cannot hold exactly', () => {
-    // Past 2^53 the wei figure would be quietly wrong rather than merely
-    // large. TBAY's whole supply is a million, so nothing legitimate is near
-    // this -- and a 400 saying so beats a 500 from BigInt, or worse, silence.
-    for (const amount of [1e21, 1.5e21, 1e20]) {
-      expect(() => tokensToWei(amount)).toThrow(/too large to represent exactly/);
-    }
+  it('expands a negative exponent too', () => {
+    expect(tokensToWei(1e-7).toString()).toBe('100000000000');
+    expect(tokensToWei(1.5e-7).toString()).toBe('150000000000');
+    expect(tokensToWei(1e-18).toString()).toBe('1');
+    // Below one wei is dust, and rounds to nothing rather than erroring.
+    expect(tokensToWei(1e-19).toString()).toBe('0');
+  });
+
+  it('leaves values that need no expansion alone', () => {
+    expect(tokensToWei(0).toString()).toBe('0');
+    expect(tokensToWei(1).toString()).toBe('1000000000000000000');
+    expect(tokensToWei(123.456).toString()).toBe('123456000000000000000');
+    // Exactly representable, and previously refused by a ceiling that had no
+    // business being there.
+    expect(tokensToWei(1e16).toString()).toBe(`1${'0'.repeat(16)}${'0'.repeat(18)}`);
+    expect(tokensToWei(2 ** 53).toString()).toBe(`${2 ** 53}${'0'.repeat(18)}`);
+  });
+
+  it('takes the number the customer typed, not its binary residue', () => {
+    // 0.1 is not exactly 0.1 in binary, and toFixed(20) says
+    // 0.10000000000000000555. Somebody who asks for a tenth of a token means
+    // a tenth of a token.
+    expect(tokensToWei(0.1).toString()).toBe('100000000000000000');
+    expect(tokensToWei(123.456789).toString()).toBe('123456789000000000000');
+  });
+
+  it('still refuses what is not a number at all', () => {
+    expect(() => tokensToWei(-1)).toThrow(/positive number/);
+    expect(() => tokensToWei(Number.NaN)).toThrow(/positive number/);
+    expect(() => tokensToWei(Number.POSITIVE_INFINITY)).toThrow(/positive number/);
   });
 });

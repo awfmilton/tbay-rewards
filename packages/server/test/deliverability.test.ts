@@ -56,6 +56,38 @@ describe('classifying a delivery failure', () => {
     }
   });
 
+  it('does not mistake the recipient\'s full mailbox for our transport', () => {
+    // 4xx by the letter of the spec, permanent in practice: an abandoned
+    // mailbox stays over quota. Read as transport it was never suppressed and
+    // the attempt was handed back every time, so the queue retried a dead
+    // address once a minute forever -- never draining, and bouncing against
+    // the sending domain the whole while. Soft is the honest answer: backed
+    // off, written off after six tries, and suppressed for thirty days rather
+    // than permanently, because a mailbox can be emptied.
+    for (const message of [
+      '452 4.2.2 Mailbox full',
+      '452 4.2.2 The email account that the user is trying to reach is over quota',
+      '552 5.2.2 Over quota',
+      '422 mailbox full',
+      '451 4.3.1 Insufficient system storage',
+    ]) {
+      expect(classifyFailure(message), message).toBe('soft');
+    }
+  });
+
+  it('reads a surname that happens to contain a protocol name (MEDIUM)', () => {
+    // The transport patterns are matched against a reply that quotes the
+    // recipient, and `SSL` unanchored is inside Kessler, Hassler, Gessler and
+    // Ressler. A real "User unknown" bounce for any of them read as our TLS
+    // failing: never suppressed, never counted, retried forever.
+    for (const message of [
+      '550 5.1.1 <kessler@example.com>: User unknown in local recipient table',
+      '550 5.1.1 <gessler@example.com>: Recipient address rejected: User unknown',
+    ]) {
+      expect(classifyFailure(message), message).toBe('hard');
+    }
+  });
+
   it('treats a failure about us as transport, not the recipient', () => {
     // These say nothing about whether a mailbox exists, so they must never
     // count toward suppressing one — a relay down for ninety seconds used to
@@ -63,8 +95,9 @@ describe('classifying a delivery failure', () => {
     for (const message of [
       '451 4.3.0 Temporary server error',
       'ECONNREFUSED',
-      '452 4.2.2 Mailbox full',
       'greylisted, try again later',
+      'unable to verify the first certificate',
+      'Client network socket disconnected before secure TLS connection was established',
     ]) {
       expect(classifyFailure(message), message).toBe('transport');
     }
@@ -470,9 +503,13 @@ describe('a stale worker cannot undo a delivery that already happened', () => {
       html: '<p>Went nowhere</p>',
       dedupeKey: 'stuck-1',
     });
+    // Well past ABANDONED_CLAIM, which is deliberately much wider than the
+    // reclaim window: reclaiming early is recoverable, writing a message off
+    // is not, and the reaper used to do that to messages that had in fact
+    // been delivered.
     await db().query(
       `UPDATE email_messages
-          SET status = 'sending', attempts = 99, claimed_at = now() - interval '6 minutes'
+          SET status = 'sending', attempts = 99, claimed_at = now() - interval '2 hours'
         WHERE tenant_id = $1`,
       [tenant.id],
     );
@@ -567,5 +604,102 @@ describe('a hung relay is our fault, not the recipient\'s', () => {
     // than to a coffee break.
     expect(waits.length).toBeGreaterThanOrEqual(5);
     expect(waits.reduce((a, b) => a + b, 0)).toBeGreaterThan(17 * 60 * 60);
+  });
+});
+
+describe('a batch claim is not a licence to send the tail late (HIGH)', () => {
+  it('renews the claim per message and drops one taken away mid-batch', async () => {
+    // One claim covers fifty rows and stamps them all with the same
+    // `claimed_at`, but they are sent serially -- so once total batch time
+    // passes the stale window, every row this worker has not reached yet looks
+    // abandoned to the other worker while this one still holds it. Measured
+    // before the fix: two of three recipients received the campaign twice,
+    // both rows ending 'sent' with no error.
+    for (const n of [1, 2, 3]) {
+      await queueEmail({
+        tenantId: tenant.id,
+        templateKey: 'campaign',
+        to: `batch${n}@example.com`,
+        subject: 'Our sale',
+        html: '<p>Sale</p>',
+        dedupeKey: `batch-${n}`,
+      });
+    }
+
+    const delivered: string[] = [];
+    let handled = 0;
+    setEmailTransport({
+      async send(message) {
+        handled += 1;
+        // After the first send, the batch has taken too long and the other
+        // worker takes everything this one has not reached.
+        if (handled === 1) {
+          await db().query(
+            `UPDATE email_messages
+                SET claimed_at = now() - interval '6 minutes'
+              WHERE tenant_id = $1 AND to_email <> $2`,
+            [tenant.id, message.to],
+          );
+          await flushEmailQueue(50);
+        }
+        delivered.push(message.to);
+        return { providerId: `p-${handled}` };
+      },
+    });
+
+    await flushEmailQueue(50);
+
+    // Everyone got it exactly once.
+    expect([...delivered].sort()).toEqual([
+      'batch1@example.com',
+      'batch2@example.com',
+      'batch3@example.com',
+    ]);
+  });
+
+  it('records a delivery the reaper had already given up on', async () => {
+    // The reaper's verdict is a guess about a worker; the send is what
+    // actually reached the customer. When they disagree, the customer wins --
+    // otherwise the receipt arrives, the queue says failed, and there is no
+    // provider id left to trace it at the relay.
+    await queueEmail({
+      tenantId: tenant.id,
+      templateKey: 'receipt',
+      to: 'slowbutfine@example.com',
+      subject: 'Your order',
+      html: '<p>Thanks</p>',
+      dedupeKey: 'slow-1',
+    });
+    await db().query(
+      `UPDATE email_messages SET attempts = $2 WHERE tenant_id = $1`,
+      [tenant.id, 5],
+    );
+
+    let delivered = 0;
+    setEmailTransport({
+      async send() {
+        // While this send is in flight the claim ages out and the other
+        // worker's reaper writes the message off.
+        await db().query(
+          `UPDATE email_messages SET claimed_at = now() - interval '2 hours'
+            WHERE tenant_id = $1`,
+          [tenant.id],
+        );
+        await flushEmailQueue(50);
+        delivered += 1;
+        return { providerId: 'relay-ok' };
+      },
+    });
+
+    await flushEmailQueue(50);
+
+    expect(delivered).toBe(1);
+    const { rows } = await db().query<{
+      status: string; provider_id: string | null; error: string | null;
+    }>(
+      'SELECT status, provider_id, error FROM email_messages WHERE tenant_id = $1',
+      [tenant.id],
+    );
+    expect(rows[0]).toMatchObject({ status: 'sent', provider_id: 'relay-ok', error: null });
   });
 });

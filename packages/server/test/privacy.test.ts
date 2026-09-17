@@ -25,6 +25,7 @@ import { upsertPointType } from '../src/services/point-types.js';
 import { flushEmailQueue, outbox, queueEmail, setEmailTransport } from '../src/services/email.js';
 import { unsubscribeRequestUrl } from '../src/services/newsletter.js';
 import { preferencesUrl } from '../src/services/preferences.js';
+import { suppress } from '../src/services/deliverability.js';
 
 let tenant: TestTenant;
 
@@ -511,9 +512,14 @@ describe('nothing identifying survives anywhere', () => {
    * for the address or the name. A table added next year that quietly stores a
    * contact's email fails this without anyone having to remember it exists.
    */
-  it('finds no trace of the address or the name in any table', async () => {
+  it('finds no trace of the address, the name or the wallet in any table', async () => {
     const email = 'needle-in-haystack@example.com';
     const name = 'Zebediah Haystack';
+    // A wallet is the strongest identifier in the schema -- a public chain
+    // address, permanent, and tied to everything ever done with it. The sweep
+    // searched for the email and the name only, and no fixture in it had a
+    // wallet, so four surviving copies went unnoticed for three rounds.
+    const wallet = '0x00000000000000000000000000000000DeaDBeef';
 
     const contact = await upsertContact(tenant.id, {
       email,
@@ -545,6 +551,33 @@ describe('nothing identifying survives anywhere', () => {
       [tenant.id, contact.id, email, `Welcome ${name}`, `<p>Hi ${name} at ${email}</p>`],
     );
 
+    await db().query(
+      'UPDATE contacts SET wallet_address = lower($2) WHERE tenant_id = $1 AND id = $3',
+      [tenant.id, wallet, contact.id],
+    );
+    await db().query(
+      `INSERT INTO token_claims (
+         tenant_id, contact_id, member_id, wallet_address, contract_address,
+         points_spent, token_amount_wei, chain_id, nonce, signature, status,
+         expires_at, supply_mode
+       )
+       SELECT $1, $2, c.member_id, lower($3), '0x74eb73aca939fc911f79d9589e808f0207684d09',
+              100, 1, 300, '1', '0x1', 'signed', now() + interval '1 day', 'mint'
+         FROM contacts c WHERE c.id = $2`,
+      [tenant.id, contact.id, wallet],
+    );
+
+    // A real bounce, because a bounce quotes the address it bounced and the
+    // suppression stores that quote. Without this the sweep never touched the
+    // one table that legitimately keeps the address, so its own invariant
+    // ("no trace anywhere") read as true when it was not.
+    await suppress(
+      tenant.id,
+      email,
+      'hard_bounce',
+      `550 5.1.1 <${email}>: User unknown in local recipient table`,
+    );
+
     await eraseContact(tenant.id, contact.id);
 
     // Every text-ish column in the public schema, excluding the migration
@@ -564,14 +597,20 @@ describe('nothing identifying survives anywhere', () => {
     for (const column of columns) {
       const { rows } = await db().query(
         `SELECT 1 FROM "${column.table_name}"
-          WHERE "${column.column_name}"::text ILIKE $1 OR "${column.column_name}"::text ILIKE $2
+          WHERE "${column.column_name}"::text ILIKE $1
+             OR "${column.column_name}"::text ILIKE $2
+             OR "${column.column_name}"::text ILIKE $3
           LIMIT 1`,
-        [`%${email}%`, `%${name}%`],
+        [`%${email}%`, `%${name}%`, `%${wallet}%`],
       );
       if (rows.length > 0) hits.push(`${column.table_name}.${column.column_name}`);
     }
 
-    expect(hits).toEqual([]);
+    // email_suppressions.email is kept on purpose and documented: a
+    // suppression nobody can match is not a suppression. Its `detail` is not
+    // part of that bargain and is cleared, because a bounce quotes the
+    // address it bounced.
+    expect(hits).toEqual(['email_suppressions.email']);
   });
 });
 

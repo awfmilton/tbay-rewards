@@ -288,13 +288,17 @@ export function tokensToWei(tokens: number): bigint {
   if (!Number.isFinite(tokens) || tokens < 0) {
     throw ApiError.badRequest('amount must be a positive number');
   }
-  // Above 2^53 a double cannot hold whole numbers exactly, so the wei figure
-  // would be quietly wrong rather than merely large. Refuse it and say so,
-  // rather than minting an amount nobody asked for. TBAY's whole supply is a
-  // million, so nothing legitimate is anywhere near this.
-  if (tokens > Number.MAX_SAFE_INTEGER) {
-    throw ApiError.badRequest('amount is too large to represent exactly');
-  }
+  // No ceiling here.
+  //
+  // There was one, at MAX_SAFE_INTEGER, and it was wrong twice over: it
+  // refused 1e16 and 2^53, which a double holds exactly, and it sat *above*
+  // the point where String() starts using exponents -- so it caught every
+  // input the expansion below exists to handle and made that code
+  // unreachable, including the 1.5e21 case it was written for.
+  //
+  // Every finite double has an exact decimal expansion and toPlainDecimal
+  // produces it, so this conversion is exact for any amount. How much is too
+  // much is a question about supply, and the mint budget is where it is asked.
 
   const plain = toPlainDecimal(tokens);
   const [whole, fraction = ''] = plain.split('.');

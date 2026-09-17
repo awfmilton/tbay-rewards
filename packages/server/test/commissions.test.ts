@@ -590,3 +590,48 @@ async function productStats(productRef: string) {
   );
   return rows[0]!;
 }
+
+describe('a referral unwound by a refund can be earned again (MEDIUM)', () => {
+  it('pays the affiliate when the referee comes back and keeps an order', async () => {
+    // The unwind reversed the bonus and set the referral back to pending, but
+    // the award's idempotency key is rule:referral:<referrer>:<referral_id>,
+    // which does not change. So re-qualifying found the reversed row, said
+    // "already done", and paid nothing -- the referral read `qualified` and
+    // the affiliate had nothing for it, permanently, because a customer
+    // returned one item and bought another.
+    const referrer = await upsertContact(tenant.id, { email: 'affiliate@example.com' });
+    const referee = await upsertContact(tenant.id, { email: 'referred@example.com' });
+    await db().query(
+      `INSERT INTO referrals (tenant_id, referrer_contact_id, referee_contact_id, status)
+       VALUES ($1, $2, $3, 'pending')`,
+      [tenant.id, referrer.id, referee.id],
+    );
+
+    const tenantRow = await tenantObject();
+    const held = async () => {
+      const balance = await getBalance(tenant.id, referrer.id);
+      return balance.balance + balance.pending;
+    };
+
+    await recordOrder(tenantRow, {
+      orderRef: 'again-1', totalCents: 5_000, contactId: referee.id, email: 'referred@example.com',
+    });
+    const afterFirst = await held();
+    expect(afterFirst).toBeGreaterThanOrEqual(250);
+
+    await refundOrder(tenantRow, 'again-1');
+    expect(await held()).toBe(afterFirst - 250);
+
+    // They come back and buy something they keep.
+    await recordOrder(tenantRow, {
+      orderRef: 'again-2', totalCents: 8_000, contactId: referee.id, email: 'referred@example.com',
+    });
+
+    expect(await held()).toBe(afterFirst);
+    const { rows } = await db().query<{ status: string }>(
+      'SELECT status FROM referrals WHERE tenant_id = $1',
+      [tenant.id],
+    );
+    expect(rows[0]!.status).toBe('qualified');
+  });
+});

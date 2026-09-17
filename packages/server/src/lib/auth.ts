@@ -116,9 +116,16 @@ export function clientIp(request: FastifyRequest): string {
  * Only ever used to subdivide an address bucket, never as a bucket of its own:
  * it is a string from the request body, so a caller who wants more allowance
  * writes a different one. Rotating it used to buy unlimited throughput.
+ *
+ * The field is `visitor`, which is what the tracker and the collect schema
+ * actually use. This read `anonId` -- a name that appears nowhere else in the
+ * product -- so it returned null on every real request and the per-visitor
+ * bucket simply did not exist: everyone behind one address shared a single
+ * ceiling with no subdivision, which is the exact failure the bucket is for.
+ * The tests passed because they sent `anonId` too.
  */
 function visitorKey(request: FastifyRequest): string | null {
   const body = request.body as Record<string, unknown> | undefined;
-  const anonId = typeof body?.anonId === 'string' ? body.anonId : null;
-  return anonId !== null && anonId !== '' && anonId.length <= 64 ? anonId : null;
+  const id = typeof body?.visitor === 'string' ? body.visitor : null;
+  return id !== null && id !== '' && id.length <= 64 ? id : null;
 }

@@ -85,8 +85,8 @@ server {
         proxy_set_header Host              $host;
         # $proxy_add_x_forwarded_for appends the peer address to any header
         # the caller already sent, so the rightmost entry is the only one
-        # nginx wrote. TRUST_PROXY_HOPS=1 (the default) tells the app to read
-        # that one and ignore whatever the caller put to its left.
+        # nginx wrote. TRUST_PROXY_HOPS=1 tells the app to read that one and
+        # ignore whatever the caller put to its left. Set it: the default is 0.
         proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
     }
@@ -94,10 +94,16 @@ server {
 ```
 
 Set `TRUST_PROXY_HOPS` to the number of proxies actually in front of the app —
-1 here, 2 behind Cloudflare in front of nginx, 0 with nothing in front. Setting
-it higher than the real number hands the client address to the caller: they
-send their own `X-Forwarded-For`, and that is what lands in the rate limiter,
-the audit log and consent records.
+1 here, 2 behind Cloudflare in front of nginx. **It defaults to 0**, meaning no
+header is trusted at all, so this is a line you have to write: without it every
+visitor behind your proxy shares one address, and the per-visitor rate limit
+becomes a per-site one.
+
+The default is 0 rather than 1 because the two mistakes are not the same size.
+Setting it too low costs accuracy, visibly. Setting it too high hands the client
+address to the caller — they send their own `X-Forwarded-For`, and that is what
+lands in the rate limiter, the audit log and consent records — and nothing about
+that is visible until somebody looks.
 
 Behind Cloudflare, `CF-IPCountry` is read automatically for country reporting.
 

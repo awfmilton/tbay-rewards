@@ -55,9 +55,20 @@ export async function upsertProduct(
                           ELSE COALESCE(EXCLUDED.price_cents, products.price_cents) END,
        currency    = CASE WHEN $9 THEN COALESCE(products.currency, EXCLUDED.currency)
                           ELSE COALESCE(EXCLUDED.currency, products.currency) END,
+       -- Categories are never writable in fill-only mode, not even when the
+       -- stored list is empty.
+       --
+       -- "Empty means unset, so filling it is allowed" sounded consistent with
+       -- the other columns and was the opposite of safe: the tracker is what
+       -- introduces products, and it introduces them with no categories, so
+       -- the unprotected state was the normal one. Anyone with the site key
+       -- decided what an already-known product earned, until a retailer
+       -- happened to state categories for it -- and PUT /v1/products/:ref is
+       -- new, so most never would. A category is not a description, it is an
+       -- input to the reward rules.
        categories  = CASE
+                       WHEN $9 THEN products.categories
                        WHEN cardinality(EXCLUDED.categories) = 0 THEN products.categories
-                       WHEN $9 AND cardinality(products.categories) > 0 THEN products.categories
                        ELSE EXCLUDED.categories
                      END,
        updated_at  = now()`,

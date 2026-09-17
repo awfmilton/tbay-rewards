@@ -49,6 +49,12 @@ services:
       TBAY_SUPPLY_MODE: ${TBAY_SUPPLY_MODE:-mint}
       BRIDGE_OPERATOR_TOKEN: ${BRIDGE_OPERATOR_TOKEN:-}
       THIRDWEB_CLIENT_ID: ${THIRDWEB_CLIENT_ID:-}
+      # Proxies in front of this container. 1 for a TLS terminator that
+      # appends to X-Forwarded-For, which is what the compose file's comment
+      # above assumes. Too high and the caller picks the address the rate
+      # limiter, the audit log and consent records all record; the default is
+      # 0, which trusts no header at all.
+      TRUST_PROXY_HOPS: ${TRUST_PROXY_HOPS:-1}
       EMAIL_TRANSPORT: ${EMAIL_TRANSPORT:-log}
       EMAIL_FROM_NAME: ${EMAIL_FROM_NAME:-TBAY Rewards}
       EMAIL_FROM_ADDRESS: ${EMAIL_FROM_ADDRESS:-no-reply@tbay.tk}
@@ -77,6 +83,12 @@ services:
       TBAY_L2_CONTRACT: ${TBAY_L2_CONTRACT:-0x74eb73ACa939Fc911f79D9589e808f0207684D09}
       TBAY_RPC_URL: ${TBAY_RPC_URL:-https://sepolia.era.zksync.dev}
       TBAY_CLAIM_SIGNER_KEY: ${TBAY_CLAIM_SIGNER_KEY:-}
+      # Proxies in front of this container. 1 for a TLS terminator that
+      # appends to X-Forwarded-For, which is what the compose file's comment
+      # above assumes. Too high and the caller picks the address the rate
+      # limiter, the audit log and consent records all record; the default is
+      # 0, which trusts no header at all.
+      TRUST_PROXY_HOPS: ${TRUST_PROXY_HOPS:-1}
       EMAIL_TRANSPORT: ${EMAIL_TRANSPORT:-log}
       EMAIL_FROM_ADDRESS: ${EMAIL_FROM_ADDRESS:-no-reply@tbay.tk}
       SMTP_URL: ${SMTP_URL:-}

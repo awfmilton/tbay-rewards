@@ -246,6 +246,69 @@ export async function eraseContact(
       [tenantId, contactId],
     );
 
+    // The chain tables carry member_id and a wallet address of their own, and
+    // clearing the contact's copy did nothing about either.
+    //
+    // member_id is the platform-wide identity link, which is exactly what
+    // nulling it on the contact is meant to break. It survived one join away,
+    // in a row keyed by the erased contact_id -- and because a member spans
+    // retailers, that join lands on the same person's live, fully identified
+    // record at another shop. Erased here, recovered from there, by name and
+    // address.
+    //
+    // A wallet address is a public chain identifier and permanent: it cannot
+    // be rotated, and anything ever done with it stays on a ledger the whole
+    // world can read. It is the strongest identifier in the schema, and the
+    // sweep test never looked for it because no fixture in it had one.
+    //
+    // The rows stay: a token claim is a financial record and a mint against a
+    // supply budget, and deleting it makes the supply unreconcilable. What
+    // goes is everything that says who it was.
+    // The address columns are NOT NULL, so they are overwritten rather than
+    // emptied: the zero address is a valid address that belongs to nobody, and
+    // reads unmistakably as "this was removed" next to a real one.
+    const BURNED_ADDRESS = '0x0000000000000000000000000000000000000000';
+    for (const table of ['token_claims', 'token_spend_intents', 'bridge_withdrawals'] as const) {
+      const columns: Record<string, string[]> = {
+        token_claims: ['wallet_address'],
+        token_spend_intents: ['from_address', 'to_address'],
+        bridge_withdrawals: ['from_address', 'l1_recipient'],
+      };
+      // Table and column names are module constants, never caller input.
+      const sets = [
+        ...columns[table]!.map((column) => `${column} = $3`),
+        'member_id = NULL',
+      ].join(', ');
+      await client.query(
+        `UPDATE ${table} SET ${sets} WHERE tenant_id = $1 AND contact_id = $2`,
+        [tenantId, contactId, BURNED_ADDRESS],
+      );
+    }
+
+    // The ledger keeps its rows -- the points have to reconcile -- but a
+    // redemption wrote the wallet into `ref_id`, the idempotency key and the
+    // meta blob. The amounts are what reconciles; the address is not.
+    await client.query(
+      `UPDATE points_ledger
+          SET ref_id = CASE WHEN ref_type = 'token_claim' THEN NULL ELSE ref_id END,
+              idempotency_key = 'erased:' || id::text,
+              meta = (meta - 'wallet_address' - 'to_address' - 'from_address')
+        WHERE tenant_id = $1 AND contact_id = $2
+          AND (meta ? 'wallet_address' OR meta ? 'to_address' OR meta ? 'from_address'
+               OR idempotency_key LIKE 'redeem:%')`,
+      [tenantId, contactId],
+    );
+
+    // A suppression's reason quotes the bounce, and a bounce quotes the
+    // address: "550 5.1.1 <them@example.com>: User unknown". The address
+    // column is kept on purpose -- a suppression nobody can match is not a
+    // suppression -- but the detail was never part of that bargain.
+    await client.query(
+      `UPDATE email_suppressions SET detail = ''
+        WHERE tenant_id = $1 AND email = lower($2) AND detail <> ''`,
+      [tenantId, contact.email ?? contact.email_normalised ?? ''],
+    );
+
     if (memberId) {
       await client.query(
         `UPDATE members SET email_hash = NULL, wallet_address = NULL, updated_at = now()

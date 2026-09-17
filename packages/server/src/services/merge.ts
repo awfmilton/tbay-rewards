@@ -156,6 +156,26 @@ export async function mergeContacts(
       bump(spec.table, await reconcile(client, tenantId, keepId, mergeId, spec));
     }
 
+    // A gift between the two records has nowhere to go.
+    //
+    // Reassigning both sides of a transfer to the survivor makes it a transfer
+    // from somebody to themselves, which `transfers_no_self` refuses -- so one
+    // gift between two duplicate records of the same person, or between two
+    // family members an operator decides are duplicates, made them permanently
+    // unmergeable. The merge died on a raw constraint name, as a 500.
+    //
+    // Dropped rather than kept: the points themselves are in the ledger, which
+    // survives and reconciles. What is lost is a record of a movement between
+    // two records that are now one, and that movement no longer describes
+    // anything.
+    const { rowCount: selfGifts } = await client.query(
+      `DELETE FROM point_transfers
+        WHERE tenant_id = $1
+          AND from_contact_id IN ($2, $3) AND to_contact_id IN ($2, $3)`,
+      [tenantId, keepId, mergeId],
+    );
+    bump('point_transfers_collapsed', selfGifts ?? 0);
+
     for (const spec of REASSIGN) {
       // Table and column names come from the module constants above, never
       // from input.
