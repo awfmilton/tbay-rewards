@@ -96,13 +96,23 @@ class TBAY_Rewards_API {
 			'timeout' => 15,
 			'headers' => array(
 				'Authorization' => 'Bearer ' . $this->secret_key(),
-				'Content-Type'  => 'application/json',
 				'Accept'        => 'application/json',
 				'User-Agent'    => 'TBAY-Rewards-WP/' . TBAY_REWARDS_VERSION,
 			),
 		);
 
+		// Content-Type belongs to a body, and a GET or DELETE has none.
+		//
+		// It was set on every request unconditionally while a body was attached
+		// only to POST, PUT and PATCH -- so every DELETE went out announcing
+		// JSON and carrying nothing, and the API answered "Body cannot be empty
+		// when content-type is set to 'application/json'" before reaching the
+		// route. Nine admin actions were dead buttons: delete a badge, a rank,
+		// a segment, a custom field, an email template, an operator. The API is
+		// tolerant of this now as well, but sending the header was wrong on its
+		// own terms.
 		if ( in_array( $args['method'], array( 'POST', 'PUT', 'PATCH' ), true ) ) {
+			$args['headers']['Content-Type'] = 'application/json';
 			// Always send a body on a write. Declaring application/json and then
 			// sending nothing makes Fastify reject the request as an empty JSON
 			// body, which is how every refund sync used to fail.

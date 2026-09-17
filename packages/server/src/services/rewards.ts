@@ -237,15 +237,32 @@ export async function upsertRule(
        cooldown_seconds, daily_cap, weekly_cap, monthly_cap, lifetime_cap,
        max_per_award, log_template, hold_seconds,
        requires_verification, config, enabled, point_type
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17::jsonb, $18,
-               COALESCE($19, $20))
+     -- Every default is applied here, in the statement, and the DO UPDATE
+     -- below reads the *parameters* rather than EXCLUDED.
+     --
+     -- Both halves matter and the second is the one that was wrong. The
+     -- parameters used to arrive already defaulted, in JavaScript: points to
+     -- zero, event_key to custom.<key>, mode to fixed. So by the time the
+     -- statement ran there was no NULL left for COALESCE(EXCLUDED.x, ...) to
+     -- fall back from, and every field the caller omitted was overwritten
+     -- with a default. A partial PUT -- which is what the WordPress
+     -- earning-rules screen sends when an admin edits one field -- set points
+     -- to zero and rewrote event_key to custom.<key>, so purchase earning
+     -- stopped, silently, on a Save the admin had every reason to think was
+     -- harmless. Moving the defaults into VALUES is not enough on its own,
+     -- because EXCLUDED is the *proposed row* and would carry them too.
+     ) VALUES ($1, $2, COALESCE($3, $2), COALESCE($4, 'custom.' || $2), COALESCE($5, 'fixed'),
+               COALESCE($6, 0), COALESCE($7, 0), COALESCE($8, 0),
+               $9, $10, $11, $12, $13, $14,
+               COALESCE($15, 0), COALESCE($16, false), COALESCE($17::jsonb, '{}'::jsonb),
+               COALESCE($18, true), COALESCE($19, $20))
      ON CONFLICT (tenant_id, key) DO UPDATE SET
-       name = COALESCE(EXCLUDED.name, reward_rules.name),
-       event_key = COALESCE(EXCLUDED.event_key, reward_rules.event_key),
-       mode = COALESCE(EXCLUDED.mode, reward_rules.mode),
-       points = COALESCE(EXCLUDED.points, reward_rules.points),
-       points_per_unit = COALESCE(EXCLUDED.points_per_unit, reward_rules.points_per_unit),
-       cooldown_seconds = COALESCE(EXCLUDED.cooldown_seconds, reward_rules.cooldown_seconds),
+       name = COALESCE($3, reward_rules.name),
+       event_key = COALESCE($4, reward_rules.event_key),
+       mode = COALESCE($5, reward_rules.mode),
+       points = COALESCE($6, reward_rules.points),
+       points_per_unit = COALESCE($7, reward_rules.points_per_unit),
+       cooldown_seconds = COALESCE($8, reward_rules.cooldown_seconds),
        -- Caps are nullable by design: passing null is how an admin *removes*
        -- a cap, so these cannot use COALESCE like the others.
        daily_cap = EXCLUDED.daily_cap,
@@ -254,32 +271,32 @@ export async function upsertRule(
        lifetime_cap = EXCLUDED.lifetime_cap,
        max_per_award = EXCLUDED.max_per_award,
        log_template = EXCLUDED.log_template,
-       hold_seconds = COALESCE(EXCLUDED.hold_seconds, reward_rules.hold_seconds),
-       requires_verification = COALESCE(EXCLUDED.requires_verification, reward_rules.requires_verification),
-       config = COALESCE(EXCLUDED.config, reward_rules.config),
-       enabled = COALESCE(EXCLUDED.enabled, reward_rules.enabled),
+       hold_seconds = COALESCE($15, reward_rules.hold_seconds),
+       requires_verification = COALESCE($16, reward_rules.requires_verification),
+       config = COALESCE($17::jsonb, reward_rules.config),
+       enabled = COALESCE($18, reward_rules.enabled),
        point_type = COALESCE($19, reward_rules.point_type),
        updated_at = now()
      RETURNING *`,
     [
       tenantId,
       rule.key,
-      rule.name ?? rule.key,
-      rule.event_key ?? `custom.${rule.key}`,
-      rule.mode ?? 'fixed',
-      rule.points ?? 0,
-      rule.points_per_unit ?? 0,
-      rule.cooldown_seconds ?? 0,
+      rule.name ?? null,
+      rule.event_key ?? null,
+      rule.mode ?? null,
+      rule.points ?? null,
+      rule.points_per_unit ?? null,
+      rule.cooldown_seconds ?? null,
       rule.daily_cap ?? null,
       rule.weekly_cap ?? null,
       rule.monthly_cap ?? null,
       rule.lifetime_cap ?? null,
       rule.max_per_award ?? null,
       rule.log_template ?? null,
-      rule.hold_seconds ?? 0,
-      rule.requires_verification ?? false,
-      JSON.stringify(rule.config ?? {}),
-      rule.enabled ?? true,
+      rule.hold_seconds ?? null,
+      rule.requires_verification ?? null,
+      rule.config ? JSON.stringify(rule.config) : null,
+      rule.enabled ?? null,
       pointType?.key ?? null,
       fallbackType.key,
     ],
