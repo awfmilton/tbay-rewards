@@ -1,5 +1,14 @@
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
-import { closeApp, closeDb, db, makeTenant, setupDatabase, truncateAll, type TestTenant } from './helpers.js';
+import {
+  closeApp,
+  closeDb,
+  db,
+  makeTenant,
+  setupDatabase,
+  testApp,
+  truncateAll,
+  type TestTenant,
+} from './helpers.js';
 import { upsertContact } from '../src/services/contacts.js';
 import { award, getBalance, listLedger, releaseMaturedPoints, reverse, spend } from '../src/services/points.js';
 import { trigger, upsertRule } from '../src/services/rewards.js';
@@ -223,6 +232,91 @@ describe('reward rules', () => {
     // makes one TBAY balance spendable across retailers.
     expect(here.member_id).toBe(there.member_id);
     expect(here.member_id).not.toBeNull();
+  });
+});
+
+describe('a rule earns on the event it names (HIGH)', () => {
+  it('awards the shipped account_created rule when a contact is created', async () => {
+    // `event_key` was decorative. Every rule carried one, the admin API let a
+    // retailer set one, `rulesForEvent` existed to look one up -- and nothing
+    // called it, so a rule only ever fired when some call site named its key
+    // as a literal. Six of the seven shipped rules have such a call site. The
+    // seventh, `account_created`, ships enabled on every tenant with 50 points
+    // on it and awarded nobody anything: two independent reviewers reproduced
+    // signup end to end and found zero ledger rows.
+    const app = await testApp();
+    const created = await app.inject({
+      method: 'POST',
+      url: '/v1/contacts',
+      headers: { authorization: `Bearer ${tenant.secretKey}` },
+      payload: { email: 'newcomer@example.com' },
+    });
+    expect(created.statusCode).toBe(200);
+    const contactId = JSON.parse(created.body).contact_id as string;
+
+    const balance = await getBalance(tenant.id, contactId);
+    expect(balance.balance).toBe(50);
+
+    // And only once, however many times the same person is upserted.
+    await app.inject({
+      method: 'POST',
+      url: '/v1/contacts',
+      headers: { authorization: `Bearer ${tenant.secretKey}` },
+      payload: { email: 'newcomer@example.com', name: 'Newcomer' },
+    });
+    expect((await getBalance(tenant.id, contactId)).balance).toBe(50);
+  });
+
+  it('earns a retailer\'s own rule on an event nothing names by key', async () => {
+    // The gap behind the shipped-rule bug: a retailer could create a rule with
+    // its own eventKey through the admin API and it could never be earned,
+    // because the only dispatcher was a literal key in our source.
+    await upsertRule(tenant.id, {
+      key: 'birthday_bonus',
+      name: 'Birthday bonus',
+      event_key: 'contact.created',
+      points: 25,
+      enabled: true,
+    });
+
+    const app = await testApp();
+    const created = await app.inject({
+      method: 'POST',
+      url: '/v1/contacts',
+      headers: { authorization: `Bearer ${tenant.secretKey}` },
+      payload: { email: 'custom-rule@example.com' },
+    });
+    const contactId = JSON.parse(created.body).contact_id as string;
+
+    // Both rules listening for contact.created: the shipped 50 and the
+    // retailer's 25.
+    expect((await getBalance(tenant.id, contactId)).balance).toBe(75);
+  });
+
+  it('does not pay a rule twice when a call site already awards it by name', async () => {
+    // The ledger's idempotency key is rule:<key>:<contact>:<refId>, and the
+    // call sites use their own refIds -- a subscription id, an order id --
+    // which would not collide with an event-dispatched one. So event dispatch
+    // has to skip the six rules that a named call site owns, or a newsletter
+    // confirmation pays twice.
+    const { awardRulesForEvent } = await import('../src/services/rewards.js');
+    const app = await testApp();
+    const created = await app.inject({
+      method: 'POST',
+      url: '/v1/contacts',
+      headers: { authorization: `Bearer ${tenant.secretKey}` },
+      payload: { email: 'owned@example.com' },
+    });
+    const contactId = JSON.parse(created.body).contact_id as string;
+
+    const paid = await awardRulesForEvent(
+      tenant.id,
+      'newsletter.confirmed',
+      contactId,
+      'occurrence-1',
+      {},
+    );
+    expect(paid).toEqual([]);
   });
 });
 

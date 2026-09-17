@@ -1,3 +1,4 @@
+import { upsertContact } from '../src/services/contacts.js';
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import {
   closeApp,
@@ -37,7 +38,16 @@ async function authed(method: 'GET' | 'POST' | 'PUT', url: string, payload?: unk
 }
 
 async function funded(email: string, points: number): Promise<string> {
-  const id = JSON.parse((await authed('POST', '/v1/contacts', { email })).body).contact_id;
+  // Quietly: POST /v1/contacts pays the shipped signup rule now, and `funded`
+  // exists to give a contact an exact opening balance.
+  const { id } = await upsertContact(tenant.id, {
+    email,
+    name: null,
+    phone: null,
+    externalRef: null,
+    attributes: {},
+    tags: [],
+  });
   await authed('POST', '/v1/rewards/adjust', {
     contactId: id,
     points,

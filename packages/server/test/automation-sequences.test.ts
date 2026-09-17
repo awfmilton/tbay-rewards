@@ -10,6 +10,7 @@ import {
   type TestTenant,
 } from './helpers.js';
 import { fire, runDueAutomations } from '../src/services/automations.js';
+import { upsertContact } from '../src/services/contacts.js';
 import { flushEmailQueue, outbox, setEmailTransport } from '../src/services/email.js';
 
 let tenant: TestTenant;
@@ -51,6 +52,25 @@ async function makeContact(input: Record<string, unknown>): Promise<string> {
   return JSON.parse(response.body).contact_id as string;
 }
 
+/**
+ * A contact, without the event.
+ *
+ * POST /v1/contacts fires `contact.created` now -- that was the fix for
+ * WooCommerce customers never triggering a welcome sequence -- so a test that
+ * creates a contact through the route and *then* fires the same event by hand
+ * is describing two occurrences, not one. With the same dedupe key the second
+ * is correctly swallowed and the run looks like it never happened; with a
+ * different one the sequence correctly runs twice.
+ *
+ * These tests are about the engine, not about contact creation, so they take
+ * the contact straight from the service and keep firing the event themselves.
+ */
+async function quietContact(email: string): Promise<string> {
+  const contact = await upsertContact(tenant.id, { email, name: null, phone: null,
+    externalRef: null, attributes: {}, tags: [] });
+  return contact.id;
+}
+
 /** Pull a parked run's resume time into the past so the worker picks it up. */
 async function fastForward(): Promise<void> {
   await db().query(
@@ -70,7 +90,7 @@ describe('waits', () => {
       ],
     });
 
-    const contactId = await makeContact({ email: 'new@example.com' });
+    const contactId = await quietContact('new@example.com');
     const contact = { id: contactId, email: 'new@example.com' } as never;
 
     const result = await fire(tenant.id, 'contact.created', {
@@ -102,21 +122,27 @@ describe('waits', () => {
       ],
     });
 
-    const contactId = await makeContact({ email: 'two@example.com' });
+    const contactId = await quietContact('two@example.com');
     await fire(tenant.id, 'contact.created', {
       contact: { id: contactId } as never,
       data: {},
       dedupeKey: `contact:${contactId}`,
     });
 
-    const { rows } = await db().query<{ balance: number }>(
-      'SELECT balance FROM points_balances WHERE contact_id = $1',
+    // The automation's own two awards, named, rather than the balance total.
+    //
+    // Firing contact.created also pays the shipped `account_created` rule now
+    // -- that is the point of event dispatch -- so a total would be asserting
+    // the signup bonus as much as the thing this test is about. Sharing one
+    // key across steps would silently drop the second award: a bug that only
+    // appears once a sequence can hold two of the same action.
+    const { rows } = await db().query<{ delta_points: number; reason: string }>(
+      `SELECT delta_points, reason FROM points_ledger
+        WHERE contact_id = $1 AND reason IN ('first', 'second')
+        ORDER BY reason`,
       [contactId],
     );
-    // 10 + 25. Sharing one key across steps would silently drop the second
-    // award — a bug that only appears once a sequence can hold two of the same
-    // action, because before this an action list ran each of them exactly once.
-    expect(rows[0]!.balance).toBe(35);
+    expect(rows.map((r) => Number(r.delta_points))).toEqual([10, 25]);
   });
 });
 
@@ -138,7 +164,7 @@ describe('branches', () => {
         { type: 'send_email', template: 'step_two' },
       ],
     });
-    return makeContact({ email: 'maybe@example.com' });
+    return quietContact('maybe@example.com');
   }
 
   it('sends the follow-up when the condition still holds', async () => {
@@ -196,7 +222,7 @@ describe('branches', () => {
       ],
     });
 
-    const contactId = await makeContact({ email: 'either@example.com' });
+    const contactId = await quietContact('either@example.com');
     await fire(tenant.id, 'contact.created', {
       contact: { id: contactId } as never,
       data: {},
@@ -264,7 +290,7 @@ describe('a branch that gates nothing, and a send that reaches nobody', () => {
     });
 
     for (const email of ['a@example.com', 'b@example.com', 'c@example.com']) {
-      const contactId = await makeContact({ email });
+      const contactId = await quietContact(email);
       await fire(tenant.id, 'contact.created', {
         contact: { id: contactId } as never,
         data: {},
@@ -281,7 +307,7 @@ describe('a branch that gates nothing, and a send that reaches nobody', () => {
 
     // And it is still a dedupe: the same contact triggering again gets nothing
     // more, which is what the field is for.
-    const again = await makeContact({ email: 'a@example.com' });
+    const again = await quietContact('a@example.com');
     await fire(tenant.id, 'contact.created', {
       contact: { id: again } as never,
       data: {},
@@ -308,7 +334,13 @@ describe('a branch that gates nothing, and a send that reaches nobody', () => {
       [tenant.id],
     );
 
-    const contactId = await makeContact({ email: 'capped@example.com', marketingConsent: true });
+    // Through the route, with consent: this test fires its own cap_one and
+    // cap_two events, so the route's contact.created costs it nothing, and
+    // marketing consent is the whole precondition for the mail it counts.
+    const contactId = await makeContact({
+      email: 'capped@example.com',
+      marketingConsent: true,
+    });
     for (const [key, template, trigger] of [
       ['cap_first', 'promo_one', 'cap_one'],
       ['cap_second', 'promo_two', 'cap_two'],
@@ -381,7 +413,7 @@ describe('safety', () => {
       [tenant.id],
     );
 
-    const contactId = await makeContact({ email: 'loop@example.com' });
+    const contactId = await quietContact('loop@example.com');
     const result = await fire(tenant.id, 'contact.created', {
       contact: { id: contactId } as never,
       data: {},
@@ -406,7 +438,7 @@ describe('safety', () => {
       ],
     });
 
-    const contactId = await makeContact({ email: 'quit@example.com', marketingConsent: true });
+    const contactId = await quietContact('quit@example.com');
     await fire(tenant.id, 'contact.created', {
       contact: { id: contactId } as never,
       data: {},
@@ -444,7 +476,7 @@ describe('safety', () => {
       ],
     });
 
-    const contactId = await makeContact({ email: 'off@example.com' });
+    const contactId = await quietContact('off@example.com');
     await fire(tenant.id, 'contact.created', {
       contact: { id: contactId } as never,
       data: {},
@@ -476,7 +508,7 @@ describe('attempts count failures, not waits (MEDIUM)', () => {
       triggerType: 'contact.created',
       actions,
     });
-    const contactId = await makeContact({ email });
+    const contactId = await quietContact(email);
     await fire(tenant.id, 'contact.created', {
       contact: { id: contactId, email } as never,
       data: {},

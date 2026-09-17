@@ -239,8 +239,13 @@ describe('the ledger CSV is honest (LOW)', () => {
 
     const response = await authed('GET', '/v1/rewards/ledger.csv');
     expect(response.statusCode).toBe(200);
-    // Header plus every row.
-    expect(response.body.trim().split('\r\n')).toHaveLength(1_201);
+    // Header, the 1,200 bulk rows, and the shipped signup award this contact
+    // earned on creation. The point is that nothing is truncated: the old
+    // clamp returned exactly 1,000 and looked complete, so what matters is
+    // that every row written is a row exported.
+    const lines = response.body.trim().split('\r\n');
+    expect(lines).toHaveLength(1_202);
+    expect(lines.filter((line) => line.includes('entry '))).toHaveLength(1_200);
   });
 
   it('leaves a negative number as a number', async () => {
@@ -302,17 +307,31 @@ describe('a tenant cannot name another tenant’s contact (HIGH)', () => {
 
     // The old bug returned 404 *after* committing: the route's own contact
     // check ran once recordOrder's transaction had already closed.
+    //
+    // Scoped to the *attacker's* tenant, which is the property. Creating the
+    // victim through POST /v1/contacts pays them the shipped signup rule in
+    // their own tenant, so "this contact has no ledger rows anywhere" stopped
+    // being true -- and it was only ever a proxy for "the attacker wrote
+    // nothing". This asserts the real thing.
     const ledger = await db().query(
-      'SELECT id FROM points_ledger WHERE contact_id = $1',
-      [victim],
+      'SELECT id FROM points_ledger WHERE contact_id = $1 AND tenant_id = $2',
+      [victim, tenant.id],
     );
     expect(ledger.rows).toHaveLength(0);
 
     const balances = await db().query(
-      'SELECT contact_id FROM points_balances WHERE contact_id = $1',
-      [victim],
+      'SELECT contact_id FROM points_balances WHERE contact_id = $1 AND tenant_id = $2',
+      [victim, tenant.id],
     );
     expect(balances.rows).toHaveLength(0);
+
+    // And the victim's own tenant is untouched by any of it: they keep exactly
+    // the signup award their own store gave them.
+    const theirs = await db().query(
+      'SELECT id FROM points_ledger WHERE contact_id = $1 AND tenant_id = $2',
+      [victim, other.id],
+    );
+    expect(theirs.rows).toHaveLength(1);
   });
 
   it('keeps the database from accepting such a row even if a caller slips past', async () => {

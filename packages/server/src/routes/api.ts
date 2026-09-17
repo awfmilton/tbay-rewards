@@ -230,6 +230,24 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
     });
     const input = parse(schema, request.body);
 
+    // Did this person already exist?
+    //
+    // The same question /v1/identify asks, and for the same reason: firing
+    // `contact.created` for somebody the store recorded weeks ago pays them a
+    // joining bonus for coming back. This route had no fire() at all, which is
+    // the other half of it -- the WordPress plugin creates every WooCommerce
+    // customer here, so no WooCommerce customer ever triggered a welcome
+    // sequence, a signup reward, or anything else listening for a new contact.
+    const before = await queryOne<{ id: string }>(
+      db(),
+      `SELECT id FROM contacts
+        WHERE tenant_id = $1
+          AND ((($2::text IS NOT NULL) AND email_normalised = lower($2))
+            OR (($3::text IS NOT NULL) AND external_ref = $3))
+        LIMIT 1`,
+      [tenant.id, input.email ?? null, input.externalRef ?? null],
+    );
+
     const contact = await upsertContact(
       tenant.id,
       {
@@ -265,6 +283,17 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
           WHERE id = $1`,
         [contact.id, input.marketingConsent, input.consentSource ?? null],
       );
+    }
+
+    // After the consent and writer updates, so an automation condition or a
+    // reward exclusion reading either sees the finished row rather than the
+    // one that existed halfway through this handler.
+    if (!before) {
+      await fire(tenant.id, 'contact.created', {
+        contact,
+        data: { source: 'api' },
+        dedupeKey: `contact:${contact.id}`,
+      });
     }
 
     return { contact_id: contact.id, member_id: contact.member_id };

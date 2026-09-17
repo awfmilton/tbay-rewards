@@ -193,6 +193,78 @@ export async function getRule(
   );
 }
 
+/**
+ * Rule keys a specific call site already awards by name.
+ *
+ * `awardRulesForEvent` pays every *other* enabled rule whose `event_key`
+ * matches, and these six must not be paid twice: the ledger's idempotency key
+ * is `rule:<key>:<contact>:<refId>` and the call sites use their own refIds --
+ * a subscription id, an order id -- which would not collide with an
+ * event-dispatched one.
+ *
+ * It is a constant rather than a column because it is a fact about this
+ * codebase, not about a tenant: it says "some code path already calls
+ * trigger() with this key". A retailer's own rule is never in it, which is the
+ * whole point -- a custom rule with `eventKey: 'order.completed'` now earns,
+ * and before this could not.
+ */
+const AWARDED_BY_NAME = new Set([
+  'newsletter_signup', // newsletter.ts, on confirmation
+  'social_share', // shares.ts, on a verified share
+  'purchase', // commissions.ts, on a completed order
+  'referral', // commissions.ts, on a qualified referral
+  'form_submission', // the WP plugin's form hooks, via POST /v1/rewards/trigger
+  'review', // the WP plugin's WooCommerce review hook, same route
+]);
+
+/**
+ * Pay every enabled rule that listens for this event and is not already paid
+ * by name.
+ *
+ * `event_key` was decorative. Every rule carried one, the admin API let a
+ * retailer set one, `rulesForEvent` existed to look one up -- and nothing
+ * called it, so the only way any rule ever fired was a call site naming its
+ * key as a literal. Six of the seven shipped rules have such a call site. The
+ * seventh, `account_created`, ships enabled on every tenant with 50 points on
+ * it, and awarded nobody anything: a reviewer reproduced signup end to end and
+ * found zero ledger rows, then forced the trigger by name and got the 50.
+ * A retailer's own rule was in the same position, permanently.
+ *
+ * Failures are swallowed per rule, deliberately. This runs inside whatever
+ * transaction the caller fired in -- creating a contact, confirming a
+ * subscription -- and a misconfigured reward rule must not roll that back.
+ */
+export async function awardRulesForEvent(
+  tenantId: string,
+  eventKey: string,
+  contactId: string,
+  occurrence: string,
+  data: Record<string, unknown>,
+  runner: Queryable = db(),
+): Promise<string[]> {
+  const paid: string[] = [];
+  for (const rule of await rulesForEvent(tenantId, eventKey, runner)) {
+    if (AWARDED_BY_NAME.has(rule.key)) continue;
+    const valueCents = Number(data.subtotal_cents ?? data.total_cents ?? data.value_cents);
+    const outcome = await trigger(
+      tenantId,
+      {
+        contactId,
+        ruleKey: rule.key,
+        // The occurrence, so the same event replayed pays once -- the same
+        // guarantee the automation runner gets from its own dedupe key.
+        refId: occurrence,
+        refType: 'event',
+        valueCents: Number.isFinite(valueCents) ? valueCents : undefined,
+        meta: { event_key: eventKey },
+      },
+      runner,
+    );
+    if (outcome.awarded) paid.push(rule.key);
+  }
+  return paid;
+}
+
 export async function rulesForEvent(
   tenantId: string,
   eventKey: string,

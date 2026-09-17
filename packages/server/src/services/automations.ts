@@ -153,6 +153,22 @@ export async function fire(
   ctx: AutomationContext,
   runner: Queryable = db(),
 ): Promise<FireResult> {
+  // Reward rules listen for the same events automations do, so this is where
+  // `event_key` becomes real. It ran before the automation lookup's early
+  // return on purpose: a tenant with no automation for this event still has
+  // rules for it, and returning early skipped them.
+  if (ctx.contact?.id) {
+    const { awardRulesForEvent } = await import('./rewards.js');
+    await awardRulesForEvent(
+      tenantId,
+      triggerType,
+      ctx.contact.id,
+      ctx.dedupeKey,
+      ctx.data ?? {},
+      runner,
+    );
+  }
+
   const { rows: automations } = await runner.query<Automation>(
     'SELECT * FROM automations WHERE tenant_id = $1 AND trigger_type = $2 AND enabled',
     [tenantId, triggerType],
