@@ -356,7 +356,7 @@ export async function getTemplate(
 ): Promise<EmailTemplate | null> {
   const row = await queryOne<EmailTemplate>(
     runner,
-    `SELECT subject, html, text, transactional, topic_key
+    `SELECT subject, html, text, transactional, topic_key, blocks, preheader
        FROM email_templates WHERE tenant_id = $1 AND key = $2`,
     [tenantId, key],
   );
@@ -366,7 +366,13 @@ export async function getTemplate(
   // A built-in template belongs to no topic: these are the messages a store
   // has not customised, and inventing a topic for them would filter mail the
   // retailer never chose to categorise.
-  return { ...fallback, transactional: fallback.transactional ?? false, topic_key: null };
+  return {
+    ...fallback,
+    transactional: fallback.transactional ?? false,
+    topic_key: null,
+    blocks: null,
+    preheader: null,
+  };
 }
 
 export interface EmailTemplate {
@@ -377,6 +383,17 @@ export interface EmailTemplate {
   transactional: boolean;
   /** Which topic this belongs to, so a recipient's choice can be honoured. */
   topic_key: string | null;
+  /**
+   * The composed blocks, when the template was built rather than written.
+   *
+   * `html` above is already rendered from these, so most sends need not look
+   * at them. They matter when a block is conditional: the stored HTML shows
+   * every block, and the per-recipient copy has to be re-rendered against what
+   * that recipient is a member of.
+   */
+  blocks: unknown;
+  /** The line a mail client shows beside the subject; composed messages only. */
+  preheader: string | null;
 }
 
 export async function upsertTemplate(
@@ -395,16 +412,59 @@ export async function upsertTemplate(
      * template out of consent is a decision the retailer makes on purpose.
      */
     transactional?: boolean;
+    /** Which topic it belongs to, for the preference centre. */
+    topicKey?: string | null;
+    /**
+     * Composed blocks instead of hand-written HTML.
+     *
+     * When present, `html` is generated from them — so the send path reads one
+     * column either way and a template that uses blocks costs nothing extra to
+     * send. The blocks are kept so the builder can reopen what somebody wrote,
+     * which generated HTML cannot be parsed back into.
+     */
+    blocks?: unknown;
+    /** The line a mail client shows beside the subject; composed messages only. */
+    preheader?: string | null;
   },
   runner: Queryable = db(),
 ): Promise<void> {
+  let html = template.html;
+  let text = template.text ?? null;
+  let blocks: string | null = null;
+  const preheader = template.preheader?.trim() || null;
+
+  if (template.blocks !== undefined && template.blocks !== null) {
+    const { validateBlocks, renderDocument, blocksToText } = await import('./email-blocks.js');
+    const checked = validateBlocks(template.blocks);
+    blocks = JSON.stringify(checked);
+    // Rendered without any segment membership: this is the copy stored on the
+    // template, and a conditional block is resolved per recipient at send time.
+    html = renderDocument(checked, new Set(), preheader);
+    text = blocksToText(checked);
+  }
+
   await runner.query(
-    `INSERT INTO email_templates (tenant_id, key, subject, html, text, transactional)
-     VALUES ($1, $2, $3, $4, $5, $6)
+    `INSERT INTO email_templates
+       (tenant_id, key, subject, html, text, transactional, topic_key, blocks, preheader)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)
      ON CONFLICT (tenant_id, key) DO UPDATE SET
        subject = EXCLUDED.subject, html = EXCLUDED.html,
-       text = EXCLUDED.text, transactional = EXCLUDED.transactional, updated_at = now()`,
-    [tenantId, key, template.subject, template.html, template.text ?? null, template.transactional ?? false],
+       text = EXCLUDED.text, transactional = EXCLUDED.transactional,
+       topic_key = COALESCE($7, email_templates.topic_key),
+       blocks = EXCLUDED.blocks,
+       preheader = EXCLUDED.preheader,
+       updated_at = now()`,
+    [
+      tenantId,
+      key,
+      template.subject,
+      html,
+      text,
+      template.transactional ?? false,
+      template.topicKey ?? null,
+      blocks,
+      preheader,
+    ],
   );
 }
 
@@ -452,7 +512,17 @@ export function senderFor(tenant: Tenant): { fromName: string; fromAddress: stri
   };
 }
 
-function layout(body: string): string {
+/**
+ * The frame every message shares: the card, the sender's name, and the footer
+ * carrying preferences and unsubscribe.
+ *
+ * Exported because a composed message needs the same frame. A block list
+ * renders to a fragment — headings and paragraphs — and storing that fragment
+ * as the body would send marketing with no visible way out of it, which is
+ * both illegal in most of the places this ships and the fastest way to be
+ * marked as spam by the recipients who cannot find the link.
+ */
+export function layout(body: string): string {
   return `<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="margin:0;padding:24px;background:#f5f5f7;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1d1d1f;">

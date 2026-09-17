@@ -21,6 +21,18 @@ class TBAY_Rewards_Manage {
 
 	private const CAPABILITY = 'manage_options';
 
+	/**
+	 * The template or broadcast the builder is editing.
+	 *
+	 * Fetched once and kept, because `admin_enqueue_scripts` runs before the
+	 * screen renders: the enqueue needs the blocks to hand to JavaScript and
+	 * the screen needs the same record to fill in its fields, and fetching it
+	 * twice would mean two API round trips for one page.
+	 *
+	 * `false` distinguishes "looked and there is none" from "not looked yet".
+	 */
+	private array|false|null $builder_record = null;
+
 	/** Screens, in menu order. */
 	private const SCREENS = array(
 		'customers'    => 'Customers',
@@ -39,6 +51,7 @@ class TBAY_Rewards_Manage {
 		add_action( 'admin_menu', array( $this, 'add_pages' ), 20 );
 		add_action( 'admin_post_tbay_manage', array( $this, 'handle_post' ) );
 		add_action( 'admin_enqueue_scripts', array( $this, 'enqueue' ) );
+		add_action( 'wp_ajax_tbay_email_preview', array( $this, 'ajax_preview' ) );
 	}
 
 	public function add_pages(): void {
@@ -65,6 +78,141 @@ class TBAY_Rewards_Manage {
 			array(),
 			TBAY_REWARDS_VERSION
 		);
+
+		if ( $this->builder_wanted() ) {
+			$this->enqueue_builder();
+		}
+	}
+
+	/**
+	 * Is this request one of the two screens that compose a message?
+	 *
+	 * Checked rather than loading the builder on every management screen: it
+	 * fetches the block catalogue from the API, and a ledger page should not
+	 * pay for a request it will never use.
+	 */
+	private function builder_wanted(): bool {
+		$screen = $this->current_screen();
+		if ( 'marketing' === $screen ) {
+			return true;
+		}
+		return 'email' === $screen && '' !== $this->query( 'template' );
+	}
+
+	/**
+	 * The record being edited: a template, or a broadcast.
+	 *
+	 * Returns an empty array for a new one, which is the right starting state
+	 * for both the builder and the form around it.
+	 */
+	private function builder_record(): array {
+		if ( null !== $this->builder_record ) {
+			return $this->builder_record ?: array();
+		}
+
+		$screen = $this->current_screen();
+		$path   = '';
+		$field  = '';
+		if ( 'email' === $screen && '' !== $this->query( 'template' ) ) {
+			$path  = '/v1/email/templates/' . rawurlencode( $this->query( 'template' ) );
+			$field = 'template';
+		} elseif ( 'marketing' === $screen && '' !== $this->query( 'broadcast' ) ) {
+			$path  = '/v1/broadcasts/' . rawurlencode( $this->query( 'broadcast' ) );
+			$field = 'broadcast';
+		}
+
+		if ( '' === $path ) {
+			$this->builder_record = false;
+			return array();
+		}
+
+		$data = $this->api->request( 'GET', $path );
+		$this->builder_record = ( ! is_wp_error( $data ) && is_array( $data[ $field ] ?? null ) )
+			? $data[ $field ]
+			: false;
+		return $this->builder_record ?: array();
+	}
+
+	/** The blocks that record holds, if it was composed rather than written. */
+	private function builder_blocks(): array {
+		$blocks = $this->builder_record()['blocks'] ?? null;
+		return is_array( $blocks ) ? $blocks : array();
+	}
+
+	private function enqueue_builder(): void {
+		wp_enqueue_script(
+			'tbay-email-builder',
+			TBAY_REWARDS_URL . 'assets/tbay-email-builder.js',
+			array(),
+			TBAY_REWARDS_VERSION,
+			true
+		);
+
+		$catalogue = $this->api->request( 'GET', '/v1/email/blocks' );
+		$catalogue = is_wp_error( $catalogue ) ? array() : ( $catalogue['blocks'] ?? array() );
+
+		wp_localize_script(
+			'tbay-email-builder',
+			'tbayBuilder',
+			array(
+				'catalogue' => $catalogue,
+				'value'     => $this->builder_blocks(),
+				'preview'   => array(
+					'url'    => admin_url( 'admin-ajax.php' ),
+					'action' => 'tbay_email_preview',
+					'nonce'  => wp_create_nonce( 'tbay_email_preview' ),
+				),
+				'strings'   => array(
+					'addBlock'      => __( 'Add a block', 'tbay-rewards' ),
+					'addRow'        => __( 'Add another', 'tbay-rewards' ),
+					'conditional'   => __( 'Conditional blocks in this message:', 'tbay-rewards' ),
+					'empty'         => __( 'No blocks yet. Add one below.', 'tbay-rewards' ),
+					'loading'       => __( 'Rendering…', 'tbay-rewards' ),
+					'matching'      => __( 'this person is in:', 'tbay-rewards' ),
+					'moveDown'      => __( 'Move down', 'tbay-rewards' ),
+					'moveUp'        => __( 'Move up', 'tbay-rewards' ),
+					'none'          => __( 'none', 'tbay-rewards' ),
+					'preview'       => __( 'Preview', 'tbay-rewards' ),
+					'previewFailed' => __( 'That preview could not be rendered.', 'tbay-rewards' ),
+					'removeBlock'   => __( 'Remove', 'tbay-rewards' ),
+					'removeRow'     => __( 'Remove', 'tbay-rewards' ),
+				),
+			)
+		);
+	}
+
+	/**
+	 * What the composed message will look like, without saving or sending it.
+	 *
+	 * Proxied through wp-admin rather than called from the browser, because the
+	 * API key lives on the server. Shipping it to the page so JavaScript could
+	 * call the API directly would hand every logged-in author a key that can
+	 * read the whole contact list.
+	 */
+	public function ajax_preview(): void {
+		if ( ! current_user_can( self::CAPABILITY ) ) {
+			wp_send_json_error( array( 'message' => __( 'You do not have permission to do that.', 'tbay-rewards' ) ), 403 );
+		}
+		check_ajax_referer( 'tbay_email_preview' );
+
+		$blocks = json_decode( isset( $_POST['blocks'] ) ? wp_unslash( $_POST['blocks'] ) : '[]', true );
+		if ( ! is_array( $blocks ) ) {
+			wp_send_json_error( array( 'message' => __( 'Those blocks could not be read.', 'tbay-rewards' ) ), 400 );
+		}
+
+		$payload = array( 'blocks' => $blocks );
+		foreach ( array( 'subject', 'preheader', 'as' ) as $field ) {
+			$value = isset( $_POST[ $field ] ) ? sanitize_text_field( wp_unslash( $_POST[ $field ] ) ) : '';
+			if ( '' !== $value ) {
+				$payload[ $field ] = $value;
+			}
+		}
+
+		$result = $this->api->post( '/v1/email/preview', $payload );
+		if ( is_wp_error( $result ) ) {
+			wp_send_json_error( array( 'message' => $result->get_error_message() ), 400 );
+		}
+		wp_send_json_success( $result );
 	}
 
 	private function current_screen(): string {
@@ -1042,6 +1190,11 @@ class TBAY_Rewards_Manage {
 	// ── Segments and broadcasts ──────────────────────────────────────────────
 
 	private function screen_marketing(): void {
+		if ( '' !== $this->query( 'broadcast' ) ) {
+			$this->render_broadcast_composer( $this->query( 'broadcast' ) );
+			return;
+		}
+
 		$segments = $this->api->request( 'GET', '/v1/segments' );
 		$segments = is_wp_error( $segments ) ? array() : ( $segments['segments'] ?? array() );
 		$sends    = $this->api->request( 'GET', '/v1/broadcasts' );
@@ -1141,6 +1294,9 @@ class TBAY_Rewards_Manage {
 								<input type="hidden" name="key" value="<?php echo esc_attr( (string) ( $send['key'] ?? '' ) ); ?>" />
 								<?php submit_button( __( 'Send now', 'tbay-rewards' ), 'small primary', '', false ); ?>
 							</form>
+							<a href="<?php echo esc_url( admin_url(
+								'admin.php?page=tbay-manage-marketing&broadcast=' . rawurlencode( (string) ( $send['key'] ?? '' ) )
+							) ); ?>"><?php esc_html_e( 'Write it', 'tbay-rewards' ); ?></a>
 						<?php elseif ( 'sending' === ( $send['status'] ?? '' ) ) : ?>
 							<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" class="tbay-row-form">
 								<?php wp_nonce_field( 'tbay_manage' ); ?>
@@ -1174,9 +1330,101 @@ class TBAY_Rewards_Manage {
 					</option>
 				<?php endforeach; ?>
 			</select>
-			<input type="text" name="templateKey" required placeholder="<?php esc_attr_e( 'Email template key', 'tbay-rewards' ); ?>"
+			<input type="text" name="subject" required placeholder="<?php esc_attr_e( 'Subject line', 'tbay-rewards' ); ?>"
+				class="regular-text" aria-label="<?php esc_attr_e( 'Subject', 'tbay-rewards' ); ?>" />
+			<input type="text" name="templateKey" placeholder="<?php esc_attr_e( 'Email template key (optional)', 'tbay-rewards' ); ?>"
 				aria-label="<?php esc_attr_e( 'Template', 'tbay-rewards' ); ?>" />
 			<?php submit_button( __( 'Save draft', 'tbay-rewards' ), 'secondary', '', false ); ?>
+			<p class="description">
+				<?php esc_html_e( 'Name a template to reuse one, or leave it blank and write the message here with "Write it".', 'tbay-rewards' ); ?>
+			</p>
+		</form>
+		<?php
+	}
+
+	/**
+	 * Write the message a send goes out with.
+	 *
+	 * A broadcast can name a template, or carry a body composed here. The
+	 * monthly newsletter is a one-off, and making somebody create a template
+	 * for each one is how a "send" screen grows a "template" screen nobody
+	 * wanted — and a template list that is really a send history.
+	 */
+	private function render_broadcast_composer( string $key ): void {
+		$send = $this->builder_record();
+		if ( array() === $send ) {
+			printf(
+				'<div class="notice notice-error"><p>%s</p></div>',
+				esc_html__( 'That send could not be loaded.', 'tbay-rewards' )
+			);
+			return;
+		}
+
+		$status = (string) ( $send['status'] ?? '' );
+		$locked = ! in_array( $status, array( 'draft', 'scheduled' ), true );
+		?>
+		<p><a href="<?php echo esc_url( admin_url( 'admin.php?page=tbay-manage-marketing' ) ); ?>">
+			&larr; <?php esc_html_e( 'Back to sends', 'tbay-rewards' ); ?></a></p>
+
+		<h2><?php echo esc_html( (string) ( $send['name'] ?? $key ) ); ?></h2>
+
+		<?php if ( $locked ) : ?>
+			<div class="notice notice-info inline"><p>
+				<?php
+				printf(
+					/* translators: %s: broadcast status, such as "sent" */
+					esc_html__( 'This send is %s, so its message can no longer be edited. What went out is what the recipient list records.', 'tbay-rewards' ),
+					esc_html( $status )
+				);
+				?>
+			</p></div>
+			<?php return; ?>
+		<?php endif; ?>
+
+		<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
+			<?php wp_nonce_field( 'tbay_manage' ); ?>
+			<input type="hidden" name="action" value="tbay_manage" />
+			<input type="hidden" name="tbay_action" value="save_broadcast" />
+			<input type="hidden" name="tbay_screen" value="marketing" />
+			<input type="hidden" name="key" value="<?php echo esc_attr( $key ); ?>" />
+			<input type="hidden" name="name" value="<?php echo esc_attr( (string) ( $send['name'] ?? $key ) ); ?>" />
+
+			<table class="form-table" role="presentation">
+				<tr>
+					<th scope="row"><label for="tbay-subject"><?php esc_html_e( 'Subject', 'tbay-rewards' ); ?></label></th>
+					<td><input type="text" id="tbay-subject" name="subject" class="large-text" required
+						value="<?php echo esc_attr( (string) ( $send['subject'] ?? '' ) ); ?>" /></td>
+				</tr>
+				<tr>
+					<th scope="row"><label for="tbay-preheader"><?php esc_html_e( 'Preview line', 'tbay-rewards' ); ?></label></th>
+					<td>
+						<input type="text" id="tbay-preheader" name="preheader" class="large-text" maxlength="200"
+							value="<?php echo esc_attr( (string) ( $send['preheader'] ?? '' ) ); ?>" />
+						<p class="description">
+							<?php esc_html_e( 'The line shown after the subject in an inbox. Left blank, the mail client shows the first words of the message instead.', 'tbay-rewards' ); ?>
+						</p>
+					</td>
+				</tr>
+				<tr>
+					<th scope="row"><?php esc_html_e( 'Message', 'tbay-rewards' ); ?></th>
+					<td>
+						<input type="hidden" id="tbay-blocks" name="blocks" value="" />
+						<div id="tbay-builder" class="tbay-builder"></div>
+						<p class="description">
+							<?php esc_html_e( 'Saving a message here replaces the template this send named, if it named one.', 'tbay-rewards' ); ?>
+						</p>
+						<p>
+							<label for="tbay-preview-as"><?php esc_html_e( 'Preview as contact ID', 'tbay-rewards' ); ?></label>
+							<input type="text" id="tbay-preview-as" class="regular-text" />
+							<span class="description">
+								<?php esc_html_e( 'Optional. Naming somebody shows the blocks they would actually get.', 'tbay-rewards' ); ?>
+							</span>
+						</p>
+						<div id="tbay-builder-preview" class="tbay-builder-preview"></div>
+					</td>
+				</tr>
+			</table>
+			<?php submit_button( __( 'Save message', 'tbay-rewards' ) ); ?>
 		</form>
 		<?php
 	}
@@ -1216,14 +1464,38 @@ class TBAY_Rewards_Manage {
 	}
 
 	private function do_save_broadcast(): string|WP_Error {
+		$payload = array( 'name' => $this->post( 'name' ) );
+
+		// Only what this form actually carried: the composer posts a message
+		// and no segment, the "prepare a send" form posts a segment and no
+		// message, and sending an empty string for the other would clear it.
+		foreach ( array( 'segmentKey', 'templateKey', 'subject', 'preheader' ) as $field ) {
+			if ( isset( $_POST[ $field ] ) ) { // phpcs:ignore WordPress.Security.NonceVerification.Missing
+				$payload[ $field ] = $this->post( $field );
+			}
+		}
+
+		$blocks = $this->posted_blocks();
+		if ( is_wp_error( $blocks ) ) {
+			return $blocks;
+		}
+		if ( null !== $blocks ) {
+			$payload['blocks'] = $blocks;
+			// A composed body replaces the template, and sending both would
+			// leave the server picking one.
+			unset( $payload['templateKey'] );
+		} elseif ( '' === ( $payload['templateKey'] ?? '' ) ) {
+			// A draft with no template is one somebody means to write here.
+			// An empty body is enough to create it; sending it is refused
+			// until there is something in it.
+			$payload['blocks'] = array();
+			unset( $payload['templateKey'] );
+		}
+
 		$result = $this->api->request(
 			'PUT',
 			'/v1/broadcasts/' . rawurlencode( $this->post( 'key' ) ),
-			array(
-				'name'        => $this->post( 'name' ),
-				'segmentKey'  => $this->post( 'segmentKey' ),
-				'templateKey' => $this->post( 'templateKey' ),
-			)
+			$payload
 		);
 		return is_wp_error( $result ) ? $result : __( 'Draft saved.', 'tbay-rewards' );
 	}
@@ -1352,12 +1624,20 @@ class TBAY_Rewards_Manage {
 	}
 
 	private function render_template_editor( string $key ): void {
-		$data = $this->api->request( 'GET', '/v1/email/templates/' . rawurlencode( $key ) );
-		if ( is_wp_error( $data ) ) {
-			printf( '<div class="notice notice-error"><p>%s</p></div>', esc_html( $data->get_error_message() ) );
+		$template = $this->builder_record();
+		if ( array() === $template ) {
+			printf(
+				'<div class="notice notice-error"><p>%s</p></div>',
+				esc_html__( 'That template could not be loaded.', 'tbay-rewards' )
+			);
 			return;
 		}
-		$template = is_array( $data['template'] ?? null ) ? $data['template'] : array();
+
+		// A template that was composed reopens in the builder. One that was
+		// hand-written reopens in the textarea it was written in — switching it
+		// to blocks would mean parsing HTML back into blocks, which does not
+		// work, so the choice is offered rather than made.
+		$composed = array() !== $this->builder_blocks() || '1' === $this->query( 'build' );
 		?>
 		<p><a href="<?php echo esc_url( admin_url( 'admin.php?page=tbay-manage-email' ) ); ?>">
 			&larr; <?php esc_html_e( 'Back to templates', 'tbay-rewards' ); ?></a></p>
@@ -1376,6 +1656,36 @@ class TBAY_Rewards_Manage {
 						value="<?php echo esc_attr( (string) ( $template['subject'] ?? '' ) ); ?>" required /></td>
 				</tr>
 				<tr>
+					<th scope="row"><label for="tbay-preheader"><?php esc_html_e( 'Preview line', 'tbay-rewards' ); ?></label></th>
+					<td>
+						<input type="text" id="tbay-preheader" name="preheader" class="large-text" maxlength="200"
+							value="<?php echo esc_attr( (string) ( $template['preheader'] ?? '' ) ); ?>" />
+						<p class="description">
+							<?php esc_html_e( 'The line shown after the subject in an inbox. Left blank, the mail client shows the first words of the message instead.', 'tbay-rewards' ); ?>
+						</p>
+					</td>
+				</tr>
+				<?php if ( $composed ) : ?>
+				<tr>
+					<th scope="row"><?php esc_html_e( 'Message', 'tbay-rewards' ); ?></th>
+					<td>
+						<input type="hidden" id="tbay-blocks" name="blocks" value="" />
+						<div id="tbay-builder" class="tbay-builder"></div>
+						<p class="description">
+							<?php esc_html_e( 'Placeholders like {{name}}, {{tenant_name}} and {{points_balance}} are filled in when the email is sent, and are escaped so they cannot break the layout.', 'tbay-rewards' ); ?>
+						</p>
+						<p>
+							<label for="tbay-preview-as"><?php esc_html_e( 'Preview as contact ID', 'tbay-rewards' ); ?></label>
+							<input type="text" id="tbay-preview-as" class="regular-text" />
+							<span class="description">
+								<?php esc_html_e( 'Optional. Naming somebody shows the blocks they would actually get.', 'tbay-rewards' ); ?>
+							</span>
+						</p>
+						<div id="tbay-builder-preview" class="tbay-builder-preview"></div>
+					</td>
+				</tr>
+				<?php else : ?>
+				<tr>
 					<th scope="row"><label for="tbay-html"><?php esc_html_e( 'HTML', 'tbay-rewards' ); ?></label></th>
 					<td>
 						<textarea id="tbay-html" name="html" rows="20" class="large-text code" required><?php
@@ -1384,8 +1694,15 @@ class TBAY_Rewards_Manage {
 						<p class="description">
 							<?php esc_html_e( 'Placeholders like {{name}}, {{tenant_name}} and {{unsubscribe_url}} are filled in when the email is sent, and are escaped so they cannot break the layout.', 'tbay-rewards' ); ?>
 						</p>
+						<p class="description">
+							<a href="<?php echo esc_url( add_query_arg( 'build', '1' ) ); ?>">
+								<?php esc_html_e( 'Build this one from blocks instead', 'tbay-rewards' ); ?>
+							</a>
+							<?php esc_html_e( '— this replaces the HTML above, which cannot be turned back into blocks.', 'tbay-rewards' ); ?>
+						</p>
 					</td>
 				</tr>
+				<?php endif; ?>
 				<tr>
 					<th scope="row"><?php esc_html_e( 'Kind', 'tbay-rewards' ); ?></th>
 					<td>
@@ -1406,21 +1723,64 @@ class TBAY_Rewards_Manage {
 	}
 
 	private function do_save_template(): string|WP_Error {
-		$html = isset( $_POST['html'] ) ? wp_kses_post( wp_unslash( $_POST['html'] ) ) : '';
-		if ( '' === $html ) {
-			return new WP_Error( 'tbay_bad_input', __( 'An email needs a body.', 'tbay-rewards' ) );
+		$payload = array(
+			'subject'       => $this->post( 'subject' ),
+			'preheader'     => $this->post( 'preheader' ),
+			'transactional' => isset( $_POST['transactional'] ),
+		);
+
+		$blocks = $this->posted_blocks();
+		if ( is_wp_error( $blocks ) ) {
+			return $blocks;
+		}
+
+		if ( null !== $blocks ) {
+			// The server renders the HTML from these. Nothing here composes
+			// markup, which is why this path needs no `wp_kses_post`: there is
+			// no markup to sanitise, only field values that are escaped when
+			// they are rendered.
+			$payload['blocks'] = $blocks;
+		} else {
+			$html = isset( $_POST['html'] ) ? wp_kses_post( wp_unslash( $_POST['html'] ) ) : '';
+			if ( '' === $html ) {
+				return new WP_Error( 'tbay_bad_input', __( 'An email needs a body.', 'tbay-rewards' ) );
+			}
+			$payload['html'] = $html;
 		}
 
 		$result = $this->api->request(
 			'PUT',
 			'/v1/email/templates/' . rawurlencode( $this->post( 'key' ) ),
-			array(
-				'subject'       => $this->post( 'subject' ),
-				'html'          => $html,
-				'transactional' => isset( $_POST['transactional'] ),
-			)
+			$payload
 		);
 		return is_wp_error( $result ) ? $result : __( 'Template saved.', 'tbay-rewards' );
+	}
+
+	/**
+	 * The blocks this form posted, if it was the builder that posted it.
+	 *
+	 * Returns null when the form carried no builder at all — a hand-written
+	 * template — and an error when it carried one that cannot be read, rather
+	 * than silently saving an empty message over somebody's newsletter.
+	 */
+	private function posted_blocks(): array|WP_Error|null {
+		if ( ! isset( $_POST['blocks'] ) ) {
+			return null;
+		}
+
+		$raw = trim( wp_unslash( $_POST['blocks'] ) ); // phpcs:ignore WordPress.Security.ValidatedSanitizedInput
+		if ( '' === $raw ) {
+			return null;
+		}
+
+		$blocks = json_decode( $raw, true );
+		if ( ! is_array( $blocks ) ) {
+			return new WP_Error( 'tbay_bad_input', __( 'That message could not be read. Nothing was saved.', 'tbay-rewards' ) );
+		}
+		if ( array() === $blocks ) {
+			return new WP_Error( 'tbay_bad_input', __( 'An email needs a body. Add at least one block.', 'tbay-rewards' ) );
+		}
+		return $blocks;
 	}
 
 	private function do_suppress_email(): string|WP_Error {

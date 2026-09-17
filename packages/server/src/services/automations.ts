@@ -1,6 +1,7 @@
 import { db, queryOne, type Queryable } from '../db/pool.js';
 import { unsubscribeRequestUrl } from './newsletter.js';
 import { mayReceive, preferencesUrl } from './preferences.js';
+import { personalise, pointsBalanceFor } from './email-blocks.js';
 import { config } from '../config.js';
 import { ApiError } from '../lib/errors.js';
 import { getTemplate, queueEmail, renderTemplate, senderFor } from './email.js';
@@ -352,11 +353,30 @@ async function sendEmailAction(
   const unsubscribeUrl = unsubscribeRequestUrl(tenant.id, ctx.contact.email);
   const preferenceUrl = preferencesUrl(tenant.id, ctx.contact.email);
 
-  const rendered = renderTemplate(template, {
+  // A template built from blocks, where some block is conditional, has to be
+  // re-rendered for this recipient: the stored HTML shows every block, because
+  // it was rendered with nobody's membership.
+  const body = await personalise(tenant.id, ctx.contact.id, template);
+
+  // Looked up only when the message holds a `points` block, so a template
+  // without one costs no extra query. A trigger that already carries a balance
+  // wins: it is the balance at the moment that fired, and re-reading it here
+  // would show a different number from the one the message is about.
+  const carried = ctx.data?.balance ?? ctx.data?.points ?? ctx.data?.points_balance;
+  const pointsBalance =
+    carried ?? (body.html.includes('{{points_balance}}')
+      ? await pointsBalanceFor(tenant.id, ctx.contact.id)
+      : '');
+
+  const rendered = renderTemplate(body, {
     tenant_name: tenant.name,
     name: ctx.contact.name ?? '',
     email: ctx.contact.email,
     rewards_url: (tenant.settings?.siteUrl as string) ?? config().publicUrl,
+    // The `points` block emits {{points_balance}}. Resolved here rather than
+    // inside the renderer so a block stays a description of what to show,
+    // with no way to reach the database of its own.
+    points_balance: pointsBalance,
     unsubscribe_url: unsubscribeUrl,
     preferences_url: preferenceUrl,
     ...ctx.data,

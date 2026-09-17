@@ -50,6 +50,14 @@ import {
   upsertSchedule,
 } from '../services/report-schedules.js';
 import {
+  blocksToText,
+  describeBlocks,
+  membershipFor,
+  renderDocument,
+  segmentsUsed,
+  validateBlocks,
+} from '../services/email-blocks.js';
+import {
   deletePointType,
   listPointTypes,
   upsertPointType,
@@ -89,6 +97,7 @@ import {
   deleteTemplate,
   getTemplate,
   listTemplates,
+  renderTemplate,
   upsertTemplate,
 } from '../services/email.js';
 import {
@@ -176,20 +185,85 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     const tenant = tenantOf(request);
     const schema = z.object({
       subject: z.string().min(1).max(300),
-      html: z.string().min(1).max(200_000),
+      // Either hand-written HTML or composed blocks. `html` stays required
+      // when there are no blocks, so every existing caller is unchanged.
+      html: z.string().max(200_000).optional(),
       text: z.string().max(200_000).nullish(),
       transactional: z.boolean().optional(),
+      topicKey: z.string().regex(/^[a-z0-9_]{2,40}$/).nullish(),
+      blocks: z.array(z.record(z.unknown())).max(60).optional(),
+      preheader: z.string().max(200).nullish(),
     });
     const input = parse(schema, request.body);
 
+    if (!input.blocks && !input.html) {
+      throw ApiError.badRequest('A template needs either html or blocks');
+    }
+
     await upsertTemplate(tenant.id, request.params.key, {
       subject: input.subject,
-      html: input.html,
+      html: input.html ?? '',
       text: input.text ?? null,
       transactional: input.transactional ?? false,
+      topicKey: input.topicKey ?? null,
+      blocks: input.blocks,
+      preheader: input.preheader ?? null,
     });
     return { key: request.params.key, saved: true };
   });
+
+  /**
+   * What a composed message will look like, without saving or sending it.
+   *
+   * The whole argument for a builder is that somebody can see what they are
+   * making. `as` names a contact to render it for, so a conditional block
+   * shows what *that* person would get rather than everything at once.
+   */
+  app.post('/v1/email/preview', async (request) => {
+    const tenant = tenantOf(request);
+    const schema = z.object({
+      blocks: z.array(z.record(z.unknown())).max(60),
+      subject: z.string().max(300).optional(),
+      preheader: z.string().max(200).nullish(),
+      as: z.string().uuid().nullish(),
+    });
+    const input = parse(schema, request.body);
+
+    const blocks = validateBlocks(input.blocks);
+    const segments = segmentsUsed(blocks);
+    const member = input.as
+      ? await membershipFor(tenant.id, input.as, segments, db())
+      : new Set<string>();
+
+    const html = renderDocument(blocks, member, input.preheader);
+    const rendered = renderTemplate(
+      { subject: input.subject ?? '(no subject)', html, text: blocksToText(blocks, member) },
+      {
+        tenant_name: tenant.name,
+        name: 'Alex',
+        email: 'alex@example.com',
+        points_balance: '1,250',
+        rewards_url: (tenant.settings?.siteUrl as string) ?? '#',
+        // Present but inert: a preview must not contain a working unsubscribe
+        // link that somebody clicks while checking their own newsletter.
+        unsubscribe_url: '#',
+        preferences_url: '#',
+      },
+    );
+
+    return {
+      subject: rendered.subject,
+      html: rendered.html,
+      text: rendered.text,
+      segments_used: segments,
+      // So a builder can say "this block is hidden for the person you picked"
+      // rather than silently dropping it.
+      segments_matched: [...member],
+    };
+  });
+
+  /** Every block type, and the fields each takes. */
+  app.get('/v1/email/blocks', async () => ({ blocks: describeBlocks() }));
 
   /** Reverts to the built-in template rather than leaving the tenant with none. */
   app.delete<{ Params: { key: string } }>('/v1/email/templates/:key', async (request) => {
@@ -813,6 +887,10 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
       templateKey: z.string().max(64).optional(),
       subject: z.string().max(300).nullish(),
       sendAt: z.string().max(40).nullish(),
+      // A body composed for this send instead of naming a template. Null
+      // clears it and goes back to the template.
+      blocks: z.array(z.record(z.unknown())).max(60).nullish(),
+      preheader: z.string().max(200).nullish(),
     });
     const input = parse(schema, request.body);
     return { broadcast: await upsertBroadcast(tenant.id, { key: request.params.key, ...input }) };

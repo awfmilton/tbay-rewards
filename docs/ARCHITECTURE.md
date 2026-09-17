@@ -62,15 +62,18 @@ actual PII; `member_id` is the thread between them.
 | Group | Tables |
 |---|---|
 | Tenancy | `tenants`, `tenant_keys`, `tenant_domains` |
-| Identity | `members`, `contacts`, `visitors`, `sessions` |
+| Identity | `members`, `contacts`, `visitors`, `sessions`, `wallet_challenges` |
 | Behaviour | `events`, `heatmap_cells`, `heatmap_pages`, `touchpoints` |
 | Commerce | `products`, `product_stats`, `carts`, `orders` |
 | Attribution | `links`, `link_clicks`, `commissions` |
-| Messaging | `lists`, `subscriptions`, `email_templates`, `email_messages` |
+| Messaging | `lists`, `subscriptions`, `email_templates`, `email_messages`, `email_events`, `email_suppressions`, `email_topics`, `contact_topic_prefs`, `preference_changes` |
+| Audiences | `segments`, `segment_members`, `broadcasts`, `broadcast_recipients` |
 | Automation | `automations`, `automation_runs`, `webhooks`, `webhook_deliveries` |
-| Rewards | `reward_rules`, `points_ledger`, `points_balances`, `share_events`, `referrals` |
+| Reporting | `reports`, `report_schedules`, `report_runs` |
+| Administration | `operators`, `audit_log`, `contact_fields`, `contact_field_values`, `retention_policies`, `erasure_log` |
+| Rewards | `point_types`, `reward_rules`, `reward_exclusions`, `reward_product_rules`, `points_ledger`, `points_balances`, `share_events`, `referrals` |
 | Gamification | `badges`, `badge_awards`, `ranks`, `rank_awards`, `streaks`, `point_transfers`, `point_coupons`, `coupon_redemptions`, `content_unlocks`, `notifications` |
-| Token | `token_claims`, `token_mint_windows`, `token_supply_budget`, `token_spend_intents`, `store_credits`, `bridge_withdrawals` |
+| Token | `token_claims`, `token_mint_windows`, `token_supply_budget`, `tenant_token_windows`, `tenant_token_budgets`, `token_spend_intents`, `store_credits`, `bridge_withdrawals` |
 
 ---
 

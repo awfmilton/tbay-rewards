@@ -282,7 +282,13 @@ never the public site key.
 | `PUT` | `/v1/email/templates/:key` | Override it |
 | `DELETE` | `/v1/email/templates/:key` | Revert to the built-in |
 
-`PUT` takes `{ subject, html, text?, transactional? }`.
+`PUT` takes `{ subject, html?, blocks?, text?, transactional?, topicKey?, preheader? }`.
+Either `html` or `blocks` — not neither. See [the email builder](#the-email-builder)
+for what `blocks` holds.
+
+`preheader` is the line a mail client shows beside the subject. Left unset, the
+client shows the first words of the body instead, which for a message that
+opens with an image is its alt text.
 
 `transactional` decides whether the message needs marketing consent. A receipt
 for something the person just did — the points their order earned — is
@@ -290,6 +296,74 @@ transactional; anything they did not ask for is not, and stays consent-gated.
 It defaults to `false`, so opting a template out of consent is always a
 deliberate act. Where the line sits legally is the retailer's call, which is
 why this is a switch rather than a hardcoded list.
+
+### The email builder
+
+A message somebody can compose without writing HTML: a list of typed blocks
+with typed fields, rendered server-side.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/v1/email/blocks` | Every block type, and the fields each takes |
+| `POST` | `/v1/email/preview` | Render blocks without saving or sending |
+
+The catalogue is fetched rather than hard-coded, so a builder UI is driven by
+the platform: add a field server-side and the UI offers it, instead of
+silently dropping what it does not know.
+
+```json
+{ "blocks": [
+    { "type": "heading", "text": "September", "level": 2 },
+    { "type": "text", "text": "Thanks for a good month, {{name}}." },
+    { "type": "products", "items": [
+        { "title": "Maple syrup", "price": "$12", "url": "https://shop.example/p/1" }
+    ] },
+    { "type": "button", "label": "Shop", "url": "https://shop.example" },
+    { "type": "points", "heading": "Your balance" }
+] }
+```
+
+Types are `heading`, `text`, `button`, `image`, `divider`, `spacer`, `products`
+and `points`. At most 60 blocks, 12 products in a product block.
+
+**The admin never writes HTML, which is the security property.** An HTML
+textarea in wp-admin is a stored XSS vector against the next admin who opens
+the preview; a list of blocks with escaped values is not, whatever anybody
+types into it. Links must be `http`, `https` or `mailto` — `javascript:` is
+mostly inert in a mail client and entirely live in an admin's preview pane, and
+`data:` is a phishing page that never leaves the message.
+
+Merge fields (`{{name}}`, `{{tenant_name}}`, `{{points_balance}}`,
+`{{rewards_url}}`) survive escaping and are substituted at send time. A merge
+field is also accepted where a URL goes.
+
+#### Dynamic content
+
+Any block may carry `visibleTo` or `hiddenFrom`, naming a segment key:
+
+```json
+{ "type": "text", "text": "Your VIP early access opens Friday", "visibleTo": "vip" }
+```
+
+That is what makes one message serve two audiences — a VIP paragraph above the
+same three products everybody gets — rather than sending two. Membership is
+resolved per recipient at send time from `segment_members`, one query for the
+whole message however many conditional blocks it holds.
+
+The copy stored on the template shows every block, because it was rendered
+against nobody. What a given person receives is rendered when the message is
+queued for them.
+
+#### Preview
+
+`POST /v1/email/preview` takes `{ blocks, subject?, preheader?, as? }` and
+returns `{ subject, html, text, segments_used, segments_matched }`. `as` is a
+contact id: naming somebody renders the blocks *that person* would get, so a
+conditional block can be checked rather than guessed at. The preview's
+unsubscribe and preferences links are inert `#` — a preview must not contain a
+working unsubscribe link that somebody clicks while checking their own
+newsletter.
+
 
 ### Who does not earn
 
@@ -899,8 +973,24 @@ an audience is read, so a segment cannot be built that forgets them.
 | `POST` | `/v1/broadcasts/:key/send` | Arm it; a worker walks the audience |
 | `POST` | `/v1/broadcasts/:key/cancel` | Stop the walk |
 
+`PUT` takes `{ name?, segmentKey?, templateKey?, subject?, sendAt?, blocks?, preheader? }`.
+
+A broadcast either names a template or carries its own body. Sending `blocks`
+clears the template it named, and naming a template clears the blocks —
+whichever came last is the one that goes out, because a message has one body
+and leaving both set would make the answer depend on the order of two `if`s. A
+composed broadcast needs its own `subject`; a template carries one already.
+
+Composing on the send is there because the monthly newsletter is a one-off, and
+making a retailer create a template for each one is how a "send" screen grows a
+"template" screen nobody wanted — and a template list that is really a send
+history. Conditional blocks work the same way here as on a template: one
+message, two audiences.
+
 Sending is a separate call from saving on purpose: mailing a whole segment is
-not something to do by accident while editing a subject line.
+not something to do by accident while editing a subject line. Arming resolves
+the body first, so a deleted template or an empty composed message stops the
+send before anybody is mailed rather than failing it halfway through.
 
 A send resumes from a cursor if a worker dies, and every message carries the
 dedupe key `broadcast:<id>:<contact>`, so even an overlapping resume cannot
