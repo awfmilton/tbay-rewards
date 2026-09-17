@@ -1050,7 +1050,7 @@ describe('erasure never destroys money in flight (HIGH)', () => {
     // A transaction carrying two burns pays the one the commitment names, not
     // the one the node happens to list first.
     setChainClient(chainOf([burn(OTHER, 5n), burn(WALLET, 1n)]));
-    expect(await recipientFor(rows[0]!)).toEqual({ address: WALLET.toLowerCase() });
+    expect(await recipientFor(rows[0]!)).toEqual({ address: WALLET.toLowerCase(), verified: true });
 
     // A node that answers with somebody else's burn pays nobody.
     setChainClient(chainOf([burn(OTHER, 1n)]));
@@ -1146,7 +1146,10 @@ describe('erasure never destroys money in flight (HIGH)', () => {
       'SELECT l1_recipient, burn_tx_hash FROM bridge_withdrawals WHERE burn_tx_hash = $1',
       ['0xburn-linkable'],
     );
-    expect(await recipientFor(withdrawal.rows[0]!)).toEqual({ address: WALLET.toLowerCase() });
+    expect(await recipientFor(withdrawal.rows[0]!)).toEqual({
+      address: WALLET.toLowerCase(),
+      verified: true,
+    });
     setChainClient(null);
   });
 
@@ -1373,6 +1376,81 @@ describe('erasure never destroys money in flight (HIGH)', () => {
     expect(settled.intent.status).toBe('verified');
     setChainClient(null);
   });
+
+  it('locks a lapsed intent against a verification claiming it mid-erasure (HIGH)', async () => {
+    // FOR UPDATE locks what the WHERE clause matched, and the refusal named
+    // only the *live* intents -- so the lapsed ones, which are exactly the
+    // population the digest query covers, were unlocked. A verification
+    // claiming one between the two statements flipped it to 'verifying', which
+    // matched neither predicate, and it fell through to the sentinel scrub: a
+    // row nothing can ever settle, with the customer's TBAY already at the
+    // retailer's payout wallet.
+    //
+    // The erasure is parked on a row lock taken from another connection, so
+    // the interleaving is deterministic rather than hoped for.
+    const contact = await withSpendIntent('raced@example.com', 'expired');
+    await db().query(
+      `UPDATE token_spend_intents SET expires_at = now() - interval '2 hours'
+        WHERE contact_id = $1`,
+      [contact.id],
+    );
+    await db().query(
+      `INSERT INTO token_claims (
+         tenant_id, contact_id, wallet_address, points_spent, token_amount_wei,
+         nonce, chain_id, contract_address, signature, status, expires_at
+       ) VALUES ($1, $2, $3, 1, 1, 424242, 300,
+                 '0x74eb73aca939fc911f79d9589e808f0207684d09', '0xsig', 'signed',
+                 now() + interval '1 day')`,
+      [tenant.id, contact.id, WALLET],
+    );
+
+    const blocker = await db().connect();
+    let erasing: Promise<unknown>;
+    try {
+      await blocker.query('BEGIN');
+      // The pool sets idle_in_transaction_session_timeout, which is right for
+      // production and would kill this deliberately-parked transaction.
+      await blocker.query('SET LOCAL idle_in_transaction_session_timeout = 0');
+      // Hold the row the erasure reaches straight after its refusal.
+      await blocker.query('SELECT 1 FROM token_claims WHERE contact_id = $1 FOR UPDATE', [
+        contact.id,
+      ]);
+
+      erasing = eraseContact(tenant.id, contact.id).catch((err: Error) => err);
+      // Let the erasure get as far as the lock.
+      await new Promise((resolve) => setTimeout(resolve, 300));
+
+      // Now try to claim the lapsed intent, exactly as verifySpendIntent does.
+      // It must block on the erasure's lock rather than slipping past it.
+      const claimer = await db().connect();
+      try {
+        // Session-level, not SET LOCAL: outside a transaction block SET LOCAL
+        // does nothing, so the claimer waited forever and the test deadlocked
+        // against its own parked blocker.
+        await claimer.query("SET lock_timeout = '400ms'");
+        await expect(
+          claimer.query(
+            `UPDATE token_spend_intents SET status = 'verifying'
+              WHERE tenant_id = $1 AND contact_id = $2 AND status = 'expired'`,
+            [tenant.id, contact.id],
+          ),
+        ).rejects.toThrow(/lock timeout|canceling statement/i);
+      } finally {
+        claimer.release();
+      }
+    } finally {
+      await blocker.query('ROLLBACK');
+      blocker.release();
+    }
+
+    await erasing;
+    // And the erasure still finished correctly: digested, not scrubbed.
+    const { rows } = await db().query<{ from_address: string }>(
+      'SELECT from_address FROM token_spend_intents WHERE contact_id = $1',
+      [contact.id],
+    );
+    expect(rows[0]!.from_address).toMatch(/^erased:/);
+  }, 20_000);
 
   it('does not keep a wallet on an intent nobody can act on any more (HIGH)', async () => {
     // Past the window the digest is replaced outright, so there is not even a

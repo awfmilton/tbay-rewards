@@ -280,16 +280,8 @@ const MAILBOX_GONE = new RegExp(
   'i',
 );
 
-/**
- * Does the reply quote an address at all?
- *
- * The same shapes withoutAddresses removes, tested before it removes them.
- */
 /** Reply codes that mean the relay refused *our* credentials. */
 const AUTH_CODES = new Set([530, 535, 538]);
-
-const QUOTES_RECIPIENT =
-  /<[^<>\s]*@[^<>\s]*>|(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/;
 
 /**
  * The subset that names the recipient, for overriding a policy status.
@@ -304,17 +296,49 @@ const QUOTES_RECIPIENT =
  */
 const RECIPIENT_GONE = new RegExp(
   [
-    'no such (?:user|recipient|mailbox)',
-    '(?:user|recipient|mailbox) unknown',
-    'unknown (?:user|recipient|mailbox)',
+    'no such (?:user|recipient|mailbox|address)',
+    '(?:user|recipient|mailbox|address) unknown',
+    'unknown (?:user|recipient|mailbox|address)',
     'mailbox (?:not found|unavailable|does not exist|disabled)',
-    '(?:user|recipient|mailbox) (?:does not exist|not found|no longer exists)',
-    'invalid (?:recipient|mailbox)',
+    '(?:user|recipient|mailbox|address) (?:does not exist|not found|no longer exists)',
+    'invalid (?:recipient|mailbox|address)',
     'no mailbox',
     'user (?:is )?(?:disabled|terminated|suspended)',
   ].join('|'),
   'i',
 );
+
+/**
+ * The reply is about the sender -- which is to say, about us.
+ *
+ * Checked before any wording can promote a policy status to a hard bounce.
+ * Postfix words a *sender* rejection exactly like a recipient one and quotes
+ * the address: "<no-reply@ourshop.example.com>: Sender address rejected: This
+ * account has been disabled". So "an address appears in the reply" is not
+ * evidence about a recipient, and reading it as such suppressed every address
+ * in the queue permanently, on the first attempt, because our own sending
+ * account was refused. SPF, DKIM and DMARC failures are the same shape: about
+ * our domain, sent identically to everybody.
+ */
+const ABOUT_THE_SENDER =
+  /sender (?:address |verify )?(?:rejected|failed|denied|not allowed)|\bfrom address\b|\bspf\b|\bdkim\b|\bdmarc\b|sending (?:domain|account|ip)|your (?:account|domain|message)|does ?n.?t have a valid/i;
+
+/**
+ * Wording that says an *account* is gone rather than a mailbox.
+ *
+ * Only promotes when the reply also names an address, because "this account
+ * has been disabled" is equally how a relay refuses the account we
+ * authenticate with. AOL and Yahoo both answer a dead mailbox this way and
+ * quote the recipient while doing it.
+ *
+ * Deliberately excludes the domain-level wordings. Exim's "unrouteable
+ * address" is a routing failure, often a DNS or MX blip, and it arrives
+ * identically for every recipient at that domain -- the same reason
+ * RECIPIENT_GONE was split out in the first place. It still reads as hard
+ * where there is no enhanced status to disagree with it.
+ */
+const ACCOUNT_GONE =
+  /account has been (?:disabled|discontinued|deactivated|closed)|does ?n.?t have an? [\w.-]{0,40} ?account/i;
 
 /**
  * Postfix's wrapper, which says nothing on its own.
@@ -360,43 +384,36 @@ const HARD_BOUNCE = new RegExp(`${MAILBOX_GONE.source}|${GENERIC_REJECT.source}`
  * multi-line reply that needs more than 8 KB to say which mailbox is missing
  * is not telling the truth.
  */
-function withoutAddresses(message: string): string {
-  return (
-    message
-      .slice(0, 65_536)
-      // `[^<>\s]`, not `[^>\s]`. Without the `<` in the class the engine
-      // matches a `<`, consumes the entire rest of the run looking for a `>`,
-      // fails, and backtracks -- from every start position. 8 KB of `<` took
-      // 135 ms of blocked event loop, and recordFailure calls this twice per
-      // failed send, so a batch of fifty was 13.5 seconds inside the API
-      // process. A remote MTA chooses this text, and prefixing
-      // "421 4.7.0 connection closed" makes it transport, which refunds the
-      // attempt and retries every sixty seconds for three days.
-      //
-      // Excluding `<` means the class cannot cross the opening bracket, so
-      // there is nothing to backtrack and the cap can be generous again: at
-      // 8 KB a reply whose operative line sat past it came out inverted, which
-      // is what a verbose DSN with a hundred Received headers looks like.
-      .replace(/<[^<>\s]*>/g, ' ')
-      // Address-shaped, not merely "has an @ in it". "\S+@\S+" retries from
-      // every start position on a long run of non-space with no "@" in it,
-      // which was seven seconds of blocked event loop on 64 KB; the looser
-      // version also ate whole JSON-stringified nodemailer errors, taking the
-      // error code with them. The character classes here cannot overlap the
-      // separator, so there is nothing to backtrack.
-      // The {1,64} is RFC 5321's limit on a local part, and it is load-bearing:
-      // unbounded, the local part still walks the whole slice from every start
-      // position when there is no "@" to stop at, which is 8 KB squared and
-      // measured at 91 ms per call. A remote MTA chooses this text.
-      // The lookbehind is what keeps this linear in the length of the reply
-      // rather than sixty-four times it. A local part can only *start* after a
-      // character that cannot be part of one, so on a long run of ordinary
-      // letters every position but the first fails in constant time. Without
-      // it the engine tries 64 characters at each of 65,536 positions -- 27 ms
-      // per call, twice per failed send, fifty sends to a batch.
-      .replace(/(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/g, ' ')
-  );
+function readReply(message: string): { said: string; named: boolean } {
+  const bounded = message.slice(0, 65_536);
+  // Addresses first, brackets second. Reversed, `<them@aol.com>` was eaten as
+  // a bracket blob before anything could notice it was an address -- and
+  // whether the reply names a mailbox is the whole basis of the 5.7.x rule
+  // below.
+  //
+  // `named` is the difference, not a separate pattern. Testing the raw reply
+  // with `<[^<>\s]*@[^<>\s]*>` put a fresh quadratic back into the one
+  // function whose entire history is about not having one: two unbounded stars
+  // around an `@` with a closing bracket that never arrives, measured at 4
+  // seconds on 64 KB of `<a@a@a@...` -- 4,700 times a well-formed reply, and
+  // the remote MTA chooses the text. Comparing before and after costs a string
+  // compare and reuses the patterns that are already linear.
+  const deAddressed = bounded.replace(EMAIL_SHAPED, ' ');
+  return { said: deAddressed.replace(/<[^<>\s]*>/g, ' '), named: deAddressed !== bounded };
 }
+
+/**
+ * Address-shaped, not merely "has an @ in it". The looser `\S+@\S+` retried
+ * from every start position on a long run of non-space, which was seven
+ * seconds of blocked event loop on 64 KB, and ate whole JSON-stringified
+ * nodemailer errors along with their error codes. The lookbehind is what keeps
+ * it linear rather than sixty-four times the length: a local part can only
+ * start after a character that cannot be part of one, so on a run of ordinary
+ * letters every position but the first fails in constant time. The {1,64} is
+ * RFC 5321's limit on a local part.
+ */
+const EMAIL_SHAPED =
+  /(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/g;
 
 /**
  * Is this failure evidence about the recipient's mailbox at all?
@@ -416,7 +433,7 @@ function withoutAddresses(message: string): string {
  * list at the same moment.
  */
 export function saysSomethingAboutTheMailbox(message: string): boolean {
-  const said = withoutAddresses(message);
+  const { said, named } = readReply(message);
   const reply = parseReply(said);
   if (reply.severity === 4) return false;
   // The subjects that are about something other than the recipient's mailbox:
@@ -438,17 +455,8 @@ export function saysSomethingAboutTheMailbox(message: string): boolean {
 }
 
 export function classifyFailure(message: string): FailureKind {
-  const said = withoutAddresses(message);
+  const { said, named } = readReply(message);
   const reply = parseReply(said);
-  // Whether the reply names a mailbox, read before the addresses are taken
-  // out. The distinction the 5.7.x arm rests on was unobservable at the point
-  // it was applied: AOL's dead-mailbox reply is
-  // "<them@aol.com>: Recipient address rejected: This account has been
-  // disabled", and the relay's refusal of *our own* account is
-  // "This account has been disabled" -- identical once the address is gone.
-  // Which is why the narrow wording set had to drop both, and a dead AOL or
-  // Yahoo mailbox stopped being suppressed by any route at all.
-  const named = QUOTES_RECIPIENT.test(message.slice(0, 65_536));
 
   // Nothing about a mailbox can be read out of a connection that failed, or
   // out of a relay that refused our password.
@@ -531,8 +539,11 @@ export function classifyFailure(message: string): FailureKind {
         // is gone -- "Access denied" beside an address is not evidence, and
         // "Recipient address rejected" is Postfix's wrapper for everything.
         if (reply.severity !== 5) return 'soft';
+        // A reply about our own sending is never evidence about a recipient,
+        // however it is worded and whoever it quotes.
+        if (ABOUT_THE_SENDER.test(said)) return 'soft';
         if (RECIPIENT_GONE.test(said)) return 'hard';
-        return named && MAILBOX_GONE.test(said) ? 'hard' : 'soft';
+        return named && ACCOUNT_GONE.test(said) ? 'hard' : 'soft';
       default:
         break; // 4, 5 and anything unregistered fall through to the wording.
     }

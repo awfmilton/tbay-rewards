@@ -1321,7 +1321,9 @@ describe('a key flood cannot buy anybody a fresh window (HIGH)', () => {
    * happens to be safe.
    */
   it('keeps blocking a caller who backs off after their 429', async () => {
-    const { rateLimit, resetRateLimits } = await import('../src/lib/ratelimit.js');
+    const { rateLimit, resetRateLimits, rateLimitSizes } = await import(
+      '../src/lib/ratelimit.js'
+    );
     resetRateLimits();
 
     // A caller who has spent their allowance -- and then, as the tracker does
@@ -1352,16 +1354,18 @@ describe('a key flood cannot buy anybody a fresh window (HIGH)', () => {
     // rather than two generations. That is a ranking again, in disguise, and
     // it produced the same outcome as the four designs before it: at limit,
     // refused; after an unrelated flood, allowed with a full allowance.
-    const { rateLimit, resetRateLimits } = await import('../src/lib/ratelimit.js');
+    const { rateLimit, resetRateLimits, rateLimitSizes } = await import(
+      '../src/lib/ratelimit.js',
+    );
     resetRateLimits();
 
-    // A crowd of blocked callers ahead of the victim, larger than the class
-    // ceiling itself -- so no cap expressed as a fraction of it can be
-    // satisfied by this test without being satisfied outright. The previous
-    // version used 60,000 against a 90,000 cap and called that "larger than
-    // any cap", which it was not: raising the fraction to 0.61 kept it green
-    // while a crowd of 90,001 still lost its blocked caller.
-    for (let n = 0; n < 110_000; n += 1) {
+    // A crowd of blocked callers ahead of the victim, just under the class
+    // ceiling -- which is the most that can be asked for, and more than any
+    // *fraction* of it. An earlier version used 60,000 against a 90,000 cap
+    // and called that "larger than any cap", which it was not: raising the
+    // fraction to 0.61 kept it green while a crowd of 90,001 still lost its
+    // blocked caller.
+    for (let n = 0; n < 99_000; n += 1) {
       for (let i = 0; i < 11; i += 1) {
         rateLimit(`ingest:crowd:i:10.1.${n % 256}.${n % 251}:a:c${n}`, 10);
       }
@@ -1376,29 +1380,98 @@ describe('a key flood cannot buy anybody a fresh window (HIGH)', () => {
     const after = rateLimit('ingest:victim:i:1.2.3.4', 10);
     expect(after.allowed).toBe(false);
     expect(after.remaining).toBe(0);
+
+    // And the other side of it, said plainly: past a whole ceiling of
+    // simultaneously-blocked callers the map is bounded rather than retained.
+    // Every key in it is a caller being rejected at that point, so there is
+    // nothing innocent left to protect -- and the alternative, measured, was
+    // six times the ceiling and 143 MB with no bound in the code at all.
+    //
+    // Four times the ceiling is the saturated worst case: the carry can reach
+    // a full ceiling, a generation admits another ceiling of new keys on top
+    // of it, and the previous generation is still held. In ordinary traffic
+    // the carry is near zero and it is two, which is what the sibling test
+    // below pins.
+    for (let n = 0; n < 60_000; n += 1) {
+      const key = `ingest:surge:i:10.9.${n % 256}.${n % 251}:a:s${n}`;
+      for (let i = 0; i < 11; i += 1) rateLimit(key, 10);
+    }
+    expect(rateLimitSizes().ingest).toBeLessThanOrEqual(400_000);
   });
 
+  it('gives the memory back when a class goes quiet (MEDIUM)', async () => {
+    // Two things went wrong here at once. The sweep emptied the previous
+    // generation outright, unexpired windows and all -- and then it was
+    // skipped for any class larger than its ceiling, which is every class that
+    // has ever filled. A class that filled once and went quiet was skipped
+    // forever, because rotation needs a ceiling of *fresh* keys and a quiet
+    // class has none: 100,000 windows that lapsed an hour ago stayed resident.
+    //
+    // Worse, the skip blinded the test that guarded the discard. With it in
+    // place, reintroducing the discard changed nothing, because the sweep
+    // never ran.
+    const { rateLimit, resetRateLimits, rateLimitSizes } = await import(
+      '../src/lib/ratelimit.js'
+    );
+    resetRateLimits();
+
+    // Short windows, so "an hour later" is something a test can wait for --
+    // but long enough to outlive the flood itself, so the class is genuinely
+    // *over its ceiling* when the sweep comes round. That is the state the
+    // size-based skip was blind to, and a flood whose own keys expire while it
+    // runs never reaches it.
+    for (let n = 0; n < 100_050; n += 1) rateLimit(`ingest:t:i:10.0.0.1:a:v${n}`, 600, 3_000);
+    expect(rateLimitSizes().ingest).toBeGreaterThan(100_000);
+
+    await new Promise((resolve) => setTimeout(resolve, 3_200));
+    rateLimit('ingest:t:i:10.0.0.2:a:later', 600, 1);
+    expect(rateLimitSizes().ingest).toBeLessThan(10);
+  }, 30_000);
+
+  it('does not let blocked callers pile up past the ceiling (MEDIUM)', async () => {
+    // Without a cap on the carry, `floor` grew by up to a ceiling every
+    // generation while blocked buckets stayed unexpired -- measured at six
+    // times the class ceiling and 143 MB, with no bound anywhere in the code.
+    // Three generations is enough to see it climb.
+    const { rateLimit, resetRateLimits, rateLimitSizes, rateLimitFloors } = await import(
+      '../src/lib/ratelimit.js'
+    );
+    resetRateLimits();
+
+    for (let gen = 0; gen < 3; gen += 1) {
+      for (let n = 0; n < 60_000; n += 1) {
+        const key = `ingest:gen${gen}:i:10.${gen}.${n % 256}.${n % 251}:a:b${n}`;
+        for (let i = 0; i < 11; i += 1) rateLimit(key, 10);
+      }
+      // Enough fresh keys to force the generation over.
+      for (let n = 0; n < 100_001; n += 1) rateLimit(`ingest:fill${gen}:i:9.9.9.9:a:f${n}`, 600);
+    }
+
+    // The carry itself, which is the number that decides whether this is
+    // bounded at all. Uncapped it climbs by up to a ceiling per generation;
+    // reading it directly means the test does not have to build six
+    // generations to watch that happen.
+    expect(rateLimitFloors().ingest).toBeLessThanOrEqual(100_000);
+    expect(rateLimitSizes().ingest).toBeLessThanOrEqual(400_000);
+  }, 60_000);
+
   it('does not reset a caller\'s count when the sweep runs (MEDIUM)', async () => {
-    // The scheduled sweep emptied the previous generation outright, unexpired
-    // windows and all, so a bucket a rotation had just demoted lost its count
-    // to the next sweep rather than surviving two full generations. For an
-    // at-limit bucket the carry above makes that unreachable; for an ordinary
-    // caller accumulating toward their limit it is the difference between a
-    // limiter that counts and one that keeps starting again.
+    // The other half: what the sweep keeps. Emptying the previous generation
+    // meant a bucket a rotation had just demoted lost its count to the next
+    // sweep rather than surviving two full generations -- the difference
+    // between a limiter that counts and one that keeps starting again.
     const { rateLimit, resetRateLimits } = await import('../src/lib/ratelimit.js');
     resetRateLimits();
 
-    // A steady caller, well short of their limit.
     for (let n = 0; n < 5; n += 1) rateLimit('ingest:steady:i:9.9.9.9:a:v1', 600);
-    // Enough fresh keys to rotate them into the previous generation.
     for (let n = 0; n < 100_050; n += 1) rateLimit(`ingest:noise:i:8.8.8.8:a:n${n}`, 600);
 
     // Force the scheduled sweep: its trigger is the window of the call that
     // notices, so a one-millisecond window fires it without touching anybody
     // else's sixty-second windows.
+    await new Promise((resolve) => setTimeout(resolve, 5));
     rateLimit('other:sweep-probe', 10, 1);
 
-    // Their count survived: the sixth request is the sixth, not the first.
     expect(600 - rateLimit('ingest:steady:i:9.9.9.9:a:v1', 600).remaining).toBe(6);
   });
 
@@ -1427,8 +1500,10 @@ describe('a key flood cannot buy anybody a fresh window (HIGH)', () => {
     // Distinct keys, not live.size + old.size -- a carried window is in both
     // maps, so adding them reported more keys than exist and made this
     // assertion unfailable.
+    // Nobody here is at their limit, so the carry is empty and the bound is
+    // two generations of the ceiling and no more.
     const sizes = rateLimitSizes();
-    expect(sizes.ingest).toBeLessThanOrEqual(200_000); // two generations at the ceiling
+    expect(sizes.ingest).toBeLessThanOrEqual(200_000);
     expect(sizes.admin).toBe(20);
   });
 

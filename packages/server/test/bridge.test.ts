@@ -78,6 +78,50 @@ describe('the payout survives an erasure without the wallet doing so (HIGH)', ()
    * documentation points operators at. Deleting the field from the route left
    * every test green while making an outstanding obligation unpayable.
    */
+  it('never offers the burn hole as a payout address (HIGH)', async () => {
+    // A build before commitments overwrote the wallet with a well-formed
+    // 0x...ff. Read back verbatim, that is the operator's answer to "where do
+    // I send this L1 release?" -- and a TBAY transfer there is irreversible.
+    // Those rows cannot heal themselves either: the erasure that would
+    // re-digest them matches on contact_id, which the same statement nulled,
+    // and erasure is one-shot.
+    const { recipientFor } = await import('../src/services/bridge.js');
+    const legacy = { l1_recipient: '0x00000000000000000000000000000000000000ff', burn_tx_hash: TX };
+
+    const chainOf = (transfers: unknown[]) => ({
+      isNonceUsed: async () => false,
+      isPaused: async () => false,
+      balanceOf: async () => 0n,
+      transfersInTx: async () => transfers as never,
+    });
+    const burnFrom = (from: string, value: bigint) => ({
+      from, to: BURN_ADDRESS, value, blockNumber: 1, confirmations: 3,
+    });
+
+    // One burn in the transaction is unambiguous, and is exactly what
+    // recordWithdrawal would have recorded -- but it is not *checked*, so it
+    // says so.
+    setChainClient(chainOf([burnFrom(HOLDER, 1n)]));
+    expect(await recipientFor(legacy)).toEqual({
+      address: HOLDER.toLowerCase(),
+      verified: false,
+    });
+
+    // Several burns and no commitment to break the tie: nobody is paid.
+    setChainClient(chainOf([burnFrom(OTHER, 5n), burnFrom(HOLDER, 1n)]));
+    expect(await recipientFor(legacy)).toEqual({ address: null, reason: 'ambiguous_legacy' });
+
+    // And anything that is neither an address nor a commitment is refused
+    // rather than handed back as one.
+    for (const broken of ['', 'erased:9682', 'not-an-address']) {
+      expect(await recipientFor({ l1_recipient: broken, burn_tx_hash: TX }), broken).toEqual({
+        address: null,
+        reason: 'unreadable',
+      });
+    }
+    setChainClient(null);
+  });
+
   it('gives the operator a payout address and nobody else', async () => {
     const app = await testApp();
     const contact = await upsertContact(tenant.id, { email: 'erased-bridge@example.com' });
@@ -126,7 +170,7 @@ describe('the payout survives an erasure without the wallet doing so (HIGH)', ()
     const operator = JSON.parse(
       (await get({ 'x-tbay-operator': 'operator-test-token' })).body,
     );
-    expect(operator.payable_to).toEqual({ address: HOLDER.toLowerCase() });
+    expect(operator.payable_to).toEqual({ address: HOLDER.toLowerCase(), verified: true });
 
     const wrong = await get({ 'x-tbay-operator': 'not-the-token' });
     expect(wrong.statusCode).toBe(403);

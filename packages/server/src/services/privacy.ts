@@ -304,27 +304,35 @@ export async function eraseContact(
     // a legal claim.
     //
     // So: unlink everything, and scrub the wallet only where nothing is owed.
-    const unsettled = await client.query<{ kind: string; id: string }>(
+    const unsettled = await client.query<{ kind: string; id: string; live: boolean }>(
       // Live, not merely unfinished -- and only for the one case where erasing
       // *now* would break something actually in progress. A spend intent is
       // created the moment somebody taps "Pay with TBAY"; the expiry worker
       // moves it out of `pending` within five minutes of its own deadline, so
       // this refusal lasts minutes and clears itself. A verification in flight
       // is about to write a store credit against this contact.
-      // FOR UPDATE, because the refusal and the digest query below decide on
-      // the same rows one statement apart, and READ COMMITTED gives each a
-      // fresh snapshot. A verification claiming in between flips the row to
-      // 'verifying', which matches neither predicate, so it falls to the
-      // sentinel scrub -- and if that verification then finds no match it is
-      // released to an unsettleable row.
-      `SELECT 'token spend' AS kind, id::text FROM token_spend_intents
+      // Every open intent is locked, and the refusal is decided from the rows
+      // rather than by the predicate.
+      //
+      // FOR UPDATE locks only what the WHERE clause matched, so a predicate
+      // naming just the live ones left the *expired* ones unlocked -- and
+      // those are exactly the population the digest query below was widened to
+      // cover. READ COMMITTED gives each statement a fresh snapshot, so a
+      // verification claiming one in between flipped it to 'verifying', which
+      // matched neither predicate, and it fell through to the sentinel scrub.
+      // If that verification then found no match it was released to a row
+      // nothing can ever settle. Reproduced deterministically.
+      `SELECT 'token spend' AS kind, id::text,
+              (status = 'verifying' OR (status = 'pending' AND expires_at > now())) AS live
+         FROM token_spend_intents
         WHERE tenant_id = $1 AND contact_id = $2
-          AND (status = 'verifying' OR (status = 'pending' AND expires_at > now()))
+          AND status IN ('pending', 'verifying', 'expired')
         FOR UPDATE`,
       [tenantId, contactId],
     );
-    if ((unsettled.rowCount ?? 0) > 0) {
-      const what = unsettled.rows.map((row) => `${row.kind} ${row.id}`).join(', ');
+    const live = unsettled.rows.filter((row) => row.live);
+    if (live.length > 0) {
+      const what = live.map((row) => `${row.kind} ${row.id}`).join(', ');
       throw ApiError.badRequest(
         `This person has a checkout in progress (${what}). Erasing mid-payment would ` +
           'lose the store credit they are about to be owed. POST /v1/token/spend/{id}/cancel ' +

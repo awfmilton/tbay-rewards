@@ -148,7 +148,6 @@ describe('classifying a delivery failure', () => {
     for (const message of [
       '554 5.7.1 <them@aol.com>: Recipient address rejected: This account has been disabled or discontinued',
       "550 5.7.1 This user doesn't have a yahoo.com account (them@yahoo.com)",
-      '550 5.7.1 <them@example.com>: Recipient address rejected: unrouteable address',
       '550 5.7.1 <them@example.com>: Recipient address rejected: Address unknown',
       '550 5.7.1 <them@example.com>: Recipient address rejected: The email address does not exist',
     ]) {
@@ -165,9 +164,42 @@ describe('classifying a delivery failure', () => {
       '550 5.7.1 <them@example.com>: Recipient address rejected: Access denied',
       '554 5.7.1 Service unavailable; Client host [203.0.113.7] blocked using zen.spamhaus.org',
       '550 5.7.606 Access denied, banned sending IP [203.0.113.7]',
+      // Exim's routing failure, which it words the same way whether the domain
+      // is gone or its MX is briefly unreachable -- and it arrives identically
+      // for every recipient at that domain. It still reads as hard where there
+      // is no enhanced status to disagree with it.
+      '550 5.7.1 <them@example.com>: Recipient address rejected: unrouteable address',
     ]) {
       expect(classifyFailure(message), message).toBe('soft');
     }
+    expect(classifyFailure('550 Unrouteable address')).toBe('hard');
+  });
+
+  it('does not read a refusal of our own sending as a dead mailbox (HIGH)', async () => {
+    // Postfix words a *sender* rejection exactly like a recipient one, and
+    // quotes the address while doing it -- so "an address appears in the
+    // reply" is not evidence about a recipient. Read as one, our own sending
+    // account being refused suppressed every address in the queue
+    // permanently, on the first attempt, through `hard`, which never consults
+    // the gate that exists to stop precisely that.
+    for (const message of [
+      '550 5.7.1 <no-reply@ourshop.example.com>: Sender address rejected: This account has been disabled',
+      '550 5.7.1 <no-reply@ourshop.example.com>: Sender address rejected: Address does not exist',
+      '550 5.7.1 <them@example.com>: Recipient address rejected: your domain does not have a valid SPF record',
+      '550 5.7.1 Message rejected; contact postmaster@example.com. Your account has been disabled',
+    ]) {
+      const address = `ours-${Math.random().toString(36).slice(2)}@example.com`;
+      expect(await recordFailure(tenant.id, address, message, 1, 6), message).toBe('soft');
+      expect(await isSuppressed(tenant.id, address), message).toBeNull();
+    }
+
+    // The control: the same wording about the *recipient*, which is what AOL
+    // and Yahoo actually send, is still a dead mailbox.
+    expect(
+      classifyFailure(
+        '554 5.7.1 <them@aol.com>: Recipient address rejected: This account has been disabled or discontinued',
+      ),
+    ).toBe('hard');
   });
 
   it('reads a credential refusal that carries no enhanced status (HIGH)', () => {
