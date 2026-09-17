@@ -1311,6 +1311,14 @@ describe('the GET beacon gets a per-visitor bucket too (MEDIUM)', () => {
 
 describe('a key flood cannot buy anybody a fresh window (HIGH)', () => {
   /**
+   * The contention contract, guarantee by guarantee.
+   *
+   * docs/RATE-LIMITING.md numbers them; the titles below name which one each
+   * test pins, so a failure says which promise was broken rather than which
+   * internal changed. Five rewrites of the limiter were five attempts to infer
+   * that document from whatever the last review happened to probe.
+   */
+  /**
    * Four attempts came before the one this tests. Three looked for a ranking
    * that would pick the right key to drop, and the attacker chose every
    * candidate. The fourth used least-recently-used order on the theory that a
@@ -1320,7 +1328,7 @@ describe('a key flood cannot buy anybody a fresh window (HIGH)', () => {
    * These test the property directly rather than a traffic pattern that
    * happens to be safe.
    */
-  it('keeps blocking a caller who backs off after their 429', async () => {
+  it('G1: keeps blocking a caller who backs off after their 429', async () => {
     const { rateLimit, resetRateLimits, rateLimitSizes } = await import(
       '../src/lib/ratelimit.js'
     );
@@ -1346,7 +1354,7 @@ describe('a key flood cannot buy anybody a fresh window (HIGH)', () => {
     expect(after.remaining).toBe(0);
   });
 
-  it('keeps blocking every rejected caller, not the first fifty thousand (HIGH)', async () => {
+  it('G1/G3/G4/G5: keeps blocking every rejected caller, not the first fifty thousand', async () => {
     // The carry was capped at a quarter of the ceiling, and rotate walks in
     // insertion order -- so the at-limit bucket past the cap was dropped, and
     // the scheduled sweep then emptied the previous generation *including
@@ -1399,7 +1407,7 @@ describe('a key flood cannot buy anybody a fresh window (HIGH)', () => {
     expect(rateLimitSizes().ingest).toBeLessThanOrEqual(400_000);
   });
 
-  it('gives the memory back when a class goes quiet (MEDIUM)', async () => {
+  it('G6: gives the memory back when a class goes quiet', async () => {
     // Two things went wrong here at once. The sweep emptied the previous
     // generation outright, unexpired windows and all -- and then it was
     // skipped for any class larger than its ceiling, which is every class that
@@ -1428,7 +1436,7 @@ describe('a key flood cannot buy anybody a fresh window (HIGH)', () => {
     expect(rateLimitSizes().ingest).toBeLessThan(10);
   }, 30_000);
 
-  it('does not let blocked callers pile up past the ceiling (MEDIUM)', async () => {
+  it('G5: does not let blocked callers pile up past the ceiling', async () => {
     // Without a cap on the carry, `floor` grew by up to a ceiling every
     // generation while blocked buckets stayed unexpired -- measured at six
     // times the class ceiling and 143 MB, with no bound anywhere in the code.
@@ -1455,7 +1463,7 @@ describe('a key flood cannot buy anybody a fresh window (HIGH)', () => {
     expect(rateLimitSizes().ingest).toBeLessThanOrEqual(400_000);
   }, 60_000);
 
-  it('does not reset a caller\'s count when the sweep runs (MEDIUM)', async () => {
+  it('G7: does not reset a caller\'s count when the sweep runs', async () => {
     // The other half: what the sweep keeps. Emptying the previous generation
     // meant a bucket a rotation had just demoted lost its count to the next
     // sweep rather than surviving two full generations -- the difference
@@ -1475,7 +1483,7 @@ describe('a key flood cannot buy anybody a fresh window (HIGH)', () => {
     expect(600 - rateLimit('ingest:steady:i:9.9.9.9:a:v1', 600).remaining).toBe(6);
   });
 
-  it('cannot reach the tenant bucket from the ingest class at all', async () => {
+  it('G2/G5: cannot reach the tenant bucket from the ingest class at all', async () => {
     const { rateLimit, resetRateLimits, rateLimitSizes } = await import(
       '../src/lib/ratelimit.js'
     );
@@ -1507,7 +1515,7 @@ describe('a key flood cannot buy anybody a fresh window (HIGH)', () => {
     expect(sizes.admin).toBe(20);
   });
 
-  it('does not let a key class be invented by its name', async () => {
+  it('G9: does not let a key class be invented by its name', async () => {
     // `name in CEILINGS` is true for 'toString', 'constructor' and 'valueOf',
     // and the ceiling then comes back as a *function* -- so `size >= ceiling`
     // is NaN, nothing rotates, and that class grows without bound. No call
@@ -1522,7 +1530,7 @@ describe('a key flood cannot buy anybody a fresh window (HIGH)', () => {
     expect(rateLimitSizes().other).toBeLessThanOrEqual(100_000);
   });
 
-  it('does not spend the event loop on the flood it is absorbing', async () => {
+  it('G8: does not spend the event loop on the flood it is absorbing', async () => {
     // Keeping LRU order cost a `delete` and a `set` on every touch, and
     // evicting walked `keys()` from the front. Both leave tombstones in V8's
     // Map that later iteration must walk past: measured at 40 us per insert

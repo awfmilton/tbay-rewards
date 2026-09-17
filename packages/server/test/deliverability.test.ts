@@ -9,7 +9,16 @@ import {
   truncateAll,
   type TestTenant,
 } from './helpers.js';
-import { classifyFailure, isSuppressed, recordFailure, suppress } from '../src/services/deliverability.js';
+import {
+  classifyFailure,
+  isSuppressed,
+  recordFailure,
+  saysSomethingAboutTheMailbox,
+  severityOf,
+  subjectOf,
+  suppress,
+} from '../src/services/deliverability.js';
+import { BOUNCE_CORPUS } from './support/bounce-corpus.js';
 import {
   flushEmailQueue,
   outbox,
@@ -44,13 +53,65 @@ async function authed(method: 'GET' | 'POST' | 'DELETE', url: string, payload?: 
   });
 }
 
+describe('the bounce corpus is the specification (HIGH)', () => {
+  /**
+   * Every reply a real provider sends, with the verdict it should get.
+   *
+   * This replaces arguing about precedence. A disagreement about behaviour is
+   * a disagreement about a row in test/support/bounce-corpus.ts, which names
+   * the provider and the reason; the table in src/services/bounce-table.ts
+   * then has to reproduce it. Five rewrites of the classifier were five
+   * attempts to infer this list from whatever the last review happened to
+   * probe.
+   *
+   * Asserted per row rather than in a loop with one expect, so a failure names
+   * the provider and the reply rather than a count.
+   */
+  for (const entry of BOUNCE_CORPUS) {
+    it(`${entry.provider}: ${entry.reply.split('\n')[0]!.slice(0, 68)}`, () => {
+      expect(subjectOf(entry.reply), entry.because).toBe(entry.subject);
+      expect(classifyFailure(entry.reply), entry.because).toBe(entry.kind);
+      expect(saysSomethingAboutTheMailbox(entry.reply), entry.because).toBe(entry.counts);
+    });
+  }
+
+  it('covers every subject the table can produce', () => {
+    // A corpus with a gap is a specification with a gap. Every subject has to
+    // have at least one real reply behind it, or it is a branch nobody has
+    // ever seen a provider exercise.
+    const seen = new Set(BOUNCE_CORPUS.map((entry) => entry.subject));
+    for (const subject of [
+      'connection',
+      'credentials',
+      'sender',
+      'message',
+      'capacity',
+      'mailbox',
+      'domain',
+      'deferral',
+      'unknown',
+    ] as const) {
+      expect(seen.has(subject), `no corpus entry for subject "${subject}"`).toBe(true);
+    }
+  });
+
+  it('never lets a transient reply count toward a suppression', () => {
+    // The policy, asserted as a policy rather than one reply at a time: a 4xx
+    // is not a verdict about anybody, whatever the wording says.
+    for (const entry of BOUNCE_CORPUS) {
+      if (severityOf(entry.reply) !== 4) continue;
+      expect(entry.counts, `${entry.provider}: ${entry.reply.slice(0, 60)}`).toBe(false);
+      expect(entry.kind, `${entry.provider}: ${entry.reply.slice(0, 60)}`).not.toBe('hard');
+    }
+  });
+});
+
 describe('classifying a delivery failure', () => {
   it('treats a missing mailbox as hard', () => {
     for (const message of [
       '550 5.1.1 <nobody@example.com>: Recipient address rejected: User unknown',
       '5.1.1 no such user',
       'Mailbox not found',
-      '553 sorry, that address is not local',
     ]) {
       expect(classifyFailure(message)).toBe('hard');
     }
@@ -172,7 +233,11 @@ describe('classifying a delivery failure', () => {
     ]) {
       expect(classifyFailure(message), message).toBe('soft');
     }
-    expect(classifyFailure('550 Unrouteable address')).toBe('hard');
+    // `domain`, not `mailbox`: see docs/DELIVERABILITY.md. Exim cannot tell a
+    // dead domain from a recipient provider with a broken DNS record, and the
+    // second produces this for every address at that domain at once.
+    expect(classifyFailure('550 Unrouteable address')).toBe('soft');
+    expect(saysSomethingAboutTheMailbox('550 Unrouteable address')).toBe(true);
   });
 
   it('does not read a refusal of our own sending as a dead mailbox (HIGH)', async () => {
@@ -272,10 +337,23 @@ describe('classifying a delivery failure', () => {
 
     // Three more that every earlier version read as soft.
     expect(
-      classifyFailure("554 delivery error: dd This user doesn't have a yahoo.com account"),
+      // Yahoo's reply as Yahoo sends it, with the recipient in it. Without a
+      // named address the same wording is how a relay refuses our own sending
+      // account, which is the guard that stopped a broadcast being suppressed
+      // for our password being wrong.
+      classifyFailure(
+        "554 delivery error: dd This user doesn't have a yahoo.com account them@yahoo.com",
+      ),
     ).toBe('hard');
+    expect(
+      classifyFailure("554 delivery error: dd This user doesn't have a yahoo.com account"),
+    ).toBe('soft');
     expect(classifyFailure('550 5.1.1 This account has been disabled or discontinued')).toBe('hard');
-    expect(classifyFailure('550 Unrouteable address')).toBe('hard');
+    // `domain`, not `mailbox`: see docs/DELIVERABILITY.md. Exim cannot tell a
+    // dead domain from a recipient provider with a broken DNS record, and the
+    // second produces this for every address at that domain at once.
+    expect(classifyFailure('550 Unrouteable address')).toBe('soft');
+    expect(saysSomethingAboutTheMailbox('550 Unrouteable address')).toBe(true);
   });
 
   it('does not let a quoted transient code outrank the final refusal (HIGH)', () => {
@@ -402,7 +480,7 @@ describe('classifying a delivery failure', () => {
   it('lets a permanent code outrank a transient one it quotes (MEDIUM)', () => {
     // Bounces recount their own history. The final word is the 5xx.
     for (const message of [
-      '550-Verification failed for <bob@example.com>\n550-Response: 450 4.1.1 Recipient address rejected\n550 Sender verify failed',
+      '550-Verification failed for <bob@example.com>\n550-Response: 450 4.1.1 Recipient address rejected\n550 5.1.1 Recipient verify failed',
       'Delivery failed permanently.\n550 5.1.1 The email account that you tried to reach does not exist.\nEarlier attempt: 451 4.3.0 deferred',
     ]) {
       expect(classifyFailure(message), message).toBe('hard');

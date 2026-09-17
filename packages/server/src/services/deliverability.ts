@@ -1,4 +1,12 @@
 import { db, queryOne, type Queryable } from '../db/pool.js';
+import {
+  FALLBACK_WORDING,
+  OVERRIDING_WORDING,
+  matchWording,
+  statusEntry,
+  verdictFor,
+  type FailureSubject,
+} from './bounce-table.js';
 
 /**
  * Bounces, complaints and suppression.
@@ -29,31 +37,17 @@ export interface Suppression {
 export type FailureKind = 'hard' | 'soft' | 'complaint' | 'transport';
 
 /**
- * Why this reads the reply instead of scanning it.
+ * How a failure is classified.
  *
- * Three rewrites of this classifier had the same shape: a pile of regexes over
- * the whole reply text, and a precedence order between them. Every adversarial
- * round found a reply where two patterns overlapped and the wrong one won.
- * "450 4.7.1 Greylisted, try again in 500 seconds" read as permanent, because
- * the text contains "500". "451 4.7.0 too many errors from 10.5.3.2" read as
- * permanent, because an IP address contains "5.3.2". A Spamhaus block read as
- * a dead mailbox, because Postfix words every rejection -- reputation,
- * content, policy -- as "<addr>: Recipient address rejected: <reason>", so the
- * hard-bounce wording is present in a reply that is not about the mailbox at
- * all. Each fix reordered the tiers, and the next reply found the new seam.
+ * The decision lives in bounce-table.ts, which is the specification, and this
+ * file only carries it out. Read that file first: it explains why five
+ * rewrites of a precedence pile were five attempts to infer a spec nobody had
+ * written, and every one of its rows cites the provider that sends that
+ * wording.
  *
- * The ordering was the bug. An SMTP reply is not free text: RFC 5321 puts a
- * three-digit code in a known position, and RFC 3463 adds an enhanced status
- * whose middle digit says what the reply is *about* -- addressing, mailbox,
- * system, routing, protocol, content, policy. That digit is the question this
- * file exists to answer, and the server has already answered it.
- *
- * So the reply is parsed: code and enhanced status read positionally, the
- * verdict taken from the subject class wherever the registry and real
- * deployments agree, and wording consulted only where they do not -- routing
- * and protocol, which Exchange overloads for unknown recipients -- and for
- * replies carrying no enhanced status at all. Guessing is confined to the
- * cases that genuinely are a guess.
+ * What is left here is the structural reading of the reply -- pulling the code
+ * and the enhanced status out of the positions SMTP puts them in -- which is
+ * the part that is mechanical rather than a judgement.
  */
 
 /**
@@ -74,10 +68,12 @@ const REPLY_CODE = /(?:^|[\r\n]|:[ \t]|[ \t]-[ \t])[ \t]*([2-5]\d\d)(?=[ \t-]|$)
  * The lookarounds are what keep a dotted quad out: "10.5.3.2" offers "5.3.2",
  * but it is preceded by a dot, and "5.9.3.2" is followed by one. An enhanced
  * status is a whole token or it is not an enhanced status. The detail
- * component takes up to three digits because "4.7.500" is a real reply and
- * reading it as "4.7.50" would leave a stray "0" to be found elsewhere.
+ * component takes up to three digits because "4.7.500" is a real reply.
  */
 const ENHANCED_STATUS = /(?<![\d.])([2-5])\.(\d{1,3})\.(\d{1,3})(?![\d.])/g;
+
+/** Reply codes that mean the relay refused *our* credentials. */
+const AUTH_CODES = new Set([530, 535, 538]);
 
 interface Reply {
   /** 4 (persistent transient) or 5 (permanent) -- the most severe present. */
@@ -98,9 +94,7 @@ interface Reply {
  * Collecting every code and status and then spreading them into Math.max was
  * linear in the *number of matches* as well as the length, and a reply made of
  * 10,900 repetitions of "4.7.1 " spent 10 ms here -- with a spread of 10,900
- * arguments one order of magnitude away from a stack overflow. Nothing needs
- * the full list: the verdict is the worst class present, plus the first status
- * carrying that class.
+ * arguments one order of magnitude away from a stack overflow.
  */
 function parseReply(said: string): Reply {
   let worst = 0;
@@ -122,9 +116,7 @@ function parseReply(said: string): Reply {
     // The most severe thing anybody said wins. A bounce recounts its own
     // history -- "Response: 450 4.1.1 ...", "Earlier attempt: 451 4.3.0
     // deferred" -- and a 5xx anywhere in that chain means some server refused
-    // permanently, whatever came before it. Reading only the first code sent a
-    // dead mailbox round the retry loop forever; reading only the last read a
-    // quoted 4xx footnote as a deferral.
+    // permanently, whatever came before it.
     if (klass === 4 && first4 === null) first4 = [Number(match[2]), Number(match[3])];
     if (klass === 5 && first5 === null) first5 = [Number(match[2]), Number(match[3])];
   }
@@ -142,424 +134,106 @@ function parseReply(said: string): Reply {
 }
 
 /**
- * Failures where no usable reply ever arrived: sockets, TLS, our own timeouts.
+ * The reply with quoted addresses removed, and whether there were any.
  *
- * None of these can be said about a mailbox, so they must never count toward
- * suppressing one. Without this rule a seventy-five second relay outage,
- * retried five times, permanently suppressed every recipient queued at the
- * time -- the opposite of what a retry limit is for.
- */
-const TRANSPORT_ERRNO =
-  /\bECONN(?:REFUSED|RESET|ABORTED)\b|\bE(?:TIMEDOUT|SOCKET|HOSTUNREACH|NETUNREACH|NOTFOUND|PIPE)\b|\bEAI_AGAIN\b/;
-
-/**
- * The same faults in words.
+ * Addresses first, brackets second. Reversed, `<them@aol.com>` was eaten as a
+ * bracket blob before anything could notice it was an address -- and whether
+ * the reply names a mailbox is what separates AOL's dead mailbox from a relay
+ * refusing our own account, which word for word are the same reply.
  *
- * nodemailer raises its own timeouts as a bare Error('Timeout') and
- * Error('Greeting never received'), with the detail only in err.code. Read as
- * wording alone those look like soft bounces, so a relay that accepted the
- * connection and went quiet spent the attempt budget and suppressed the
- * address for thirty days -- for a fault at our end.
- */
-const TRANSPORT_WORDS =
-  /socket close|connection (?:closed|timeout|refused)|^timeout$|\btimed out\b|greeting (?:never received|timeout)|\bcertificate\b|\bself.?signed\b|\bTLS\b|\bSSL\b|\bSTARTTLS\b|insufficient (?:system )?storage/i;
-
-/**
- * The relay refusing *us*, not refusing the recipient.
- *
- * A 535 is a real SMTP reply and carries a permanent class, but it is a
- * statement about our credentials. Suppressing a customer because our SMTP
- * password expired is the worst failure mode this file has.
- */
-const AUTH_FAILURE = new RegExp(
-  [
-    // Qualified, never the bare word. Gmail's standard policy block reads
-    // "This message does not have authentication information or fails to pass
-    // authentication checks. The message has been blocked" -- a permanent
-    // refusal about our sending domain, which as `transport` never gives up
-    // and is retried every sixty seconds until the three-day reaper: about
-    // 4,320 attempts per recipient, aimed at the provider already refusing us
-    // on reputation grounds.
-    'authentication (?:failed|required|unsuccessful|not enabled)',
-    // Amazon SES answers "535 Authentication Credentials Invalid", which the
-    // qualified set missed -- so our own SMTP password being wrong came back
-    // soft, spent every attempt, and then suppressed the recipient for thirty
-    // days. That failure hits every address in the queue identically, which is
-    // the worst thing this file can do.
-    'authentication credentials',
-    '\\b(?:invalid|bad|rejected) credentials\\b',
-    '\\bcredentials (?:invalid|rejected|incorrect)\\b',
-    'invalid login',
-    'username and password not accepted',
-    '\\bbad credentials\\b',
-    // Lookarounds for the same reason ENHANCED_STATUS has them: an IP address
-    // contains three-part runs. Postfix embeds "host NAME[IP]" in a relayed
-    // bounce, so a dead mailbox behind relay 192.5.7.8 read as an
-    // authentication failure -- never suppressed, attempt refunded, retried
-    // for three days. That is the failure removing the bare code set was
-    // meant to end.
-    '(?<![\\d.])5\\.7\\.8(?![\\d.])',
-  ].join('|'),
-  'i',
-);
-
-/**
- * Rejections that are about the message or about our sending domain.
- *
- * These used to be read as complaints, which permanently suppressed the
- * address *and* withdrew that person's marketing consent. But Gmail's standard
- * block is "550-5.7.1 ... likely unsolicited mail ... blocked", and a content
- * filter says "rejected as spam": both are the receiver refusing *our*
- * message, not a recipient reporting us. An hour of that took every recipient
- * in the batch off the list permanently -- worse than the bounce storm the
- * classifier was written to prevent.
- *
- * A real complaint is a feedback-loop report, which arrives out of band --
- * POST /v1/email/suppressions with reason: complaint is how a provider's FBL
- * handler or an operator records one. Nothing in an SMTP reply is one.
- */
-const CONTENT_BLOCK =
-  /\b(?:spam|abuse|complaint|unsolicited|blocked|blacklist|denylist|reputation|policy)\b/i;
-
-/**
- * "Not now" -- said in words, by a server that sent no code with it.
- *
- * Greylisting and throttling are verdicts, not faults: the receiver looked at
- * the message and asked us to come back. They belong on the backoff ladder,
- * and they must never accumulate toward writing an address off, because the
- * whole point of the reply is that the mailbox is fine.
- */
-const DEFERRAL =
-  /greylist|graylist|try again|too many connections|rate limit|temporarily (?:deferred|rejected|unavailable|not available)|throttl/i;
-
-/**
- * A mailbox with no room in it.
- *
- * The one reply every other rule reads wrongly. It can carry a 4xx, so the
- * transient rules claim it as our transport and retry it forever; it can quote
- * "Recipient address rejected", so the hard-bounce rules claim it and suppress
- * the address permanently. Neither is true: the mailbox exists, its owner has
- * not gone anywhere, and they may well empty it next week.
- */
-const OVER_QUOTA =
-  /over ?quota|quota exceeded|mailbox (?:is )?full|user'?s mailbox is full|exceeded storage allocation/i;
-
-/**
- * Wording that means "this address will never work".
- *
- * Only consulted where the enhanced status did not decide. Deliberately
- * conservative: a false hard bounce silently stops mailing a real customer
- * forever, which is far worse than retrying a dead address four more times.
- *
- * Every alternative is a plain literal run. The previous version paired a code
- * with its reason across ".*" -- "\b550\b.*no such user" -- which made the
- * match quadratic in the length of the reply, and the reply comes from a
- * remote MTA: 64 KB of "550 " took 1.5 seconds of blocked event loop and
- * 256 KB took 24. Splitting the code out of the wording is what makes it
- * linear, and the code is parsed now anyway.
- */
-const MAILBOX_GONE = new RegExp(
-  [
-    'no such (?:user|recipient|mailbox|address)',
-    '(?:user|recipient|mailbox|address) unknown',
-    'unknown (?:user|recipient|mailbox|address)',
-    'mailbox (?:not found|unavailable|does not exist|disabled)',
-    '(?:address|account|user|recipient|mailbox) (?:does not exist|not found|no longer exists)',
-    'invalid (?:recipient|mailbox|address)',
-    'no mailbox',
-    'not local',
-    'not our customer',
-    'user (?:is )?(?:disabled|terminated|suspended)',
-    // Yahoo: "This user doesn't have a yahoo.com account".
-    "does ?n.?t have an? ",
-    // AOL: "This account has been disabled or discontinued".
-    'account has been (?:disabled|discontinued|deactivated)',
-    // Exim.
-    'unroute?able address',
-  ].join('|'),
-  'i',
-);
-
-/** Reply codes that mean the relay refused *our* credentials. */
-const AUTH_CODES = new Set([530, 535, 538]);
-
-/**
- * The subset that names the recipient, for overriding a policy status.
- *
- * A 5.7.x reply is about security or policy, and only wording that says a
- * *person's mailbox* is gone may outrank that. "Account", "address" and
- * "user" are not interchangeable here: a relay says "this account has been
- * disabled" about the account we authenticate with, and Exim says
- * "unrouteable address" about a domain -- neither is evidence that the
- * recipient's mailbox does not exist, and both arrive identically for every
- * recipient of the same broadcast.
- */
-const RECIPIENT_GONE = new RegExp(
-  [
-    'no such (?:user|recipient|mailbox|address)',
-    '(?:user|recipient|mailbox|address) unknown',
-    'unknown (?:user|recipient|mailbox|address)',
-    'mailbox (?:not found|unavailable|does not exist|disabled)',
-    '(?:user|recipient|mailbox|address) (?:does not exist|not found|no longer exists)',
-    'invalid (?:recipient|mailbox|address)',
-    'no mailbox',
-    'user (?:is )?(?:disabled|terminated|suspended)',
-  ].join('|'),
-  'i',
-);
-
-/**
- * The reply is about the sender -- which is to say, about us.
- *
- * Checked before any wording can promote a policy status to a hard bounce.
- * Postfix words a *sender* rejection exactly like a recipient one and quotes
- * the address: "<no-reply@ourshop.example.com>: Sender address rejected: This
- * account has been disabled". So "an address appears in the reply" is not
- * evidence about a recipient, and reading it as such suppressed every address
- * in the queue permanently, on the first attempt, because our own sending
- * account was refused. SPF, DKIM and DMARC failures are the same shape: about
- * our domain, sent identically to everybody.
- */
-const ABOUT_THE_SENDER =
-  /sender (?:address |verify )?(?:rejected|failed|denied|not allowed)|\bfrom address\b|\bspf\b|\bdkim\b|\bdmarc\b|sending (?:domain|account|ip)|your (?:account|domain|message)|does ?n.?t have a valid/i;
-
-/**
- * Wording that says an *account* is gone rather than a mailbox.
- *
- * Only promotes when the reply also names an address, because "this account
- * has been disabled" is equally how a relay refuses the account we
- * authenticate with. AOL and Yahoo both answer a dead mailbox this way and
- * quote the recipient while doing it.
- *
- * Deliberately excludes the domain-level wordings. Exim's "unrouteable
- * address" is a routing failure, often a DNS or MX blip, and it arrives
- * identically for every recipient at that domain -- the same reason
- * RECIPIENT_GONE was split out in the first place. It still reads as hard
- * where there is no enhanced status to disagree with it.
- */
-const ACCOUNT_GONE =
-  /account has been (?:disabled|discontinued|deactivated|closed)|does ?n.?t have an? [\w.-]{0,40} ?account/i;
-
-/**
- * Postfix's wrapper, which says nothing on its own.
- *
- * Postfix words *every* rejection as "<addr>: Recipient address rejected:
- * <reason>" -- an RBL hit, a content refusal and a genuinely unknown mailbox
- * all carry it. Treating it as evidence about the mailbox is what made a
- * Spamhaus listing suppress a whole batch; treating a reply that contains only
- * it as evidence of nothing is what lets the reason decide instead.
- */
-const GENERIC_REJECT = /recipient (?:address )?rejected|address rejected/i;
-
-/**
- * Wording that means "this address will never work".
- *
- * Only consulted where the enhanced status did not decide. Deliberately
- * conservative: a false hard bounce silently stops mailing a real customer
- * forever, which is far worse than retrying a dead address four more times.
- *
- * Every alternative is a plain literal run. An earlier version paired a code
- * with its reason across ".*" -- "\b550\b.*no such user" -- which made the
- * match quadratic in the length of the reply, and the reply comes from a
- * remote MTA: 64 KB of "550 " took 1.5 seconds of blocked event loop and
- * 256 KB took 24. Splitting the code out of the wording is what makes it
- * linear, and the code is parsed now anyway.
- */
-const HARD_BOUNCE = new RegExp(`${MAILBOX_GONE.source}|${GENERIC_REJECT.source}`, 'i');
-
-/**
- * The reply with quoted addresses taken out, and bounded.
- *
- * Every rule reads this rather than the raw text, and that uniformity is
- * itself a fix: the previous version stripped addresses for some patterns and
- * not others, so "\b535\b" matched <535@163.com> and called a dead mailbox a
- * transport fault -- which never suppresses *and* refunds the attempt, so that
- * address was retried every sixty seconds forever. The same split truncated
- * the stripped copy at 2 KB while leaving the raw fallbacks unbounded, so a
- * reply whose operative line sat past the cap was classified by one rule on
- * the head and another on the tail, and came out inverted.
- *
- * The cap is generous rather than tight because nothing below is worse than
- * linear any more. An SMTP reply line is 512 octets by RFC 5321, and a
- * multi-line reply that needs more than 8 KB to say which mailbox is missing
- * is not telling the truth.
+ * `named` is the difference, not a separate pattern. Testing the raw reply
+ * with `<[^<>\s]*@[^<>\s]*>` put a fresh quadratic into the one function
+ * whose entire history is about not having one: two unbounded stars around an
+ * `@` with a closing bracket that never arrives, measured at 4 seconds on
+ * 64 KB of `<a@a@a@...` -- 4,700 times a well-formed reply, and the remote MTA
+ * chooses the text. Comparing before and after costs a string compare and
+ * reuses patterns that are already linear.
  */
 function readReply(message: string): { said: string; named: boolean } {
   const bounded = message.slice(0, 65_536);
-  // Addresses first, brackets second. Reversed, `<them@aol.com>` was eaten as
-  // a bracket blob before anything could notice it was an address -- and
-  // whether the reply names a mailbox is the whole basis of the 5.7.x rule
-  // below.
-  //
-  // `named` is the difference, not a separate pattern. Testing the raw reply
-  // with `<[^<>\s]*@[^<>\s]*>` put a fresh quadratic back into the one
-  // function whose entire history is about not having one: two unbounded stars
-  // around an `@` with a closing bracket that never arrives, measured at 4
-  // seconds on 64 KB of `<a@a@a@...` -- 4,700 times a well-formed reply, and
-  // the remote MTA chooses the text. Comparing before and after costs a string
-  // compare and reuses the patterns that are already linear.
   const deAddressed = bounded.replace(EMAIL_SHAPED, ' ');
   return { said: deAddressed.replace(/<[^<>\s]*>/g, ' '), named: deAddressed !== bounded };
 }
 
 /**
- * Address-shaped, not merely "has an @ in it". The looser `\S+@\S+` retried
- * from every start position on a long run of non-space, which was seven
- * seconds of blocked event loop on 64 KB, and ate whole JSON-stringified
- * nodemailer errors along with their error codes. The lookbehind is what keeps
- * it linear rather than sixty-four times the length: a local part can only
- * start after a character that cannot be part of one, so on a run of ordinary
- * letters every position but the first fails in constant time. The {1,64} is
- * RFC 5321's limit on a local part.
+ * Address-shaped, not merely "has an @ in it".
+ *
+ * The looser `\S+@\S+` retried from every start position on a long run of
+ * non-space, which was seven seconds of blocked event loop on 64 KB, and ate
+ * whole JSON-stringified nodemailer errors along with their error codes. The
+ * lookbehind is what keeps it linear rather than sixty-four times the length:
+ * a local part can only start after a character that cannot be part of one, so
+ * on a run of ordinary letters every position but the first fails in constant
+ * time. The {1,64} is RFC 5321's limit on a local part.
  */
 const EMAIL_SHAPED =
   /(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/g;
 
 /**
- * Is this failure evidence about the recipient's mailbox at all?
- *
- * Separate from the classification because they answer different questions.
- * `classifyFailure` decides what to do with *this* attempt; this decides
- * whether the attempt may be counted toward giving up on the address after the
- * budget runs out, which is a thirty-day suppression and therefore a much
- * higher bar.
- *
- * Only an unexplained failure clears it. A deferral says "not now", a
- * reputation block is about our domain, a mail-system status is about the
- * receiving server -- none of them is a statement about a mailbox, so none of
- * them may be stacked up into one. This matters most for the failures that hit
- * every recipient of a broadcast identically: without it, an afternoon of
- * throttling or one bad sending reputation takes the entire audience off the
- * list at the same moment.
+ * What this failure is about. Exported so the tests can pin step one and step
+ * two separately, which is the whole reason they are separate.
  */
-export function saysSomethingAboutTheMailbox(message: string): boolean {
-  const { said, named } = readReply(message);
-  const reply = parseReply(said);
-  if (reply.severity === 4) return false;
-  // The subjects that are about something other than the recipient's mailbox:
-  // 3 is the receiving mail system, 5 is the protocol, 6 is this message's
-  // content and 7 is security and policy -- which is where every reputation
-  // block lands.
-  //
-  // Checking only the *wording* was not enough and left the gate doing almost
-  // nothing. Exchange Online's standard IP-reputation refusal is
-  // "550 5.7.606 Access denied, banned sending IP [...]", which contains none
-  // of spam, abuse, blocked, blacklist, reputation or policy -- so it counted,
-  // and six attempts took every Outlook recipient in a broadcast off the list
-  // together for thirty days. Measured: 5 of 5 suppressed, expires_at +30
-  // days, subscriptions.status 'bounced'. That is the disaster this predicate
-  // exists to prevent, arriving through the predicate.
-  if (reply.subject !== null && [3, 5, 6, 7].includes(reply.subject)) return false;
-  if (CONTENT_BLOCK.test(said) || DEFERRAL.test(said)) return false;
-  return true;
-}
-
-export function classifyFailure(message: string): FailureKind {
+export function subjectOf(message: string): FailureSubject {
   const { said, named } = readReply(message);
   const reply = parseReply(said);
 
-  // Nothing about a mailbox can be read out of a connection that failed, or
-  // out of a relay that refused our password.
-  if (TRANSPORT_ERRNO.test(said) || TRANSPORT_WORDS.test(said)) return 'transport';
-  // Wording only. A bare 530/535/538 used to count too, and REPLY_CODE's
-  // "after a colon and a space" position matches the way a bounce quotes
-  // anything: "550 5.1.1 User unknown; original message size: 535 KB" came
-  // back as an authentication failure, which is transport -- never suppressed
-  // and the attempt refunded, so a dead mailbox was retried for three days.
-  // Every real refusal carries wording, and one that somehow does not lands on
-  // 5.7.x, which never suppresses anyway.
-  // The wording, or an authentication code the reply *opens* with.
-  //
-  // Position is what makes the code usable again. A bare 530/535/538 anywhere
-  // in the text matched "original message size: 535 KB accepted" and called a
-  // dead mailbox a transport fault; the first code in a reply is the reply's
-  // own, and "535 Authentication Credentials Invalid" needs no wording to be
-  // recognised.
-  if (AUTH_FAILURE.test(said)) return 'transport';
-  if (reply.first !== null && AUTH_CODES.has(reply.first)) return 'transport';
+  // A reply that never reached a mailbox, or that refused us, outranks
+  // everything -- including the enhanced status, because providers put both
+  // those refusals and a genuinely dead Yandex mailbox on 5.7.x.
+  const overriding = matchWording(OVERRIDING_WORDING, said, named);
+  if (overriding) return overriding;
+
+  // An authentication code the reply *opens* with needs no wording. Position
+  // is what makes the code usable: a bare 535 anywhere in the text matched
+  // "original message size: 535 KB accepted" and called a dead mailbox a
+  // transport fault.
+  if (reply.first !== null && AUTH_CODES.has(reply.first)) return 'credentials';
 
   // 421 is "service not available, closing transmission channel" -- the one
   // reply code about the connection rather than about anything in the
-  // envelope, so it outranks the subject digit riding along with it. An
-  // overloaded relay says "421 4.7.0", and reading that as a policy decision
-  // about the recipient is how a throttled hour turned into suppressions.
-  //
-  // Only when 421 is the worst thing in the reply. parseReply deliberately
-  // takes the most severe code anywhere in the chain, and an unconditional
-  // short-circuit threw that away: "Earlier attempt: 421 4.7.0 too busy" above
-  // a final "550 5.1.1 User unknown" read as transport, so a dead mailbox was
-  // retried every sixty seconds and never suppressed.
-  if (reply.severity === 4 && reply.closing) return 'transport';
+  // envelope. Only when it is the worst thing in the reply: "Earlier attempt:
+  // 421 4.7.0 too busy" above a final "550 5.1.1 User unknown" is a dead
+  // mailbox recounting its history.
+  if (reply.severity === 4 && reply.closing) return 'connection';
 
-  // The enhanced status, where the registry and real deployments agree on what
-  // the subject means. Subjects 4 (routing) and 5 (protocol) are deliberately
-  // absent: Exchange Online answers an unknown recipient with 5.4.1, so the
-  // registry meaning and the deployed meaning disagree and the wording below
-  // is the better witness.
-  if (reply.subject !== null) {
-    switch (reply.subject) {
-      case 1: // Addressing status -- the destination address itself.
-        if (reply.severity === 5 && [1, 2, 3, 6, 10].includes(reply.detail!)) return 'hard';
-        // 5.1.7 and 5.1.8 are the *sender's* address: about us, not them.
-        return 'soft';
-      case 2: // Mailbox status.
-        if (reply.severity === 5 && reply.detail === 1) return 'hard'; // disabled, not accepting
-        return 'soft'; // 4.2.2 / 5.2.2 full, 5.2.3 too large -- all retryable
-      case 3: // Mail system status: the receiving system, never the mailbox.
-        return reply.severity === 4 ? 'transport' : 'soft';
-      case 6: // Message content or media.
-      case 7: // Security or policy -- every reputation block lands here.
-        // Unconditional `soft` was wrong for the servers that answer an
-        // unknown recipient with a policy status: Yandex's standard reply is
-        // "550 5.7.1 No such user!", which came back soft, so the address was
-        // never permanently suppressed and bounced on every broadcast forever.
-        //
-        // Only the unambiguous wording counts here. Postfix's "Recipient
-        // address rejected" wraps blocks and dead mailboxes alike, so it is
-        // deliberately not enough -- that wrapper is what made a Spamhaus
-        // listing suppress a whole batch.
-        //
-        // Two guards, both load-bearing. Without the severity check this arm
-        // returned before the transient fall-through could reach it, so
-        // "450 4.7.1 Recipient address rejected: mailbox unavailable, try
-        // again later" -- a deferral -- came back `hard`, and `hard`
-        // suppresses on the first attempt, permanently, without consulting
-        // `saysSomethingAboutTheMailbox` at all. Every other subject arm
-        // checks severity; these two did not.
-        //
-        // And the wording has to name a *recipient*. "This account has been
-        // disabled" is how a relay refuses our own sending account, which hits
-        // every recipient of a broadcast identically -- the exact batch
-        // disaster the gate exists to prevent, arriving through the one verdict
-        // that never reaches the gate.
-        //
-        // Wording that names a recipient on its own, or the broader set when
-        // the reply quotes the mailbox it is about. A block quotes the
-        // recipient too, which is why the wording still has to say the mailbox
-        // is gone -- "Access denied" beside an address is not evidence, and
-        // "Recipient address rejected" is Postfix's wrapper for everything.
-        if (reply.severity !== 5) return 'soft';
-        // A reply about our own sending is never evidence about a recipient,
-        // however it is worded and whoever it quotes.
-        if (ABOUT_THE_SENDER.test(said)) return 'soft';
-        if (RECIPIENT_GONE.test(said)) return 'hard';
-        return named && ACCOUNT_GONE.test(said) ? 'hard' : 'soft';
-      default:
-        break; // 4, 5 and anything unregistered fall through to the wording.
-    }
-  }
+  // The status, where it settles the question outright.
+  const entry = reply.subject === null ? null : statusEntry(reply.subject, reply.detail ?? 0);
+  if (entry && 'decide' in entry) return entry.decide;
 
-  // No enhanced status, or one whose subject does not settle it. Quota first,
-  // because a full mailbox quotes the hard-bounce wording verbatim; then the
-  // blocks, because Postfix words a reputation rejection with it too; only
-  // then the mailbox wording itself.
-  if (OVER_QUOTA.test(said)) return 'soft';
-  if (CONTENT_BLOCK.test(said)) return 'soft';
+  // Otherwise the wording, and then whatever the status leans toward. A 5.7.x
+  // with no recognisable wording is a policy refusal about us -- which is what
+  // it almost always is -- rather than an unexplained failure that the attempt
+  // budget would eventually suppress somebody for.
+  return matchWording(FALLBACK_WORDING, said, named) ?? entry?.fallback ?? 'unknown';
+}
 
-  // A permanent refusal outranks a transient code it merely quotes, and a
-  // transient one is never evidence that an address is dead.
-  if (reply.severity === 4) return 'soft';
-  return HARD_BOUNCE.test(said) ? 'hard' : 'soft';
+/**
+ * The severity the reply carries: 4 transient, 5 permanent, null if it said
+ * neither. Exported so the policy in docs/DELIVERABILITY.md can be asserted as
+ * a policy -- "a transient reply never counts" -- rather than one reply at a
+ * time.
+ */
+export function severityOf(message: string): 4 | 5 | null {
+  return parseReply(readReply(message).said).severity;
+}
+
+export function classifyFailure(message: string): FailureKind {
+  return verdictFor(subjectOf(message), severityOf(message)).kind;
+}
+
+/**
+ * Is this failure evidence about the recipient's mailbox at all?
+ *
+ * Derived from the same verdict as the classification, not decided separately.
+ * A standalone predicate was added in round seven and had drifted from the
+ * classifier by round ten: it excluded reputation blocks by *wording*, so
+ * Exchange Online's "550 5.7.606 Access denied, banned sending IP" -- which
+ * contains none of the words it looked for -- counted, and six attempts took
+ * every Outlook recipient in a broadcast off the list together for thirty
+ * days. One source of truth cannot drift from itself.
+ */
+export function saysSomethingAboutTheMailbox(message: string): boolean {
+  return verdictFor(subjectOf(message), severityOf(message)).counts;
 }
 
 export function normaliseEmail(email: string): string {
