@@ -870,6 +870,57 @@ class TBAY_Rewards_UI {
 	// REST endpoints
 	// ─────────────────────────────────────────────────────────────────────────
 
+	/**
+	 * Per-member budgets for the platform calls these routes make.
+	 *
+	 * Every one of these spends a call from the tenant's single secret-key
+	 * rate-limit bucket. Without a budget here, one registered user with a
+	 * `fetch` loop could empty that bucket in seconds and every secret-key call
+	 * the site makes would start failing — including the order sync, which only
+	 * retries on a later status change. Orders that stay in "processing" would
+	 * silently never award points or writer commissions.
+	 *
+	 * Deliberately generous: a member clicking around a rewards page will not
+	 * notice these, and anything that does notice them is a loop.
+	 */
+	private const RATE_LIMITS = array(
+		'default'        => 60,
+		// Guessing a reward code is the one thing worth guessing.
+		'coupon'         => 10,
+		'transfer'       => 10,
+		'redeem'         => 10,
+		'credit'         => 10,
+		'bridge/submit'  => 10,
+		'wallet'         => 20,
+	);
+
+	private const RATE_WINDOW = 60;
+
+	/**
+	 * Has this member used up their budget for this route?
+	 *
+	 * A transient counter per member per route. Not exact under concurrency —
+	 * two requests can read the same value — but the shape that matters is
+	 * "hundreds a second becomes tens a minute", and a fixed window does that.
+	 */
+	private function over_rate_limit( string $route ): bool {
+		$user_id = get_current_user_id();
+		if ( ! $user_id ) {
+			return true;
+		}
+
+		$allowed = self::RATE_LIMITS[ $route ] ?? self::RATE_LIMITS['default'];
+		$key     = 'tbay_rl_' . $user_id . '_' . md5( $route );
+		$used    = (int) get_transient( $key );
+
+		if ( $used >= $allowed ) {
+			return true;
+		}
+
+		set_transient( $key, $used + 1, self::RATE_WINDOW );
+		return false;
+	}
+
 	public function register_routes(): void {
 		$logged_in = static fn(): bool => is_user_logged_in();
 
@@ -893,12 +944,24 @@ class TBAY_Rewards_UI {
 		);
 
 		foreach ( $routes as $path => $spec ) {
+			$handler = $spec[1];
 			register_rest_route(
 				'tbay/v1',
 				'/' . $path,
 				array(
 					'methods'             => 'GET' === $spec[0] ? WP_REST_Server::READABLE : WP_REST_Server::CREATABLE,
-					'callback'            => array( $this, $spec[1] ),
+					'callback'            => function ( WP_REST_Request $request ) use ( $handler, $path ) {
+						if ( $this->over_rate_limit( $path ) ) {
+							return new WP_REST_Response(
+								array(
+									'error'   => 'rate_limited',
+									'message' => __( 'Too many requests. Please wait a moment.', 'tbay-rewards' ),
+								),
+								429
+							);
+						}
+						return $this->{$handler}( $request );
+					},
 					'permission_callback' => $logged_in,
 				)
 			);
@@ -955,15 +1018,45 @@ class TBAY_Rewards_UI {
 			: new WP_REST_Response( $result, 200 );
 	}
 
+	/**
+	 * A URL on this site, or nothing.
+	 *
+	 * Sharing mints a platform link and a `/r/<code>` redirect that sends
+	 * whoever clicks it wherever the link points. Taking the destination from
+	 * the request let any logged-in user — a subscriber, the lowest role
+	 * WordPress has — turn the rewards domain into a redirector to anywhere,
+	 * and be paid points for the clicks. The share buttons only ever share the
+	 * page they are on, so the host is a fact about this site, not a parameter.
+	 */
+	private function own_url( string $candidate ): ?string {
+		$url = esc_url_raw( trim( $candidate ) );
+		if ( '' === $url ) {
+			return null;
+		}
+
+		$host = wp_parse_url( $url, PHP_URL_HOST );
+		$home = wp_parse_url( home_url(), PHP_URL_HOST );
+		if ( ! is_string( $host ) || ! is_string( $home ) ) {
+			return null;
+		}
+
+		$scheme = wp_parse_url( $url, PHP_URL_SCHEME );
+		if ( ! in_array( $scheme, array( 'http', 'https' ), true ) ) {
+			return null;
+		}
+
+		return strtolower( $host ) === strtolower( $home ) ? $url : null;
+	}
+
 	public function handle_share( WP_REST_Request $request ): WP_REST_Response {
 		$contact_id = $this->require_contact();
 		if ( null === $contact_id ) {
 			return $this->error( __( 'Your rewards account is not ready yet.', 'tbay-rewards' ) );
 		}
 
-		$url = esc_url_raw( (string) $request->get_param( 'url' ) );
-		if ( '' === $url ) {
-			return $this->error( __( 'Nothing to share.', 'tbay-rewards' ) );
+		$url = $this->own_url( (string) $request->get_param( 'url' ) );
+		if ( null === $url ) {
+			return $this->error( __( 'You can only share pages from this store.', 'tbay-rewards' ) );
 		}
 
 		$result = $this->api->post(
@@ -1129,6 +1222,15 @@ class TBAY_Rewards_UI {
 		return new WP_REST_Response( $result, 200 );
 	}
 
+	/**
+	 * Record that a signed claim was spent on chain.
+	 *
+	 * The contact has to go with it. The platform scopes the update to the
+	 * voucher's owner — without it the call 404s, the claim stays `signed`, and
+	 * it later expires. With refunds on expiry configured, that refunds the
+	 * points for tokens the member already holds: the same value paid twice,
+	 * caused by a missing parameter rather than by anything an attacker did.
+	 */
 	public function handle_claim_tx( WP_REST_Request $request ): WP_REST_Response {
 		$claim_id = sanitize_text_field( (string) $request->get_param( 'claimId' ) );
 		$tx_hash  = sanitize_text_field( (string) $request->get_param( 'txHash' ) );
@@ -1137,9 +1239,14 @@ class TBAY_Rewards_UI {
 			return $this->error( __( 'Invalid transaction reference.', 'tbay-rewards' ) );
 		}
 
+		$contact_id = $this->require_contact();
+		if ( null === $contact_id ) {
+			return $this->error( __( 'Your rewards account is not ready yet.', 'tbay-rewards' ) );
+		}
+
 		$result = $this->api->post(
 			'/v1/token/claims/' . rawurlencode( $claim_id ) . '/tx',
-			array( 'txHash' => $tx_hash )
+			array( 'txHash' => $tx_hash, 'contactId' => $contact_id )
 		);
 
 		return is_wp_error( $result )

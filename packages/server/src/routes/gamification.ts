@@ -1,3 +1,4 @@
+import { uuidOf } from '../lib/paging.js';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { db } from '../db/pool.js';
@@ -335,9 +336,14 @@ export async function gamificationRoutes(app: FastifyInstance): Promise<void> {
 
   app.get<{ Params: { id: string } }>('/v1/bridge/withdrawals/:id', async (request) => {
     const tenant = tenantOf(request);
-    const withdrawal = await getWithdrawal(request.params.id);
-    // Scope the lookup: a withdrawal id must not leak another retailer's data.
-    if (!withdrawal || (withdrawal.tenant_id && withdrawal.tenant_id !== tenant.id)) {
+    const id = uuidOf(request.params.id, 'id')!;
+    const withdrawal = await getWithdrawal(id);
+    // Equality, not "set and different". A withdrawal submitted anonymously
+    // has a null tenant, and `w.tenant_id && …` short-circuited false for it —
+    // so every anonymous row was readable by any retailer holding its id. An
+    // anonymous withdrawal belongs to no retailer, so it is nobody's to read
+    // here; the bridge operator has its own credential and its own listing.
+    if (!withdrawal || withdrawal.tenant_id !== tenant.id) {
       throw ApiError.notFound('Withdrawal not found');
     }
     return { withdrawal };
@@ -353,7 +359,7 @@ export async function gamificationRoutes(app: FastifyInstance): Promise<void> {
   app.post<{ Params: { id: string } }>('/v1/bridge/withdrawals/:id/release', async (request) => {
     requireBridgeOperator(request.headers['x-tbay-operator'] as string | undefined);
     const input = parse(z.object({ l1TxHash: z.string().length(66) }), request.body);
-    const released = await markReleased(request.params.id, input.l1TxHash);
+    const released = await markReleased(uuidOf(request.params.id, 'id')!, input.l1TxHash);
     if (!released) throw ApiError.conflict('That withdrawal is not awaiting release');
     return { withdrawal: released };
   });
@@ -361,7 +367,7 @@ export async function gamificationRoutes(app: FastifyInstance): Promise<void> {
   app.post<{ Params: { id: string } }>('/v1/bridge/withdrawals/:id/reject', async (request) => {
     requireBridgeOperator(request.headers['x-tbay-operator'] as string | undefined);
     const input = parse(z.object({ reason: z.string().max(500) }), request.body);
-    const rejected = await rejectWithdrawal(request.params.id, input.reason);
+    const rejected = await rejectWithdrawal(uuidOf(request.params.id, 'id')!, input.reason);
     if (!rejected) throw ApiError.conflict('That withdrawal cannot be rejected');
     return { withdrawal: rejected };
   });

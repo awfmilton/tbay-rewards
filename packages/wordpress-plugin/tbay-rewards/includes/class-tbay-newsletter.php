@@ -226,32 +226,50 @@ class TBAY_Rewards_Newsletter {
 			return new WP_REST_Response( array( 'message' => $result->get_error_message() ), 400 );
 		}
 
-		return new WP_REST_Response( $result, 200 );
+		// The same answer whether or not that address was already on the list.
+		// `already_subscribed` told anybody who asked which of a list of
+		// addresses belonged to a customer of this store — a membership oracle
+		// on an endpoint that is public by design.
+		return new WP_REST_Response( array( 'status' => 'pending' ), 200 );
 	}
 
 	/** No-JavaScript fallback: posts to admin-post.php and redirects back. */
 	public function handle_form_post(): void {
 		check_admin_referer( 'tbay_subscribe', 'tbay_nonce' );
 
-		$redirect = isset( $_POST['redirect_to'] )
-			? esc_url_raw( wp_unslash( $_POST['redirect_to'] ) )
+		// `is_string` first: `redirect_to[]=x` makes this an array, and
+		// `esc_url_raw` on one is a TypeError in PHP 8 — a 500 on a public
+		// form for anybody who mistypes, or probes.
+		$posted_redirect = $_POST['redirect_to'] ?? null; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput
+		$redirect        = is_string( $posted_redirect )
+			? esc_url_raw( wp_unslash( $posted_redirect ) )
 			: home_url( '/' );
+		if ( '' === $redirect ) {
+			$redirect = home_url( '/' );
+		}
 
 		if ( ! empty( $_POST['website'] ) || ! $this->rate_limit_ok() ) {
 			wp_safe_redirect( add_query_arg( 'tbay_subscribed', 'pending', $redirect ) );
 			exit;
 		}
 
+		// Same reason: `sanitize_email` on an array is a TypeError, while
+		// `sanitize_text_field` and `sanitize_key` return '' for one.
+		$posted_email = $_POST['email'] ?? ''; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput
+
 		$result = $this->subscribe(
-			isset( $_POST['email'] ) ? sanitize_email( wp_unslash( $_POST['email'] ) ) : '',
+			is_string( $posted_email ) ? sanitize_email( wp_unslash( $posted_email ) ) : '',
 			isset( $_POST['name'] ) ? sanitize_text_field( wp_unslash( $_POST['name'] ) ) : '',
 			isset( $_POST['list'] ) ? sanitize_key( wp_unslash( $_POST['list'] ) ) : 'newsletter',
 			isset( $_POST['source'] ) ? sanitize_text_field( wp_unslash( $_POST['source'] ) ) : 'form',
 			isset( $_COOKIE['tbay_visitor'] ) ? sanitize_text_field( wp_unslash( $_COOKIE['tbay_visitor'] ) ) : ''
 		);
 
-		$status = is_wp_error( $result ) ? 'error' : ( $result['status'] ?? 'pending' );
-		wp_safe_redirect( add_query_arg( 'tbay_subscribed', rawurlencode( (string) $status ), $redirect ) );
+		// Uniform for the same reason as the REST path above: the redirect
+		// target is a URL anybody can read over the user's shoulder, and
+		// `already_subscribed` in it answers a question they did not ask.
+		$status = is_wp_error( $result ) ? 'error' : 'pending';
+		wp_safe_redirect( add_query_arg( 'tbay_subscribed', rawurlencode( $status ), $redirect ) );
 		exit;
 	}
 
@@ -311,11 +329,46 @@ class TBAY_Rewards_Newsletter {
 		return $decoded;
 	}
 
-	/** Five signup attempts per IP per ten minutes. */
+	/**
+	 * Five signup attempts per visitor per ten minutes.
+	 *
+	 * `REMOTE_ADDR` alone is the proxy's address behind Cloudflare or a load
+	 * balancer, so every visitor shared one bucket and the sixth genuine
+	 * signup of any ten minutes was refused. A forwarded-for header is not
+	 * trustworthy on its own — anyone can send one — so it narrows the bucket
+	 * rather than replacing it: the pair means a spoofed header only divides
+	 * the sender's own allowance, while real visitors behind one proxy get
+	 * their own.
+	 *
+	 * The filter is there because only the site owner knows what sits in
+	 * front of them.
+	 */
 	private function rate_limit_ok(): bool {
-		$ip  = isset( $_SERVER['REMOTE_ADDR'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REMOTE_ADDR'] ) ) : '';
-		$key = 'tbay_sub_' . md5( $ip );
+		$remote    = isset( $_SERVER['REMOTE_ADDR'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REMOTE_ADDR'] ) ) : '';
+		$forwarded = '';
+		foreach ( array( 'HTTP_CF_CONNECTING_IP', 'HTTP_X_REAL_IP', 'HTTP_X_FORWARDED_FOR' ) as $header ) {
+			if ( ! empty( $_SERVER[ $header ] ) ) {
+				$value     = sanitize_text_field( wp_unslash( $_SERVER[ $header ] ) );
+				$forwarded = trim( explode( ',', $value )[0] );
+				break;
+			}
+		}
 
+		/**
+		 * Filter the identity the signup throttle counts against.
+		 *
+		 * @param string $identity  Remote address, narrowed by a forwarded header.
+		 * @param string $remote    REMOTE_ADDR as the server reported it.
+		 * @param string $forwarded The first forwarded address, if any.
+		 */
+		$identity = (string) apply_filters(
+			'tbay_rewards_signup_throttle_identity',
+			$remote . '|' . $forwarded,
+			$remote,
+			$forwarded
+		);
+
+		$key      = 'tbay_sub_' . md5( $identity );
 		$attempts = (int) get_transient( $key );
 		if ( $attempts >= 5 ) {
 			return false;

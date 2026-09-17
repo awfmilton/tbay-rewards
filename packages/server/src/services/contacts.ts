@@ -136,6 +136,26 @@ export interface UpsertOptions {
    * a customer legitimately changing their email address still works.
    */
   allowIdentityChange?: boolean;
+
+  /**
+   * Fill in what is missing; never overwrite what is there.
+   *
+   * For the public site key, which is embedded in every page and therefore
+   * held by anyone who can view source. Without this, knowing a customer's
+   * email address was enough to rewrite their name, phone, locale and country
+   * on the retailer's own records, and — worse — to add tags and attributes to
+   * them. Tags drive segments, segments drive broadcasts and the visibility of
+   * conditional email blocks, so tag injection is a way to put yourself, or
+   * somebody else, into a campaign.
+   *
+   * A first login filling in a name the store does not have yet is the case
+   * this path exists for, and it still works. Overwriting a name the store
+   * already has is not something a page script should be able to do.
+   *
+   * Tags and attributes are ignored entirely on an existing contact rather than
+   * merged: "add-only" still lets anything be added.
+   */
+  fillOnly?: boolean;
 }
 
 export async function upsertContact(
@@ -207,21 +227,30 @@ export async function upsertContact(
     if (existing) {
       const updated = await queryOne<Contact>(
         client,
+        // $15 is `fillOnly`: the caller may fill a blank but not change a
+        // value. See UpsertOptions for why the public site key gets that and
+        // nothing more.
         `UPDATE contacts SET
             email             = COALESCE($2, email),
             email_normalised  = COALESCE($3, email_normalised),
-            name              = COALESCE($4, name),
-            phone             = COALESCE($5, phone),
+            name              = CASE WHEN $15 THEN COALESCE(name, $4)
+                                     ELSE COALESCE($4, name) END,
+            phone             = CASE WHEN $15 THEN COALESCE(phone, $5)
+                                     ELSE COALESCE($5, phone) END,
             external_ref      = COALESCE($6, external_ref),
-            locale            = COALESCE($7, locale),
-            country           = COALESCE($8, country),
-            wallet_address    = COALESCE($9, wallet_address),
+            locale            = CASE WHEN $15 THEN COALESCE(locale, $7)
+                                     ELSE COALESCE($7, locale) END,
+            country           = CASE WHEN $15 THEN COALESCE(country, $8)
+                                     ELSE COALESCE($8, country) END,
+            wallet_address    = CASE WHEN $15 THEN COALESCE(wallet_address, $9)
+                                     ELSE COALESCE($9, wallet_address) END,
             member_id         = COALESCE(member_id, $10),
-            attributes        = attributes || $11::jsonb,
-            tags              = (
+            attributes        = CASE WHEN $15 THEN attributes
+                                     ELSE attributes || $11::jsonb END,
+            tags              = CASE WHEN $15 THEN tags ELSE (
               SELECT COALESCE(array_agg(DISTINCT tag), '{}')
                 FROM unnest(tags || $12::text[]) AS tag
-            ),
+            ) END,
             marketing_consent = COALESCE($13, marketing_consent),
             consent_source    = COALESCE($14, consent_source),
             consent_at        = CASE WHEN $13 IS TRUE AND NOT marketing_consent
@@ -245,6 +274,7 @@ export async function upsertContact(
           input.tags ?? [],
           input.marketingConsent ?? null,
           input.consentSource ?? null,
+          options.fillOnly ?? false,
         ],
       );
       return updated!;

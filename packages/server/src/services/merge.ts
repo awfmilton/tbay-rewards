@@ -124,6 +124,21 @@ export async function mergeContacts(
       throw ApiError.unprocessable('An erased contact cannot be merged');
     }
 
+    // Both contacts' balance rows, exclusively, before anything reads one.
+    //
+    // The contact locks above are what award and spend now wait on (see
+    // `holdContact` in points.ts), so this is belt and braces for a row that
+    // exists — but it also means `mergeBalances` reads a balance nothing can
+    // change underneath it, rather than a snapshot it then adds to the
+    // survivor while a spend drains the original.
+    await client.query(
+      `SELECT 1 FROM points_balances
+        WHERE tenant_id = $1 AND contact_id = ANY($2::uuid[])
+        ORDER BY contact_id, point_type
+        FOR UPDATE`,
+      [tenantId, [first, second]],
+    );
+
     const moved: Record<string, number> = {};
     const bump = (key: string, n: number): void => {
       if (n > 0) moved[key] = (moved[key] ?? 0) + n;

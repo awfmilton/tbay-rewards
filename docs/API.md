@@ -653,6 +653,32 @@ Filters: `operatorId`, `target` (a contact), `action` (a **prefix**, so
 
 ---
 
+## Webhooks, settings and store credit (secret)
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/v1/webhooks` | Registered endpoints, without their signing secrets |
+| `POST` | `/v1/webhooks` | `{ url, secret, topics? }` — https only |
+| `DELETE` | `/v1/webhooks/:id` | Remove one |
+| `GET` | `/v1/settings` | The retailer's settings |
+| `PUT` | `/v1/settings` | Change them (owner only) |
+| `POST` | `/v1/token/credit/reserve` | The oldest usable store credit for a contact |
+| `POST` | `/v1/token/credit/redeem` | `{ code, orderRef, amountCents? }` |
+
+A store credit is a balance, not a token. `reserve` reports what is **left**
+(`remaining_cents`, and `amount_cents` for compatibility), not the face value,
+and `redeem` draws that balance down by `amountCents` — omitted means all of
+it. A $50 credit spent on a $10 basket leaves $40 on the account instead of
+destroying it.
+
+Redemption is idempotent per order: asking twice for the same `orderRef`
+returns what the first call took, with `already_redeemed: true`, and takes
+nothing more. A checkout retried after a timeout cannot tell "that did not go
+through" from "that went through and the reply was lost", so the platform
+decides.
+
+---
+
 ## Merging duplicates (secret)
 
 Somebody checks out as a guest with one address and signs up with another; an

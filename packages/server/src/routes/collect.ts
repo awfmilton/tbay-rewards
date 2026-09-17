@@ -84,6 +84,10 @@ export async function collectRoutes(app: FastifyInstance): Promise<void> {
           tags: input.tags ?? [],
         },
         client,
+        // The site key is in every page's source, so this call is effectively
+        // anonymous. It may introduce a contact and fill in blanks on one;
+        // it may not rewrite a customer the store already knows.
+        { fillOnly: true },
       );
 
       if (input.visitor) {
@@ -180,7 +184,10 @@ export async function collectRoutes(app: FastifyInstance): Promise<void> {
       ip: clientIp(request),
       visitorAnonId: input.visitor ?? null,
       attributes: input.attributes ?? {},
-    });
+    },
+    undefined,
+    // The site key, so: introduce a person, fill in blanks, change nothing.
+    { fillOnly: true });
 
     return {
       status: result.status,

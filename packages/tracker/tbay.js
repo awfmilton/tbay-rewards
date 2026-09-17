@@ -66,6 +66,11 @@
     try { window.localStorage.setItem(key, value); } catch (e) { /* quota or blocked */ }
   }
 
+  function removeStore(key) {
+    delete memory[key];
+    try { window.localStorage.removeItem(key); } catch (e) { /* blocked */ }
+  }
+
   function uuid() {
     if (window.crypto && window.crypto.randomUUID) return window.crypto.randomUUID();
     var bytes = new Uint8Array(16);
@@ -79,8 +84,20 @@
            hex.slice(16, 20) + '-' + hex.slice(20);
   }
 
-  var visitorId = readStore('tbay_visitor');
-  if (!visitorId) { visitorId = uuid(); writeStore('tbay_visitor', visitorId); }
+  // ── Consent, before anything is written ───────────────────────────────────
+  //
+  // The setting says "collect nothing until your consent banner calls
+  // tbay.consent(true)", and the identifiers used to be created and stored
+  // regardless — a 365-day cookie and a localStorage id for somebody who never
+  // agreed to either, which the storefront then read at checkout and sent
+  // server-side. Sending was gated; being identified was not.
+  //
+  // Reading the stored answer is not collection, so that happens first.
+  var consented = !settings.requireConsent || readStore('tbay_consent') === '1';
+
+  // Generated either way — a page still needs an id for the events it queues —
+  // but only written down once there is consent to remember it.
+  var visitorId = (consented && readStore('tbay_visitor')) || uuid();
 
   /**
    * Mirror the visitor id into a first-party cookie.
@@ -106,37 +123,53 @@
     } catch (e) { return null; }
   }
 
-  writeCookie('tbay_visitor', visitorId, 365);
-
   /**
-   * Persist the trackable-link code on the storefront's own origin.
+   * Write the identity down.
    *
-   * The /r/ redirect sets its signed cookie on the API origin, which the shop's
-   * server can never see. Capturing the code here, on the landing page, is what
-   * lets checkout attribute the order to the writer whose link brought it.
+   * Called once now — a no-op without consent — and again the moment consent
+   * is given, so a visitor who accepts the banner keeps the id the page has
+   * been using rather than starting a second one.
+   *
+   * The cookie exists because localStorage is invisible to the site's own
+   * server, and the storefront needs this id at checkout to attribute the
+   * order to the session that earned it. The link code is captured here, on
+   * the landing page, because the /r/ redirect's own cookie is on the API
+   * origin, which the shop's server can never see.
    */
-  (function persistLinkCode() {
+  function persistIdentity() {
+    if (!consented) return;
+    writeStore('tbay_visitor', visitorId);
+    writeCookie('tbay_visitor', visitorId, 365);
     var code = linkCodeFromUrl();
     if (code) writeCookie('tbay_ref', code, 30);
-  }());
+  }
+
+  /** Forget what was written, for somebody who withdraws consent. */
+  function forgetIdentity() {
+    removeStore('tbay_visitor');
+    removeStore('tbay_session');
+    removeStore('tbay_session_ts');
+    writeCookie('tbay_visitor', '', -1);
+    writeCookie('tbay_ref', '', -1);
+  }
+
+  persistIdentity();
 
   function currentSession() {
-    var id = readStore('tbay_session');
-    var last = parseInt(readStore('tbay_session_ts') || '0', 10);
+    var id = consented ? readStore('tbay_session') : null;
+    var last = parseInt((consented && readStore('tbay_session_ts')) || '0', 10);
     var now = Date.now();
     if (!id || !last || now - last > settings.sessionTimeoutMs) {
       id = uuid();
-      writeStore('tbay_session', id);
     }
-    writeStore('tbay_session_ts', String(now));
+    if (consented) {
+      writeStore('tbay_session', id);
+      writeStore('tbay_session_ts', String(now));
+    }
     return id;
   }
 
   var sessionId = currentSession();
-
-  // ── Consent ───────────────────────────────────────────────────────────────
-
-  var consented = !settings.requireConsent || readStore('tbay_consent') === '1';
 
   // ── Queue ─────────────────────────────────────────────────────────────────
 
@@ -160,14 +193,60 @@
       key: settings.key,
       visitor: visitorId,
       session: sessionId,
-      url: location.href,
-      referrer: document.referrer || null,
+      url: currentUrl(),
+      referrer: safeReferrer(),
       linkCode: linkCodeFromUrl(),
       events: queue.splice(0, queue.length)
     };
     if (heat.length > 0) body.heatmap = heat;
     if (pendingCart) { body.cart = pendingCart; pendingCart = null; }
     return body;
+  }
+
+  /**
+   * A page address safe to keep.
+   *
+   * `location.href` carries whatever the storefront put in the query string,
+   * and on WooCommerce that includes the order key on every
+   * `/checkout/order-received/` page — a token that opens a guest's order,
+   * with their name, address and items, to anyone who reads it back out of
+   * the analytics. Password-reset keys, preview nonces and `?email=` are the
+   * same shape.
+   *
+   * So the path is kept and the query is rebuilt from an allow-list: the
+   * campaign parameters analytics is actually for, and the referral code this
+   * tracker mints itself. Anything else a retailer needs can be sent
+   * explicitly as an event property, which is a decision rather than an
+   * accident.
+   */
+  var KEEP_PARAMS = [
+    'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
+    'gclid', 'fbclid', 'msclkid', 'ref', 'tb_ref', 'tbref'
+  ];
+
+  function safeUrl(raw) {
+    try {
+      var url = new URL(raw, location.href);
+      var kept = new URLSearchParams();
+      for (var i = 0; i < KEEP_PARAMS.length; i += 1) {
+        var value = url.searchParams.get(KEEP_PARAMS[i]);
+        if (value !== null) kept.set(KEEP_PARAMS[i], value);
+      }
+      var query = kept.toString();
+      // The fragment goes too: it never reaches a server anyway, and on some
+      // sites it is where the session token lives.
+      return url.origin + url.pathname + (query ? '?' + query : '');
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function currentUrl() {
+    return safeUrl(location.href) || location.origin + location.pathname;
+  }
+
+  function safeReferrer() {
+    return document.referrer ? safeUrl(document.referrer) : null;
   }
 
   function linkCodeFromUrl() {
@@ -221,7 +300,7 @@
   function push(event) {
     if (!consented) return;
     event.occurredAt = new Date().toISOString();
-    if (!event.url) event.url = location.href;
+    if (!event.url) event.url = currentUrl();
     queue.push(event);
     if (queue.length >= settings.maxQueue) flush(false);
     else scheduleFlush();
@@ -265,7 +344,7 @@
     var key = kind + '|' + location.pathname;
     if (!heatQueue[key]) {
       heatQueue[key] = {
-        page: location.href,
+        page: currentUrl(),
         kind: kind,
         samples: [],
         docHeight: docHeight(),
@@ -404,7 +483,7 @@
       name: meta.getAttribute('data-tbay-product-name'),
       priceCents: parseInt(meta.getAttribute('data-tbay-product-price') || '', 10) || null,
       imageUrl: meta.getAttribute('data-tbay-product-image'),
-      url: location.href
+      url: currentUrl()
     };
   }
 
@@ -513,11 +592,27 @@
     consent: function (granted) {
       consented = granted !== false;
       writeStore('tbay_consent', consented ? '1' : '0');
-      if (consented) { pageview(); scheduleFlush(); }
-      else { queue.length = 0; heatQueue = {}; pendingCart = null; }
+      if (consented) {
+        // Now, not before: this is the first moment anything may be written
+        // down, and the id the page has already been using is kept.
+        persistIdentity();
+        sessionId = currentSession();
+        pageview();
+        scheduleFlush();
+      } else {
+        queue.length = 0;
+        heatQueue = {};
+        pendingCart = null;
+        forgetIdentity();
+      }
     },
 
-    flush: function () { flushScrollDepth(); flush(false); }
+    flush: function () { flushScrollDepth(); flush(false); },
+
+    // What this page reports itself as, after the query string has been
+    // stripped back to the campaign parameters. Exposed so the URL rules can
+    // be tested — a storefront has no reason to call it.
+    __currentUrl: currentUrl
   };
 
   // Replay anything queued before the script finished loading:

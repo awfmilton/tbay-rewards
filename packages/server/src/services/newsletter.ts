@@ -86,6 +86,14 @@ export async function subscribe(
   tenant: Tenant,
   input: SubscribeInput,
   runner?: Queryable,
+  /**
+   * Called with the public site key, which is in every page's source.
+   *
+   * A subscribe form may introduce somebody and fill in what the store does
+   * not know; it may not rewrite the name or the attributes of a customer the
+   * store already has. See `UpsertOptions.fillOnly`.
+   */
+  options: { fillOnly?: boolean } = {},
 ): Promise<SubscribeResult> {
   const email = String(input.email ?? '').trim();
   if (!isValidEmail(email)) throw ApiError.badRequest('A valid email address is required');
@@ -103,6 +111,7 @@ export async function subscribe(
         consentSource: input.source ?? 'newsletter_form',
       },
       client,
+      { fillOnly: options.fillOnly ?? false },
     );
 
     if (input.visitorAnonId) {

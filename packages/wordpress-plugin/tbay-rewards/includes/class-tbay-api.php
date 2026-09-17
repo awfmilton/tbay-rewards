@@ -21,6 +21,10 @@ class TBAY_Rewards_API {
 
 	private const OPTION = 'tbay_rewards_settings';
 
+	/** Set for a minute after a failed call; see `note_failure`. */
+	private const FAILURE_KEY      = 'tbay_platform_down';
+	private const FAILURE_BACKOFF  = MINUTE_IN_SECONDS;
+
 	/** Short-lived cache so a page rendering three shortcodes makes one call. */
 	private array $request_cache = array();
 
@@ -157,12 +161,38 @@ class TBAY_Rewards_API {
 			return $cached;
 		}
 
-		$result = $this->get( $path, $query );
-		if ( ! is_wp_error( $result ) ) {
-			set_transient( $transient_key, $result, $ttl );
-			$this->request_cache[ $key ] = $result;
+		// A platform that just failed is a platform that is probably still
+		// failing. Without this, every page view tried again and waited out the
+		// whole timeout — a storefront that adds ten seconds to every
+		// uncached page, and twenty-five on cart and checkout, because
+		// something else is down.
+		if ( false !== get_transient( self::FAILURE_KEY ) ) {
+			return new WP_Error(
+				'tbay_unavailable',
+				__( 'The rewards platform is not responding. Trying again shortly.', 'tbay-rewards' )
+			);
 		}
+
+		$result = $this->get( $path, $query );
+		if ( is_wp_error( $result ) ) {
+			$this->note_failure();
+			return $result;
+		}
+
+		set_transient( $transient_key, $result, $ttl );
+		$this->request_cache[ $key ] = $result;
 		return $result;
+	}
+
+	/**
+	 * Stop calling out for a minute after a failure.
+	 *
+	 * Short on purpose: long enough that a restart or a blip does not cost
+	 * every visitor a timeout, short enough that the site recovers on its own
+	 * without anybody clearing a cache.
+	 */
+	private function note_failure(): void {
+		set_transient( self::FAILURE_KEY, 1, self::FAILURE_BACKOFF );
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────
@@ -247,6 +277,15 @@ class TBAY_Rewards_API {
 			return $cached;
 		}
 
+		// Called on every `wp_enqueue_scripts`, so a platform that is down must
+		// not cost each page view the full timeout.
+		if ( false !== get_transient( self::FAILURE_KEY ) ) {
+			return new WP_Error(
+				'tbay_unavailable',
+				__( 'The rewards platform is not responding. Trying again shortly.', 'tbay-rewards' )
+			);
+		}
+
 		$response = wp_remote_get(
 			$this->endpoint() . '/v1/config',
 			array(
@@ -255,12 +294,14 @@ class TBAY_Rewards_API {
 			)
 		);
 		if ( is_wp_error( $response ) ) {
+			$this->note_failure();
 			return $response;
 		}
 
 		$code    = (int) wp_remote_retrieve_response_code( $response );
 		$decoded = json_decode( (string) wp_remote_retrieve_body( $response ), true );
 		if ( $code < 200 || $code >= 300 || ! is_array( $decoded ) ) {
+			$this->note_failure();
 			return new WP_Error( 'tbay_config_error', __( 'Could not read the platform configuration.', 'tbay-rewards' ) );
 		}
 
@@ -273,6 +314,9 @@ class TBAY_Rewards_API {
 		global $wpdb;
 		$this->request_cache = array();
 		delete_transient( 'tbay_chain_config' );
+		// Something just changed, so an admin is watching. Try the platform
+		// again rather than making them wait out the back-off.
+		delete_transient( self::FAILURE_KEY );
 
 		// With a persistent object cache, transients never reach wp_options, so
 		// the DELETE below would be a no-op. Bumping a namespace version makes

@@ -104,6 +104,23 @@ class TBAY_Rewards_Tracker {
 					'clientId'  => (string) ( $chain['thirdweb']['clientId'] ?? '' ),
 					'chainSlug' => (string) ( $chain['thirdweb']['chainSlug'] ?? '' ),
 				),
+				/**
+				 * Subresource-integrity hash for the wallet library.
+				 *
+				 * Filterable because a site may serve it from its own origin —
+				 * the surest fix — or pin a different version. Empty means the
+				 * browser does not check, which is the old behaviour and the
+				 * reason this exists.
+				 */
+				'ethersIntegrity'  => (string) apply_filters(
+					'tbay_rewards_ethers_integrity',
+					'sha384-eoEZatO/ymJi+LdBilp3xt/M9N9Lla2JlMVPZuk48Fg1YGl2Mc+vmsky+nkOtlSi'
+				),
+				/** Exact thirdweb build; a floating major is whatever ships today. */
+				'thirdwebModuleUrl' => (string) apply_filters(
+					'tbay_rewards_thirdweb_module_url',
+					'https://esm.sh/thirdweb@5.105.0'
+				),
 				'i18n'        => array(
 					'shareCopied'   => __( 'Link copied — share it to earn points.', 'tbay-rewards' ),
 					'shareFailed'   => __( 'Could not create your share link. Please try again.', 'tbay-rewards' ),
@@ -145,6 +162,8 @@ class TBAY_Rewards_Tracker {
 					'shareCreating'  => __( 'Creating your link…', 'tbay-rewards' ),
 					'shareOpened'    => __( 'Shared. You earn points when someone opens your link.', 'tbay-rewards' ),
 					'txSent'         => __( 'Sent — waiting for the network to confirm.', 'tbay-rewards' ),
+					/* translators: %s: blockchain transaction hash */
+					'claimNotRecorded' => __( 'Your tokens were claimed, but we could not record it. Please quote %s to support.', 'tbay-rewards' ),
 					/* translators: %s: amount of TBAY. */
 					'claimPending'   => __( 'You have an unfinished claim for %s TBAY.', 'tbay-rewards' ),
 					'claimResume'    => __( 'Finish claiming', 'tbay-rewards' ),

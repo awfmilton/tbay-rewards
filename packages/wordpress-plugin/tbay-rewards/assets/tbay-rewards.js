@@ -195,7 +195,10 @@
 			}).then(function (data) {
 				form.reset();
 				setStatus(status,
-					data.status === 'already_subscribed' ? i18n.alreadyMember : i18n.subscribed, 'ok');
+					// One answer for everybody: the endpoint is public, and saying
+					// "you are already subscribed" answers a question about
+					// somebody else's address.
+					i18n.subscribed, 'ok');
 				if (window.tbay) window.tbay.track('newsletter_signup', { list: form.dataset.list });
 			})['catch'](function (error) {
 				setStatus(status, friendlyError(error), 'error');
@@ -291,12 +294,23 @@
 
 	var scriptCache = {};
 
-	function loadScript(src) {
+	/**
+	 * Load a third-party script, and refuse it if it is not the one expected.
+	 *
+	 * This code runs on the page that asks a wallet to sign claims and burns.
+	 * A CDN that served something else — compromised, or a version republished
+	 * under the same URL — would be arbitrary JavaScript next to somebody's
+	 * wallet. `integrity` makes the browser check the bytes and drop them if
+	 * they do not match, so the worst case becomes "the wallet library did not
+	 * load" rather than "the wallet library was someone else's".
+	 */
+	function loadScript(src, integrity) {
 		if (scriptCache[src]) return scriptCache[src];
 		scriptCache[src] = new Promise(function (resolve, reject) {
 			var script = document.createElement('script');
 			script.src = src;
 			script.crossOrigin = 'anonymous';
+			if (integrity) script.integrity = integrity;
 			script.onload = resolve;
 			script.onerror = function () { reject(new Error('Could not load the wallet library.')); };
 			document.head.appendChild(script);
@@ -304,10 +318,14 @@
 		return scriptCache[src];
 	}
 
+	// Pinned to an exact version with its published hash. Bump both together;
+	// a version without a hash is a version nobody is checking.
+	var ETHERS_URL = 'https://cdnjs.cloudflare.com/ajax/libs/ethers/6.7.1/ethers.umd.min.js';
+	var ETHERS_SRI = config.ethersIntegrity || '';
+
 	function loadEthers() {
 		if (window.ethers) return Promise.resolve(window.ethers);
-		return loadScript('https://cdnjs.cloudflare.com/ajax/libs/ethers/6.7.1/ethers.umd.min.js')
-			.then(function () { return window.ethers; });
+		return loadScript(ETHERS_URL, ETHERS_SRI).then(function () { return window.ethers; });
 	}
 
 	/**
@@ -329,7 +347,12 @@
 	function loadThirdweb() {
 		if (thirdwebModule) return Promise.resolve(thirdwebModule);
 		if (!dynamicImport) return Promise.reject(new Error(i18n.noWallet));
-		return dynamicImport('https://esm.sh/thirdweb@5').then(function (mod) {
+		// An exact version, not `@5`. A floating major resolves to whatever the
+		// CDN serves at load time — including a minor published an hour ago and
+		// its transitive dependencies — on the page that signs wallet
+		// transactions. An ESM import cannot carry an integrity hash, so
+		// pinning is the whole of the defence.
+		return dynamicImport(config.thirdwebModuleUrl || 'https://esm.sh/thirdweb@5.105.0').then(function (mod) {
 			thirdwebModule = mod;
 			return mod;
 		});
@@ -722,10 +745,51 @@
 					var url = explorerTx(tx.hash);
 					setStatus(status, i18n.txSent + (url ? ' ' + url : ''), 'pending');
 
-					rest('claim-tx', { claimId: voucher.claim_id, txHash: tx.hash })['catch'](function () {});
+					// Retried, and never swallowed. If the platform does not learn
+					// the claim was spent it stays open, later expires, and — where
+					// the store refunds on expiry — pays the points back for tokens
+					// the member is already holding.
+					recordClaimTx(voucher.claim_id, tx.hash, status);
 					return tx.wait().then(function () { return { txHash: tx.hash }; });
 				});
 		});
+	}
+
+	/**
+	 * Tell the platform a voucher was spent, and keep trying.
+	 *
+	 * A lost confirmation is not cosmetic: the claim stays open and expires,
+	 * which on a store that refunds expired claims pays the same value twice.
+	 * Three attempts over about half a minute covers a reload of the API or a
+	 * moment of bad connectivity; after that the member is told, with the hash,
+	 * so support has something to work from.
+	 */
+	function recordClaimTx(claimId, txHash, status) {
+		var attempt = 0;
+
+		function send() {
+			attempt += 1;
+			return rest('claim-tx', { claimId: claimId, txHash: txHash })['catch'](function (error) {
+				if (attempt < 3) {
+					return new Promise(function (resolve) {
+						window.setTimeout(resolve, attempt * 5000);
+					}).then(send);
+				}
+				if (status) {
+					setStatus(
+						status,
+						i18n.claimNotRecorded
+							? i18n.claimNotRecorded.replace('%s', txHash)
+							: 'Your tokens were claimed, but we could not record it. Please quote ' +
+								txHash + ' to support.',
+						'error'
+					);
+				}
+				throw error;
+			});
+		}
+
+		return send()['catch'](function () {});
 	}
 
 	function refreshBalance(panel) {

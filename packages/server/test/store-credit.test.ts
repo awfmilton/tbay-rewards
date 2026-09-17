@@ -124,7 +124,7 @@ describe('spending points for store credit', () => {
     expect(quote.amount_cents).toBe(1100);
   });
 
-  it('redeems the code against an order exactly once', async () => {
+  it('redeems the whole code against an order exactly once', async () => {
     const contact = await funded('once@example.com', 500);
     const { code } = JSON.parse(
       (await authed('POST', '/v1/credit/redeem', { contactId: contact, points: 500 })).body,
@@ -132,6 +132,101 @@ describe('spending points for store credit', () => {
 
     const { redeemStoreCredit } = await import('../src/services/token.js');
     expect(await redeemStoreCredit(tenant.id, code, 'order-1')).not.toBeNull();
+    // Nothing left, so a different order gets nothing.
     expect(await redeemStoreCredit(tenant.id, code, 'order-2')).toBeNull();
+  });
+
+  it('draws the credit down instead of destroying the remainder', async () => {
+    // A $5 credit spent on a 50c basket used to burn the whole code. The
+    // customer lost $4.50 and the store looked like it had taken it.
+    const contact = await funded('partial@example.com', 500);
+    const { code, amount_cents } = JSON.parse(
+      (await authed('POST', '/v1/credit/redeem', { contactId: contact, points: 500 })).body,
+    );
+    expect(amount_cents).toBe(500);
+
+    const { redeemStoreCredit } = await import('../src/services/token.js');
+    const first = await redeemStoreCredit(tenant.id, code, 'order-a', 50);
+    expect(first).toMatchObject({ amount_cents: 50, remaining_cents: 450 });
+
+    const second = await redeemStoreCredit(tenant.id, code, 'order-b', 450);
+    expect(second).toMatchObject({ amount_cents: 450, remaining_cents: 0 });
+
+    // Now it really is spent.
+    expect(await redeemStoreCredit(tenant.id, code, 'order-c', 1)).toBeNull();
+  });
+
+  it('answers a repeated redemption for one order without taking more', async () => {
+    // A checkout retried after a timeout cannot tell "that did not go through"
+    // from "that went through and the reply was lost".
+    const contact = await funded('retry@example.com', 500);
+    const { code } = JSON.parse(
+      (await authed('POST', '/v1/credit/redeem', { contactId: contact, points: 500 })).body,
+    );
+
+    const { redeemStoreCredit } = await import('../src/services/token.js');
+    const first = await redeemStoreCredit(tenant.id, code, 'order-retry', 200);
+    const again = await redeemStoreCredit(tenant.id, code, 'order-retry', 200);
+
+    expect(first).toMatchObject({ amount_cents: 200, already_redeemed: false });
+    expect(again).toMatchObject({ amount_cents: 200, already_redeemed: true });
+
+    const { rows } = await db().query<{ redeemed_cents: string }>(
+      'SELECT redeemed_cents FROM store_credits WHERE tenant_id = $1 AND code = $2',
+      [tenant.id, code],
+    );
+    expect(Number(rows[0]!.redeemed_cents)).toBe(200);
+  });
+
+  it('refuses to spend more of a credit than is left', async () => {
+    const contact = await funded('over@example.com', 500);
+    const { code } = JSON.parse(
+      (await authed('POST', '/v1/credit/redeem', { contactId: contact, points: 500 })).body,
+    );
+
+    const { redeemStoreCredit } = await import('../src/services/token.js');
+    await redeemStoreCredit(tenant.id, code, 'order-1', 400);
+    await expect(redeemStoreCredit(tenant.id, code, 'order-2', 200)).rejects.toThrow(/100 cents left/);
+  });
+
+  it('two checkouts racing the same credit cannot both spend it', async () => {
+    const contact = await funded('race@example.com', 500);
+    const { code } = JSON.parse(
+      (await authed('POST', '/v1/credit/redeem', { contactId: contact, points: 500 })).body,
+    );
+
+    const { redeemStoreCredit } = await import('../src/services/token.js');
+    const results = await Promise.allSettled([
+      redeemStoreCredit(tenant.id, code, 'race-a', 500),
+      redeemStoreCredit(tenant.id, code, 'race-b', 500),
+    ]);
+
+    const won = results.filter((r) => r.status === 'fulfilled' && r.value !== null);
+    expect(won).toHaveLength(1);
+
+    const { rows } = await db().query<{ redeemed_cents: string }>(
+      'SELECT redeemed_cents FROM store_credits WHERE tenant_id = $1 AND code = $2',
+      [tenant.id, code],
+    );
+    expect(Number(rows[0]!.redeemed_cents)).toBe(500);
+  });
+
+  it('offers what is left of a credit, not its face value', async () => {
+    const contact = await funded('quote@example.com', 500);
+    const { code } = JSON.parse(
+      (await authed('POST', '/v1/credit/redeem', { contactId: contact, points: 500 })).body,
+    );
+
+    const { redeemStoreCredit } = await import('../src/services/token.js');
+    await redeemStoreCredit(tenant.id, code, 'order-part', 300);
+
+    const reserved = JSON.parse(
+      (await authed('POST', '/v1/token/credit/reserve', { contactId: contact })).body,
+    );
+    // A storefront quoting the face value offers a discount the platform
+    // would then refuse, and the customer sees the checkout fail.
+    expect(reserved.remaining_cents).toBe(200);
+    expect(reserved.amount_cents).toBe(200);
+    expect(reserved.face_value_cents).toBe(500);
   });
 });
