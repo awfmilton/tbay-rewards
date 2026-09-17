@@ -95,6 +95,16 @@ export async function buildApp(): Promise<FastifyInstance> {
       return reply.code(400).send({ error: 'bad_request', message: messageOf(error) });
     }
 
+    // Fastify's own 4xx — malformed JSON, an empty body, an unsupported media
+    // type, a payload over the limit. Each is the caller's mistake and each
+    // arrives here with the right status already on it; falling through to the
+    // 500 branch told every one of them the server had broken.
+    const status = (error as { statusCode?: number }).statusCode;
+    if (typeof status === 'number' && status >= 400 && status < 500) {
+      request.log.warn({ err: error }, 'rejected request');
+      return reply.code(status).send({ error: 'bad_request', message: messageOf(error) });
+    }
+
     request.log.error({ err: error }, 'unhandled error');
     return reply.code(500).send({
       error: 'internal_error',

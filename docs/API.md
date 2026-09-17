@@ -283,8 +283,16 @@ never the public site key.
 | `DELETE` | `/v1/email/templates/:key` | Revert to the built-in |
 
 `PUT` takes `{ subject, html?, blocks?, text?, transactional?, topicKey?, preheader? }`.
-Either `html` or `blocks` — not neither. `topicKey: null` removes the template
-from every topic. See [the email builder](#the-email-builder)
+A template being created needs a body — `html` or `blocks`. One that already
+exists can be edited a field at a time.
+
+Fields left out are left alone; `null` clears. That distinction matters most
+for `transactional`: omitting it used to mean `false`, which turns a receipt
+back into marketing and stops it reaching anyone without a marketing opt-in.
+`topicKey: null` removes the template from every topic.
+
+Saving `html` over a composed template drops its blocks, because generated HTML
+cannot be parsed back into them. See [the email builder](#the-email-builder)
 for what `blocks` holds.
 
 `preheader` is the line a mail client shows beside the subject. Left unset, the

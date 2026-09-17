@@ -470,6 +470,41 @@ describe('bad input is a 400, not a 500 (LOW)', () => {
     expect(res.statusCode).toBe(400);
   });
 
+  it('calls a malformed body the caller\'s mistake, not the server\'s', async () => {
+    // Fastify raises its own 400 for these; the handler fell through to the
+    // 500 branch and told every caller with a trailing comma that the server
+    // had broken.
+    for (const payload of ['{"email":', '', '[1,2']) {
+      const res = await (await testApp()).inject({
+        method: 'POST',
+        url: '/v1/contacts',
+        headers: {
+          authorization: `Bearer ${tenant.secretKey}`,
+          'content-type': 'application/json',
+        },
+        payload,
+      });
+      expect(res.statusCode, JSON.stringify(payload)).toBe(400);
+      expect(JSON.parse(res.body).error).toBe('bad_request');
+    }
+  });
+
+  it('names the field when a date will not parse', async () => {
+    // Unchecked, the string reached Postgres and came back as "invalid input
+    // syntax for type timestamp with time zone" — a 500 for a caller's typo.
+    const cases: Array<[string, string, Record<string, unknown>]> = [
+      ['POST', '/v1/orders', { orderRef: 'bad-date-1', totalCents: 100, placedAt: 'yesterday' }],
+      ['PUT', '/v1/broadcasts/bad_date', { name: 'x', subject: 'y', sendAt: 'soon',
+        blocks: [{ type: 'text', text: 'hi' }] }],
+    ];
+    for (const [method, url, payload] of cases) {
+      const res = await authed(method as 'POST' | 'PUT', url, payload);
+      expect(res.statusCode, url).toBe(400);
+      const details = JSON.parse(res.body).details as Array<{ field: string }>;
+      expect(details.some((d) => d.field === 'placedAt' || d.field === 'sendAt'), url).toBe(true);
+    }
+  });
+
   it('treats a search term as text, not as a wildcard pattern', async () => {
     const contact = JSON.parse(
       (await authed('POST', '/v1/contacts', { email: 'search@example.com' })).body,

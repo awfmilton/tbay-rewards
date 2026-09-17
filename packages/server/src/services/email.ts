@@ -416,7 +416,8 @@ export async function upsertTemplate(
   key: string,
   template: {
     subject: string;
-    html: string;
+    /** Hand-written HTML. Omitted leaves whatever is stored alone. */
+    html?: string;
     text?: string | null;
     /**
      * Send this even to contacts without marketing consent.
@@ -443,10 +444,39 @@ export async function upsertTemplate(
   },
   runner: Queryable = db(),
 ): Promise<void> {
-  let html = template.html;
-  let text = template.text ?? null;
-  let blocks: string | null = null;
-  const preheader = template.preheader?.trim() || null;
+  /**
+   * What is already there, so a field the caller did not name is kept.
+   *
+   * Omitting `text` used to clear the plain-text override, omitting
+   * `transactional` turned a receipt back into marketing — meaning it stopped
+   * reaching anyone without a marketing opt-in — and omitting `topicKey` or
+   * `preheader` cleared those too. The wp-admin form happens to post most of
+   * them on every save, which is why it went unnoticed; an API caller editing
+   * a subject line lost the rest.
+   *
+   * For a built-in being overridden for the first time this is the built-in,
+   * which is the right base to edit from.
+   */
+  const existing = await getTemplate(tenantId, key, runner);
+  const named = <T>(value: T | undefined, fallback: T): T =>
+    value === undefined ? fallback : value;
+
+  let html = named(template.html, existing?.html ?? '');
+  let text = named(template.text, existing?.text ?? null);
+  let blocks: string | null = existing?.blocks ? JSON.stringify(existing.blocks) : null;
+  const transactional = named(template.transactional, existing?.transactional ?? false);
+  const topicKey = named(template.topicKey, existing?.topic_key ?? null);
+  const preheader =
+    template.preheader === undefined
+      ? existing?.preheader ?? null
+      : template.preheader?.trim() || null;
+
+  if (template.html !== undefined) {
+    // Hand-written HTML replaces a composed body: generated HTML cannot be
+    // parsed back into blocks, so keeping both would leave the builder
+    // reopening something the message no longer is.
+    blocks = null;
+  }
 
   if (template.blocks !== undefined && template.blocks !== null) {
     const { validateBlocks, renderDocument, blocksToText, assertSegmentsExist } =
@@ -484,8 +514,8 @@ export async function upsertTemplate(
       template.subject,
       html,
       text,
-      template.transactional ?? false,
-      template.topicKey ?? null,
+      transactional,
+      topicKey,
       blocks,
       preheader,
     ],
