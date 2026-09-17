@@ -23,7 +23,7 @@ The bugs those reviews found are all fixed; see the commit history for
 | **Bounce and complaint handling** | Conservative SMTP classification, an address-keyed suppression list, and RFC 8058 one-click `List-Unsubscribe` |
 | **Campaign delays and branching** | Automations are resumable step sequences: waits, branches evaluated against live data, gotos, and per-run step caps |
 | **Contact timeline** | One endpoint merging eleven sources, each limited before the union so a noisy source cannot crowd out a rare one |
-| **WordPress admin screens** | Eight screens: customers, ledger, earning rules, badges and ranks, segments and sends, email (with topics), currencies, privacy |
+| **WordPress admin screens** | Ten screens: customers, ledger, earning rules, badges and ranks, segments and sends, email (with topics), currencies, privacy, access and audit, reports |
 | **Counter write amplification** | In-process buffering flushed on a timer, off the request path entirely |
 | **myCred control surfaces** | Exclusions, per-product overrides, weekly/monthly caps, per-award clamps, badge and rank CRUD, manual rank pinning, coupon balance bands and grants |
 | **Multiple point types** | A currency per retailer-defined type, each with its own rules, ranks, badges, coupons, transfers, leaderboard and balance |
@@ -32,6 +32,7 @@ The bugs those reviews found are all fixed; see the commit history for
 | **Custom contact fields** | Retailer-defined typed fields, segmentable as `cf_<key>`, validated at write time rather than cast at read time |
 | **Contact merge** | Balances summed per currency, colliding rows reconciled rather than blindly updated, and the survivor keeps its id |
 | **Operators, roles and audit** | Keys attributable to a named person and scoped to a role, enforced by one hook, with an append-only record of every change |
+| **Report builder and scheduled exports** | Composable reports over a closed catalogue of sources, dimensions and measures, emailed daily, weekly or monthly |
 
 ### Multiple point types, in detail
 
@@ -66,7 +67,7 @@ installed with the tenant and every endpoint falls back to it.
 
 ## Still open
 
-### Reports and an email builder
+### An email builder
 
 The Mautic gaps that remain. Each is being worked in turn; see the task list.
 

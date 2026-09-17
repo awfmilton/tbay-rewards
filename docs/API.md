@@ -408,6 +408,83 @@ echoes `point_type`.
 
 ---
 
+## Saved reports and scheduled exports (secret)
+
+The fixed analytics under `/v1/reports` answer the questions we thought of. A
+retailer wants "revenue by campaign, monthly, for the last year" or "points
+issued per rule since we changed the rates" — questions nobody can enumerate in
+advance, and which are otherwise answered by somebody writing SQL against
+production.
+
+Mounted at **`/v1/saved-reports`**, deliberately: a `:key` parameter under
+`/v1/reports` would shadow every fixed report, including `/v1/reports/sources`.
+
+| Route | Purpose |
+|---|---|
+| `GET /v1/saved-reports/catalogue` | Sources, and what each can group by and measure |
+| `GET /v1/saved-reports` | Saved reports and their schedules |
+| `PUT` / `DELETE /v1/saved-reports/:key` | Save or remove one |
+| `POST /v1/saved-reports/run` | Run a definition without saving it |
+| `GET /v1/saved-reports/:key/run` | Run a saved one |
+| `GET /v1/saved-reports/:key/run.csv` | The same as a CSV download |
+| `PUT` / `DELETE /v1/saved-reports/:key/schedule` | Email it on a cadence |
+| `POST /v1/saved-reports/:key/send` | Send it now |
+| `GET /v1/saved-reports/runs` | What went out, and to whom |
+
+### The definition
+
+```json
+{
+  "source": "orders",
+  "dimensions": ["month", "campaign"],
+  "measures": ["orders", "revenue"],
+  "days": 365,
+  "filters": { "match": "all", "filters": [{ "field": "country", "operator": "eq", "value": "CA" }] }
+}
+```
+
+The definition is the retailer's; the **shape** of it is not. Every source,
+dimension and measure name is looked up in a fixed catalogue — the same
+discipline the segment filter compiler is built on, and for the same reason.
+"Let admins pick any column" is how a reporting screen becomes an
+arbitrary-read primitive over the whole schema, including other tenants' rows,
+pii salts and key hashes.
+
+Sources: `orders`, `points`, `commissions`, `email`, `contacts`. At most four
+dimensions and eight measures. `days` is a rolling window, defaulting to 90;
+`null` means everything.
+
+`filters` is a **contact segment**, compiled by the same compiler segments use
+— including the retailer's own `cf_<key>` fields — rather than a second filter
+language that would need auditing separately.
+
+A definition is validated **on save**, so a broken report is rejected while an
+admin is looking at the form rather than three weeks later when its schedule
+fires at 6am and nobody is watching.
+
+Date buckets are in the **retailer's** timezone. A "day" that rolls over at
+20:00 local is a daily report nobody can reconcile against their till.
+
+### Schedules
+
+`daily`, `weekly` or `monthly` at an hour in the retailer's timezone —
+deliberately not cron. An admin screen with a cron field is one where somebody
+schedules a report for 03:17 every 13th of the month by accident and does not
+find out for a year. The monthly day is capped at 28, so February never
+silently skips a send.
+
+A send is claimed by writing the **period key** — `2026-W38`, `2026-09` —
+rather than a timestamp. Two workers racing produce one send and one no-op, and
+"have we sent since 07:00" cannot drift across a clock change. Sending by hand
+uses a distinct key, so it does not consume Monday's.
+
+Scheduled reports carry **no unsubscribe link**, which is what marks a message
+transactional here. A report to the retailer's own staff must not consume a
+customer-facing frequency allowance, nor offer a member of staff a link that
+suppresses them from the store's own mail.
+
+---
+
 ## Operators, roles and the audit log (secret)
 
 Every secret key could do everything, which is fine for one person running one

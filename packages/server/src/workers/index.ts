@@ -12,6 +12,7 @@ import { runDueAutomations } from '../services/automations.js';
 import { flushCounters, startCounterBuffer, stopCounterBuffer } from '../services/counters.js';
 import { runRetentionSweep } from '../services/privacy.js';
 import { expirePauses } from '../services/preferences.js';
+import { runDueReports } from '../services/report-schedules.js';
 import { config } from '../config.js';
 
 /**
@@ -68,6 +69,11 @@ export const JOBS: Job[] = [
   // timestamp to now(), so a lapsed pause already sends. Doing it hourly means
   // "is this contact paused" is answerable by looking at the row.
   { name: 'pause_expiry', intervalMs: 3_600_000, run: () => expirePauses() },
+  // Every fifteen minutes. A scheduled report is due from its hour onwards, so
+  // the worst case is a Monday report arriving at 07:14 rather than 07:00 —
+  // which nobody notices, unlike a report that runs on the minute and misses
+  // its window entirely when the worker was restarting.
+  { name: 'report_schedules', intervalMs: 900_000, run: () => runDueReports() },
 ];
 
 const timers: NodeJS.Timeout[] = [];
