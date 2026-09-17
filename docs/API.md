@@ -283,7 +283,8 @@ never the public site key.
 | `DELETE` | `/v1/email/templates/:key` | Revert to the built-in |
 
 `PUT` takes `{ subject, html?, blocks?, text?, transactional?, topicKey?, preheader? }`.
-Either `html` or `blocks` — not neither. See [the email builder](#the-email-builder)
+Either `html` or `blocks` — not neither. `topicKey: null` removes the template
+from every topic. See [the email builder](#the-email-builder)
 for what `blocks` holds.
 
 `preheader` is the line a mail client shows beside the subject. Left unset, the
@@ -324,7 +325,13 @@ silently dropping what it does not know.
 ```
 
 Types are `heading`, `text`, `button`, `image`, `divider`, `spacer`, `products`
-and `points`. At most 60 blocks, 12 products in a product block.
+and `points`. At most 60 blocks, 12 products in a product block, and at least
+one block — a message whose only content is its own unsubscribe link is refused
+rather than stored.
+
+Fields are checked, not coerced. A value of the wrong type is a 400 rather than
+`[object Object]` in a sent newsletter, and a heading, a paragraph, a button
+label and a product name may not be blank.
 
 **The admin never writes HTML, which is the security property.** An HTML
 textarea in wp-admin is a stored XSS vector against the next admin who opens
@@ -349,6 +356,11 @@ That is what makes one message serve two audiences — a VIP paragraph above the
 same three products everybody gets — rather than sending two. Membership is
 resolved per recipient at send time from `segment_members`, one query for the
 whole message however many conditional blocks it holds.
+
+The segment has to exist. A typo is otherwise invisible and silent in the worst
+direction — `visibleTo: "vips"` hides the block from everybody, `hiddenFrom:
+"vips"` shows it to everybody — so an unknown key is refused when the message is
+saved.
 
 The copy stored on the template shows every block, because it was rendered
 against nobody. What a given person receives is rendered when the message is
@@ -976,10 +988,19 @@ an audience is read, so a segment cannot be built that forgets them.
 `PUT` takes `{ name?, segmentKey?, templateKey?, subject?, sendAt?, blocks?, preheader? }`.
 
 A broadcast either names a template or carries its own body. Sending `blocks`
-clears the template it named, and naming a template clears the blocks —
-whichever came last is the one that goes out, because a message has one body
-and leaving both set would make the answer depend on the order of two `if`s. A
-composed broadcast needs its own `subject`; a template carries one already.
+clears the template it named, and naming a template clears the blocks; sending
+both in one call is a 400, because a message has one body and picking for you
+would make the answer depend on the order of two `if`s. A composed broadcast
+needs its own `subject`, and a `preheader` only means something on one — on a
+template-backed send it is refused, since the template's own preheader is
+already part of the body that goes out.
+
+A draft may have neither: that is what "create it, then write it" looks like
+between the two steps. Arming one is refused until it has a message.
+
+Fields left out are left alone. In particular `sendAt` omitted keeps the time
+already set, so editing a scheduled send's message does not quietly
+un-schedule it; `sendAt: null` clears it and returns the send to a draft.
 
 Composing on the send is there because the monthly newsletter is a one-off, and
 making a retailer create a template for each one is how a "send" screen grows a

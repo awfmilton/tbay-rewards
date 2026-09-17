@@ -75,7 +75,8 @@ checked rather than guessed at.
 A send either names a template or carries its own message. Leave the template
 box blank when preparing a send and write the message on the send itself: the
 monthly newsletter is a one-off, and a template list that is really a send
-history helps nobody.
+history helps nobody. Coming back to "Prepare a send" to change a send's
+segment leaves whatever was written there alone.
 
 Templates written by hand keep working. Editing one shows the HTML it was
 written in, with a link to rebuild it from blocks — which replaces the HTML,

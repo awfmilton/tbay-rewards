@@ -1,6 +1,7 @@
 import nodemailer, { type Transporter } from 'nodemailer';
 import { db, queryOne, type Queryable } from '../db/pool.js';
 import { config } from '../config.js';
+import { ApiError } from '../lib/errors.js';
 import { planTracking } from './email-tracking.js';
 import { isSuppressed, recordFailure } from './deliverability.js';
 import type { Tenant } from './tenants.js';
@@ -293,7 +294,7 @@ export function renderTemplate(
   template: { subject: string; html: string; text?: string | null },
   vars: Record<string, unknown>,
 ): RenderedTemplate {
-  const subject = interpolate(template.subject, vars);
+  const subject = interpolate(template.subject, vars, false);
   let html = interpolate(template.html, vars);
 
   // A missing variable interpolates to an empty string, which in an `href`
@@ -302,7 +303,7 @@ export function renderTemplate(
   // anchor goes rather than depending on five call sites to remember.
   if (!vars.preferences_url) html = stripEmptyLinks(html);
 
-  const text = template.text ? interpolate(template.text, vars) : stripHtml(html);
+  const text = template.text ? interpolate(template.text, vars, false) : stripHtml(html);
   return { subject, html, text };
 }
 
@@ -313,7 +314,21 @@ function stripEmptyLinks(html: string): string {
     .replace(/(&nbsp;)?\s*&middot;\s*(&nbsp;)?\s*(?=<\/p>)/gi, '');
 }
 
-function interpolate(input: string, vars: Record<string, unknown>): string {
+/**
+ * Substitute `{{placeholders}}`.
+ *
+ * `escape` is false for the subject line and the plain-text part, because
+ * neither is HTML: a store called "Bob's Bikes" was arriving as "Bob&#39;s
+ * Bikes" in the inbox, and a text-part link with two query parameters arrived
+ * with `&amp;` in it, which is a broken link in a text-only client.
+ *
+ * It stays true — unconditionally — for the HTML part.
+ */
+function interpolate(
+  input: string,
+  vars: Record<string, unknown>,
+  escape = true,
+): string {
   return input.replace(PLACEHOLDER, (_match, key: string) => {
     const value = key.split('.').reduce<unknown>((acc, part) => {
       if (acc && typeof acc === 'object' && part in (acc as Record<string, unknown>)) {
@@ -321,8 +336,8 @@ function interpolate(input: string, vars: Record<string, unknown>): string {
       }
       return undefined;
     }, vars);
-    // Everything interpolated lands in HTML, so escape unconditionally.
-    return value === undefined || value === null ? '' : escapeHtml(String(value));
+    if (value === undefined || value === null) return '';
+    return escape ? escapeHtml(String(value)) : String(value);
   });
 }
 
@@ -434,8 +449,15 @@ export async function upsertTemplate(
   const preheader = template.preheader?.trim() || null;
 
   if (template.blocks !== undefined && template.blocks !== null) {
-    const { validateBlocks, renderDocument, blocksToText } = await import('./email-blocks.js');
+    const { validateBlocks, renderDocument, blocksToText, assertSegmentsExist } =
+      await import('./email-blocks.js');
     const checked = validateBlocks(template.blocks);
+    if (checked.length === 0) {
+      // Otherwise the stored body is the frame and nothing else: a message
+      // whose only content is its own unsubscribe link.
+      throw ApiError.badRequest('An email needs at least one block');
+    }
+    await assertSegmentsExist(tenantId, checked, runner);
     blocks = JSON.stringify(checked);
     // Rendered without any segment membership: this is the copy stored on the
     // template, and a conditional block is resolved per recipient at send time.
@@ -450,7 +472,9 @@ export async function upsertTemplate(
      ON CONFLICT (tenant_id, key) DO UPDATE SET
        subject = EXCLUDED.subject, html = EXCLUDED.html,
        text = EXCLUDED.text, transactional = EXCLUDED.transactional,
-       topic_key = COALESCE($7, email_templates.topic_key),
+       -- Direct, not COALESCE: a template moved out of every topic has to be
+       -- able to go back to belonging to none.
+       topic_key = $7,
        blocks = EXCLUDED.blocks,
        preheader = EXCLUDED.preheader,
        updated_at = now()`,

@@ -356,17 +356,17 @@ async function sendEmailAction(
   // A template built from blocks, where some block is conditional, has to be
   // re-rendered for this recipient: the stored HTML shows every block, because
   // it was rendered with nobody's membership.
-  const body = await personalise(tenant.id, ctx.contact.id, template);
+  const body = await personalise(tenant.id, ctx.contact.id, template, runner);
 
-  // Looked up only when the message holds a `points` block, so a template
-  // without one costs no extra query. A trigger that already carries a balance
-  // wins: it is the balance at the moment that fired, and re-reading it here
-  // would show a different number from the one the message is about.
-  const carried = ctx.data?.balance ?? ctx.data?.points ?? ctx.data?.points_balance;
-  const pointsBalance =
-    carried ?? (body.html.includes('{{points_balance}}')
-      ? await pointsBalanceFor(tenant.id, ctx.contact.id)
-      : '');
+  // Read, never taken from the trigger. `order.completed` carries `points` as
+  // the amount that order *earned*, and `points.awarded` carries the balance of
+  // whichever currency that rule pays — neither is "your balance" in the
+  // default currency, which is what the block says. Looked up only when the
+  // message holds the block, so a template without one costs no extra query,
+  // and on `runner` so an award still inside its own transaction is counted.
+  const pointsBalance = body.html.includes('{{points_balance}}')
+    ? await pointsBalanceFor(tenant.id, ctx.contact.id, runner)
+    : '';
 
   const rendered = renderTemplate(body, {
     tenant_name: tenant.name,

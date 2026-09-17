@@ -195,7 +195,8 @@ class TBAY_Rewards_Manage {
 		}
 		check_ajax_referer( 'tbay_email_preview' );
 
-		$blocks = json_decode( isset( $_POST['blocks'] ) ? wp_unslash( $_POST['blocks'] ) : '[]', true );
+		$posted = isset( $_POST['blocks'] ) ? wp_unslash( $_POST['blocks'] ) : '[]';
+		$blocks = is_string( $posted ) ? json_decode( $posted, true ) : null;
 		if ( ! is_array( $blocks ) ) {
 			wp_send_json_error( array( 'message' => __( 'Those blocks could not be read.', 'tbay-rewards' ) ), 400 );
 		}
@@ -1486,9 +1487,10 @@ class TBAY_Rewards_Manage {
 			unset( $payload['templateKey'] );
 		} elseif ( '' === ( $payload['templateKey'] ?? '' ) ) {
 			// A draft with no template is one somebody means to write here.
-			// An empty body is enough to create it; sending it is refused
-			// until there is something in it.
-			$payload['blocks'] = array();
+			// Nothing is sent for the body: an empty list would look like a
+			// composed message and wipe whatever "Write it" had put there —
+			// and this form is the only screen that can change a segment, so
+			// it is re-submitted for sends that already have a message.
 			unset( $payload['templateKey'] );
 		}
 
@@ -1768,7 +1770,14 @@ class TBAY_Rewards_Manage {
 			return null;
 		}
 
-		$raw = trim( wp_unslash( $_POST['blocks'] ) ); // phpcs:ignore WordPress.Security.ValidatedSanitizedInput
+		$posted = wp_unslash( $_POST['blocks'] ); // phpcs:ignore WordPress.Security.ValidatedSanitizedInput
+		if ( ! is_string( $posted ) ) {
+			// `blocks[]=…` rather than the JSON the builder posts. Only an
+			// admin can send it, and a TypeError is still the wrong answer.
+			return new WP_Error( 'tbay_bad_input', __( 'That message could not be read. Nothing was saved.', 'tbay-rewards' ) );
+		}
+
+		$raw = trim( $posted );
 		if ( '' === $raw ) {
 			return null;
 		}

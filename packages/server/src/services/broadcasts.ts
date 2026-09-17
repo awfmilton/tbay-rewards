@@ -1,7 +1,13 @@
 import { db, queryOne, withTransaction, type Queryable } from '../db/pool.js';
 import { unsubscribeRequestUrl } from './newsletter.js';
 import { mayReceive, preferencesUrl } from './preferences.js';
-import { blocksToText, personalise, renderDocument, validateBlocks } from './email-blocks.js';
+import {
+  assertSegmentsExist,
+  blocksToText,
+  personalise,
+  renderDocument,
+  validateBlocks,
+} from './email-blocks.js';
 import { config } from '../config.js';
 import { ApiError } from '../lib/errors.js';
 import { limitOf } from '../lib/paging.js';
@@ -100,36 +106,59 @@ export async function upsertBroadcast(
     segmentId = segment.id;
   }
 
+  // A message has one body. Sent together, there is no answer to which one goes
+  // out that is not an accident of the order these two `if`s are written in.
+  if (input.templateKey && input.blocks !== undefined && input.blocks !== null) {
+    throw ApiError.badRequest('A broadcast takes a templateKey or blocks, not both');
+  }
+
   let blocks: string | null = existing?.blocks ? JSON.stringify(existing.blocks) : null;
-  if (input.blocks !== undefined) {
-    blocks = input.blocks === null ? null : JSON.stringify(validateBlocks(input.blocks));
-  }
+  let templateKey: string | null = existing?.template_key ?? null;
 
-  // A composed body replaces the template; naming a template replaces the
-  // composed body. Whichever the caller sent last is the one they meant.
-  let templateKey: string | null = input.templateKey ?? existing?.template_key ?? null;
-  if (input.blocks !== undefined && input.blocks !== null && !input.templateKey) {
-    templateKey = null;
-  } else if (input.templateKey) {
+  if (input.templateKey) {
+    // Naming a template replaces a composed body.
+    templateKey = input.templateKey;
     blocks = null;
+  } else if (input.blocks !== undefined) {
+    if (input.blocks === null) {
+      blocks = null;
+    } else {
+      const checked = validateBlocks(input.blocks);
+      await assertSegmentsExist(tenantId, checked, runner);
+      blocks = JSON.stringify(checked);
+      // A composed body replaces the template.
+      templateKey = null;
+    }
   }
 
-  const preheader =
+  let preheader =
     input.preheader === undefined
       ? existing?.preheader ?? null
       : input.preheader?.trim() || null;
 
-  if (blocks) {
-    // Nothing else supplies one: a template carries its own subject, a
-    // composed body carries none.
-    if (!(input.subject ?? existing?.subject)) {
-      throw ApiError.badRequest('A composed broadcast needs a subject');
-    }
-  } else {
-    if (!templateKey) throw ApiError.badRequest('A broadcast needs a templateKey or blocks');
+  // Preserved when not named, so editing a scheduled send's message does not
+  // quietly un-schedule it — the composer never posts a time, and the old
+  // `EXCLUDED.send_at` turned every such save into "draft, never sends".
+  const sendAt = input.sendAt === undefined ? existing?.send_at ?? null : input.sendAt;
+
+  if (templateKey) {
     if (!(await getTemplate(tenantId, templateKey, runner))) {
       throw ApiError.notFound(`No email template "${templateKey}"`);
     }
+    if (input.preheader) {
+      // It would be stored and never read: the template's own preheader is
+      // already rendered into the body this send goes out with.
+      throw ApiError.badRequest(
+        'A preheader belongs to the message. Set it on the template, or write this send its own.',
+      );
+    }
+    // A send that switches from its own body to a template leaves its
+    // preheader behind, rather than keeping a value nothing will read.
+    preheader = null;
+  } else if (!(input.subject ?? existing?.subject)) {
+    // Nothing else supplies one: a template carries its own subject, a body
+    // written here carries none.
+    throw ApiError.badRequest('A composed broadcast needs a subject');
   }
 
   const row = await queryOne<Broadcast>(
@@ -159,7 +188,7 @@ export async function upsertBroadcast(
       segmentId,
       templateKey,
       input.subject ?? existing?.subject ?? null,
-      input.sendAt ?? null,
+      sendAt,
       blocks,
       preheader,
     ],
