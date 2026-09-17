@@ -14,6 +14,7 @@ import { limitOf } from '../lib/paging.js';
 import { getTemplate, queueEmail, renderTemplate, senderFor } from './email.js';
 import { shouldTrack } from './email-tracking.js';
 import { assertGamificationKey } from './gamification.js';
+import { frequencyRuleFor, overFrequencyCap } from './frequency.js';
 import { getSegment, segmentAudience } from './segments.js';
 import { getTenantById, type Tenant } from './tenants.js';
 
@@ -271,54 +272,6 @@ export async function cancelBroadcast(
   );
   if (!row) throw ApiError.conflict('That broadcast cannot be cancelled');
   return row;
-}
-
-/** Marketing sends per contact allowed in a rolling window. */
-interface FrequencyRule {
-  perDay: number | null;
-  perWeek: number | null;
-}
-
-function frequencyRuleFor(tenant: Tenant): FrequencyRule {
-  const positive = (value: unknown): number | null => {
-    const n = Number(value);
-    return Number.isFinite(n) && n > 0 ? Math.trunc(n) : null;
-  };
-  return {
-    perDay: positive(tenant.settings?.maxMarketingPerDay),
-    perWeek: positive(tenant.settings?.maxMarketingPerWeek),
-  };
-}
-
-/**
- * Has this contact had enough marketing for now?
- *
- * Counts messages this contact was *sent*, not queued: a message stuck in the
- * queue has not reached anyone, and counting it would let a backlog silently
- * suppress a campaign.
- */
-async function overFrequencyCap(
-  runner: Queryable,
-  tenantId: string,
-  contactId: string,
-  rule: FrequencyRule,
-): Promise<string | null> {
-  for (const [window, cap, label] of [
-    ['1 day', rule.perDay, 'day'],
-    ['7 days', rule.perWeek, 'week'],
-  ] as const) {
-    if (cap === null) continue;
-    const row = await queryOne<{ n: string }>(
-      runner,
-      `SELECT COUNT(*) AS n FROM email_messages
-        WHERE tenant_id = $1 AND contact_id = $2 AND status = 'sent'
-          AND unsubscribe_url IS NOT NULL
-          AND sent_at >= now() - $3::interval`,
-      [tenantId, contactId, window],
-    );
-    if (Number(row?.n ?? 0) >= cap) return `frequency_cap_${label}`;
-  }
-  return null;
 }
 
 export interface SendResult {
