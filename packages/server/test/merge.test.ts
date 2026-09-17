@@ -469,11 +469,59 @@ describe('over the API', () => {
 });
 
 describe('a merge and a spend at the same moment', () => {
+  it('makes a spend wait for a merge that is holding the contact', async () => {
+    // The mechanism, tested directly. The merge locks the two contact rows;
+    // award and spend used to lock only the balance row, so nothing made the
+    // two serialise and a spend could land between the merge reading the
+    // loser's balance and moving their ledger — leaving the survivor holding
+    // points that were never earned.
+    //
+    // That interleaving is a sub-millisecond window, which is not something a
+    // test can reliably provoke. What a test can check is the lock itself: a
+    // spend must not proceed while a merge holds the contact row.
+    const keep = (await upsertContact(tenant.id, { email: 'lock-keep@example.com' })).id;
+    const loser = (await upsertContact(tenant.id, { email: 'lock-lose@example.com' })).id;
+    await award(tenant.id, {
+      contactId: loser,
+      points: 100,
+      reason: 'seed',
+      idempotencyKey: 'lock-seed',
+    });
+
+    const holder = await db().connect();
+    try {
+      await holder.query('BEGIN');
+      // What the merge takes first.
+      await holder.query('SELECT 1 FROM contacts WHERE tenant_id = $1 AND id = $2 FOR UPDATE', [
+        tenant.id,
+        loser,
+      ]);
+
+      const spending = spend(tenant.id, {
+        contactId: loser,
+        points: 50,
+        reason: 'blocked',
+        idempotencyKey: 'lock-spend',
+      });
+
+      const outcome = await Promise.race([
+        spending.then(() => 'finished'),
+        new Promise((resolve) => setTimeout(() => resolve('waited'), 700)),
+      ]);
+      // Without the shared lock in `holdContact`, this reads 'finished'.
+      expect(outcome).toBe('waited');
+
+      await holder.query('ROLLBACK');
+      await spending;
+    } finally {
+      holder.release();
+    }
+  });
+
   it('leaves the survivor with a balance that equals its own ledger', async () => {
-    // The merge locked the two contact rows; award and spend locked the
-    // balance row. Nothing made the two serialise, so a spend landing between
-    // the merge reading the loser's balance and moving their ledger left the
-    // survivor holding points that were never earned.
+    // A guard on the invariant rather than a reproduction of the race: after a
+    // concurrent merge and spend, whatever order they land in, the survivor's
+    // balance must equal the sum of its own ledger.
     const keep = (await upsertContact(tenant.id, { email: 'keep-race@example.com' })).id;
     const loser = (await upsertContact(tenant.id, { email: 'loser-race@example.com' })).id;
 
@@ -484,15 +532,23 @@ describe('a merge and a spend at the same moment', () => {
       idempotencyKey: 'race-seed',
     });
 
-    await Promise.allSettled([
-      mergeContacts(tenant.id, { keepId: keep, mergeId: loser }),
-      spend(tenant.id, {
-        contactId: loser,
-        points: 50,
-        reason: 'race spend',
-        idempotencyKey: 'race-spend',
-      }),
-    ]);
+    // Staggered on purpose. The window is: the merge reads the loser's
+    // balance, the spend commits, the merge then moves the loser's ledger onto
+    // the survivor. Firing both at the same instant does not reach it — the
+    // spend finishes before the merge has read anything — so the spend starts
+    // a few milliseconds in.
+    const merging = mergeContacts(tenant.id, keep, loser);
+    await new Promise((resolve) => setTimeout(resolve, 3));
+    const spending = spend(tenant.id, {
+      contactId: loser,
+      points: 50,
+      reason: 'race spend',
+      idempotencyKey: 'race-spend',
+    });
+
+    const [merged] = await Promise.allSettled([merging, spending]);
+    // The merge itself has to have happened, or this test proves nothing.
+    expect(merged.status).toBe('fulfilled');
 
     const { rows } = await db().query<{ balance: string; ledger: string }>(
       `SELECT b.balance,
@@ -504,8 +560,16 @@ describe('a merge and a spend at the same moment', () => {
       [tenant.id, keep],
     );
 
+    expect(rows.length).toBeGreaterThan(0);
     for (const row of rows) {
       expect(Number(row.balance)).toBe(Number(row.ledger));
     }
+
+    // And the loser is gone, so nothing of theirs is stranded.
+    const { rows: left } = await db().query(
+      'SELECT 1 FROM contacts WHERE tenant_id = $1 AND id = $2',
+      [tenant.id, loser],
+    );
+    expect(left).toHaveLength(0);
   });
 });

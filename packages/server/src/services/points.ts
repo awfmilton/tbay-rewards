@@ -121,17 +121,25 @@ export async function getBalances(
  * Hold the contact still while their points move.
  *
  * A merge locks the two contact rows, then sums their balances and moves their
- * ledger entries onto the survivor. Award and spend lock the *balance* row, so
- * nothing made the two serialise against each other: a spend that landed
- * between the merge reading a balance and moving the ledger left the survivor
- * with a balance that no longer equalled its own history — spendable points
- * that were never earned. An award landing after the move went onto a contact
- * row about to be deleted, and vanished with it.
+ * ledger entries onto the survivor. A spend landing between those two steps
+ * would leave the survivor's balance above the sum of its own ledger —
+ * spendable points that were never earned.
  *
- * Shared, so concurrent awards for different people, or for the same person,
- * do not queue behind each other; only a merge, which takes the row
- * exclusively, waits or is waited for. Taken before any balance lock, so the
- * two paths acquire in the same order and cannot deadlock.
+ * That interleaving turns out to be unreachable already, and it is worth
+ * writing down why, because the reason is not obvious and not ours: every
+ * award and spend inserts a `points_ledger` row, and that insert takes a
+ * `KEY SHARE` lock on the referenced `contacts` row to enforce the foreign
+ * key. `KEY SHARE` conflicts with the merge's `FOR UPDATE`, so the insert
+ * already waits. Verified directly against Postgres 16 rather than assumed.
+ *
+ * This lock is here to stop that guarantee being accidental. It states the
+ * ordering — contact, then balance — in the code that depends on it, rather
+ * than leaving it to a constraint that somebody could reasonably change; and
+ * it covers a future writer that touches a balance without writing a ledger
+ * row first, which the foreign key would not.
+ *
+ * Shared, so concurrent awards do not queue behind each other; only a merge,
+ * which takes the row exclusively, waits or is waited for.
  */
 async function holdContact(
   client: Queryable,

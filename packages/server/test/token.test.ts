@@ -471,8 +471,11 @@ describe('spending TBAY at a retailer', () => {
 
     const redeemed = await redeemStoreCredit(tenant.id, result.credit!.code, 'order-99');
     expect(redeemed?.amount_cents).toBe(500);
-    // A credit is single-use.
-    expect(await redeemStoreCredit(tenant.id, result.credit!.code, 'order-100')).toBeNull();
+    expect(redeemed?.remaining_cents).toBe(0);
+    // Spent in full, so a second order is refused — and told it was spent,
+    // not that the code never existed.
+    await expect(redeemStoreCredit(tenant.id, result.credit!.code, 'order-100'))
+      .rejects.toThrow(/already been used/i);
   });
 
   it('rejects a transfer that went to the wrong address', async () => {

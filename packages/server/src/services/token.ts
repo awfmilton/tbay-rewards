@@ -1080,9 +1080,16 @@ export async function redeemStoreCredit(
       };
     }
 
-    if (credit.status !== 'active') return null;
-
     const remaining = Number(credit.amount_cents) - Number(credit.redeemed_cents);
+
+    // Distinguished from "no such code", which is what this used to say. A
+    // storefront showing "that code is not valid" for a credit the customer
+    // spent last week sends them to support over nothing.
+    if (credit.status !== 'active' || remaining <= 0) {
+      throw ApiError.conflict('That store credit has already been used', {
+        code: 'credit_spent',
+      });
+    }
     const wanted = amountCents === undefined ? remaining : Math.trunc(amountCents);
     if (!Number.isFinite(wanted) || wanted <= 0) {
       throw ApiError.badRequest('An amount to redeem must be a positive number of cents');

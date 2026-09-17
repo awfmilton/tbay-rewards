@@ -554,6 +554,8 @@ class TBAY_Rewards_WooCommerce {
 		}
 
 		$remaining = (int) ( $fresh['remaining_cents'] ?? $fresh['amount_cents'] ?? 0 );
+		// `reserve` returns the oldest credit with something left, so a code
+		// that no longer matches means the one in the session is spent.
 		if ( (string) ( $fresh['code'] ?? '' ) !== (string) $credit['code'] || $remaining < $wanted ) {
 			$errors->add(
 				'tbay_credit',
