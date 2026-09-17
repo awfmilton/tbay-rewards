@@ -106,7 +106,13 @@ With WooCommerce active:
 - Pushes the cart on every page so abandonment tracking has something to recover
 - Captures the attribution cookie at checkout onto the order
 - Reports paid orders, awards points, accrues writer commission
-- Voids commissions and claws back points on refund
+- Voids commissions and claws back points on refund, and takes the sale back
+  out of the product figures
+- Pushes each product to the platform when it is saved, over the secret key.
+  The tracker reports products too, but under the site key that sits in your
+  page source — so those details may only introduce a product the platform has
+  not seen, never restate one. This is what makes a price change, a rename or a
+  re-categorisation actually land
 - Offers TBAY store credit at cart and checkout, and applies it as a discount
 - Marks product tiles so clicks are attributed to the right product
 
