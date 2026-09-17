@@ -724,6 +724,25 @@ export async function awardBadgeManually(
   );
   if (!badge) throw ApiError.notFound(`No badge "${badgeKey}"`);
 
+  // A level the badge does not have is not an award, it is a typo that ends up
+  // on the customer's profile. A badge showing "Level 20" it never defined has
+  // no artwork, no name and no meaning; say so now rather than render it.
+  //
+  // Read from the tiers rather than counted: a badge is free to number its
+  // tiers 1 and 3, and "how many are there" is a different question from
+  // "which ones exist".
+  const declared = (badge.tiers ?? [])
+    .map((tier) => Number((tier as { level?: unknown }).level))
+    .filter((value) => Number.isInteger(value) && value > 0);
+  const levels = declared.length > 0 ? declared : [1];
+  if (!levels.includes(level)) {
+    throw ApiError.badRequest(
+      levels.length === 1 && levels[0] === 1
+        ? `"${badgeKey}" has a single level`
+        : `"${badgeKey}" has levels ${levels.join(', ')}; ${level} is not one of them`,
+    );
+  }
+
   const row = await queryOne<BadgeAward>(
     runner,
     `INSERT INTO badge_awards (tenant_id, badge_id, contact_id, level, progress)
@@ -1084,9 +1103,20 @@ export async function recordStreak(
       [tenantId, contactId, key],
     );
 
+    // The retailer's day, not the server's.
+    //
+    // CURRENT_DATE is UTC in production, so a Montana store's daily streak
+    // rolled over at five in the afternoon: a customer who visits each evening
+    // was credited twice on one day and missed the next, and their streak
+    // broke while they were doing exactly what was asked. Reward caps and
+    // transfer limits already ask the tenant which day it is; this is the one
+    // place that did not.
+    const zone = await tenantTimezone(tenantId, client);
     const today = await queryOne<{ today: string; yesterday: string }>(
       client,
-      `SELECT CURRENT_DATE::text AS today, (CURRENT_DATE - 1)::text AS yesterday`,
+      `SELECT (now() AT TIME ZONE $1)::date::text          AS today,
+              ((now() AT TIME ZONE $1)::date - 1)::text    AS yesterday`,
+      [zone],
     );
 
     if (existing && existing.last_day === today!.today) {
@@ -1099,15 +1129,15 @@ export async function recordStreak(
     const updated = await queryOne<Streak>(
       client,
       `INSERT INTO streaks (tenant_id, contact_id, key, current_length, longest_length, last_day, total_days)
-       VALUES ($1, $2, $3, $4, $4, CURRENT_DATE, 1)
+       VALUES ($1, $2, $3, $4, $4, $5::date, 1)
        ON CONFLICT (tenant_id, contact_id, key) DO UPDATE SET
          current_length = $4,
          longest_length = GREATEST(streaks.longest_length, $4),
-         last_day       = CURRENT_DATE,
+         last_day       = $5::date,
          total_days     = streaks.total_days + 1,
          updated_at     = now()
        RETURNING current_length, longest_length, total_days, last_day::text AS last_day`,
-      [tenantId, contactId, key, nextLength],
+      [tenantId, contactId, key, nextLength, today!.today],
     );
 
     // A rule named after the streak pays it, when the retailer has defined one.
@@ -1400,6 +1430,23 @@ export async function createCoupon(
   }
 
   const type = await resolvePointType(tenantId, input.pointType, runner);
+
+  // A coupon that hands out a badge or rank nobody has defined fails at
+  // redemption, in front of the customer, on a code the retailer already
+  // printed. Checked when it is written instead, where a typo is still cheap.
+  for (const [field, key, table] of [
+    ['grantBadgeKey', input.grantBadgeKey, 'badges'],
+    ['grantRankKey', input.grantRankKey, 'ranks'],
+  ] as const) {
+    if (!key) continue;
+    const found = await runner.query(
+      `SELECT 1 FROM ${table} WHERE tenant_id = $1 AND key = $2`,
+      [tenantId, key],
+    );
+    if ((found.rowCount ?? 0) === 0) {
+      throw ApiError.badRequest(`${field} "${key}" does not exist`);
+    }
+  }
 
   const row = await queryOne<{ code: string; points: number }>(
     runner,

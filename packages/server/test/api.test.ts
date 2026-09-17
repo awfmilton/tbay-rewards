@@ -190,7 +190,8 @@ describe('full customer journey', () => {
     });
 
     balance = await authed('GET', `/v1/rewards/balance?contactId=${contactId}`);
-    expect(balance.json().points.balance).toBe(125); // + 25 for the verified share
+    // + 25 for the verified share, + 25 for the Social Butterfly badge it earns.
+    expect(balance.json().points.balance).toBe(150);
 
     // 4. Buy, which converts the cart and grants held purchase points.
     const order = await authed('POST', '/v1/orders', {

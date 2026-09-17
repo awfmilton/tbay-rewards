@@ -425,3 +425,58 @@ describe('re-running a stale export', () => {
     expect(subs[0]!.status).toBe('unsubscribed');
   });
 });
+
+describe('a real export, not a textbook one (LOW)', () => {
+  it('reads a semicolon-delimited file the way Excel wrote it', async () => {
+    // Excel writes the list separator of the machine it ran on -- a semicolon
+    // across most of Europe and in French Canada, which is exactly where this
+    // product ships. Read as commas, the file is one column wide, and the
+    // importer answered "No email column found -- is this a Mautic contact
+    // export?" about a file that was precisely that.
+    const csv = [
+      'id;email;firstname;lastname;date_added',
+      '1;semi@example.com;Marie;Tremblay;2024-02-01 09:00:00',
+      '2;other@example.com;Jean;Roy;2024-02-02 09:00:00',
+    ].join('\n');
+
+    const report = await importMauticContacts({ tenantId: tenant.id, csv });
+
+    expect(report.warnings).toEqual([]);
+    expect(report.created).toBe(2);
+    const { rows } = await db().query<{ email: string; name: string }>(
+      'SELECT email, name FROM contacts WHERE tenant_id = $1 ORDER BY email',
+      [tenant.id],
+    );
+    expect(rows.map((row) => row.email)).toEqual(['other@example.com', 'semi@example.com']);
+    expect(rows[1]!.name).toBe('Marie Tremblay');
+  });
+
+  it('says so when a stray quote swallowed the rest of the file', async () => {
+    // Everything after the stray quote collapses into one value, so most of
+    // the rows are simply not there. Importing 1 of 3 and reporting success is
+    // the worst outcome: the retailer moves on believing the list came across.
+    const csv = [
+      'id,email,firstname',
+      '1,first@example.com,Ann',
+      '2,"broken@example.com,Bob',
+      '3,third@example.com,Cal',
+    ].join('\n');
+
+    const report = await importMauticContacts({ tenantId: tenant.id, csv });
+
+    expect(report.warnings.some((warning) => /ends inside a quoted value/i.test(warning))).toBe(true);
+  });
+
+  it('is unbothered by a file that is genuinely comma-delimited', async () => {
+    const csv = [
+      'id,email,firstname,lastname',
+      '1,"Doe, Jane" <comma@example.com>,Jane,Doe',
+      '2,plain@example.com,Bob,Roy',
+    ].join('\n');
+
+    const report = await importMauticContacts({ tenantId: tenant.id, csv });
+
+    // The quoted comma must not be counted as a delimiter vote.
+    expect(report.read).toBe(2);
+  });
+});

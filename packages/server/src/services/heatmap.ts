@@ -142,13 +142,32 @@ export async function recordHeatmap(
   return cells.length;
 }
 
-/** Count a session against a page once, for "sampled sessions" in reports. */
+/**
+ * Count a session against a page once, for "sampled sessions" in reports.
+ *
+ * Deduplicated on (page, device, session) rather than on "is this the
+ * session's first request". The tracker flushes pointer samples on a timer, so
+ * a visitor who reads for a few seconds before moving the mouse sends their
+ * first batch on a later beat -- and under the old test was never counted,
+ * leaving the screen reporting a heatmap built from no sessions at all beside
+ * a full set of cells.
+ */
 export async function countHeatmapSession(
   runner: Queryable,
   tenantId: string,
   pageKey: string,
   deviceClass: string,
+  sessionId: string,
 ): Promise<void> {
+  const claimed = await runner.query(
+    `INSERT INTO heatmap_page_sessions (tenant_id, page_key, device_class, session_id)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT DO NOTHING`,
+    [tenantId, pageKey, deviceClass, sessionId],
+  );
+  // Already counted on an earlier beat of the same session.
+  if ((claimed.rowCount ?? 0) === 0) return;
+
   if (countersEnabled()) {
     bufferPage(tenantId, pageKey, deviceClass, { sessions: 1 });
     return;

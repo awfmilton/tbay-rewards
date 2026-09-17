@@ -6,7 +6,47 @@
  * newlines — and a dependency is not worth it for that.
  */
 
-export function parseCsv(input: string): string[][] {
+/**
+ * Which character separates the fields.
+ *
+ * Excel writes the list separator of the machine it ran on, which is a
+ * semicolon across most of Europe and in French Canada -- and this product
+ * ships to a bilingual Canadian store. A semicolon file parsed as commas is
+ * one column wide, so the importer answered "No email column found -- is this
+ * a Mautic contact export?" about a file that was exactly that, and the
+ * retailer had no way to tell what it wanted instead.
+ *
+ * Decided from the header line only, and only from text outside quotes, so a
+ * comma inside a quoted product name cannot outvote the real delimiter.
+ */
+function sniffDelimiter(input: string): string {
+  let inQuotes = false;
+  const counts = new Map<string, number>([[',', 0], [';', 0], ['\t', 0]]);
+
+  for (let i = 0; i < input.length; i += 1) {
+    const char = input[i]!;
+    if (char === '"') {
+      inQuotes = !inQuotes;
+      continue;
+    }
+    if (inQuotes) continue;
+    if (char === '\n') break;
+    const seen = counts.get(char);
+    if (seen !== undefined) counts.set(char, seen + 1);
+  }
+
+  let best = ',';
+  let most = 0;
+  for (const [candidate, count] of counts) {
+    if (count > most) {
+      best = candidate;
+      most = count;
+    }
+  }
+  return best;
+}
+
+export function parseCsv(input: string, delimiter = sniffDelimiter(input)): string[][] {
   const rows: string[][] = [];
   let row: string[] = [];
   let field = '';
@@ -41,7 +81,7 @@ export function parseCsv(input: string): string[][] {
       continue;
     }
 
-    if (char === ',') {
+    if (char === delimiter) {
       row.push(field);
       field = '';
       i += 1;
@@ -78,12 +118,23 @@ export function parseCsv(input: string): string[][] {
 export interface CsvTable {
   headers: string[];
   rows: Array<Record<string, string>>;
+  /**
+   * The file ended inside a quoted field.
+   *
+   * Everything after the stray quote was swallowed into one value, so rows
+   * are missing. The parse still returns what it has -- half an import beats
+   * none -- but the caller has to be able to say so, because silently
+   * importing 40 of 4,000 contacts and reporting success is worse than
+   * failing outright.
+   */
+  unterminatedQuote: boolean;
 }
 
 /** Parse into objects keyed by lowercased, trimmed header. */
 export function parseCsvTable(input: string): CsvTable {
   const raw = parseCsv(input);
-  if (raw.length === 0) return { headers: [], rows: [] };
+  const unterminatedQuote = hasUnterminatedQuote(input);
+  if (raw.length === 0) return { headers: [], rows: [], unterminatedQuote };
 
   const headers = (raw[0] ?? []).map((header) => header.trim().toLowerCase());
   const rows = raw.slice(1).map((line) => {
@@ -94,7 +145,16 @@ export function parseCsvTable(input: string): CsvTable {
     return record;
   });
 
-  return { headers, rows };
+  return { headers, rows, unterminatedQuote };
+}
+
+/** An odd number of quote characters means one was never closed. */
+function hasUnterminatedQuote(input: string): boolean {
+  let quotes = 0;
+  for (let i = 0; i < input.length; i += 1) {
+    if (input[i] === '"') quotes += 1;
+  }
+  return quotes % 2 === 1;
 }
 
 /** First non-empty value among several candidate column names. */

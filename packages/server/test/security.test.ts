@@ -408,7 +408,10 @@ describe('share rewards need a genuine third-party click', () => {
 
     await recordLinkClickForShare(db(), tenant.id, share.link.code, { contactId: friend.id });
 
-    expect((await getBalance(tenant.id, sharer.id)).balance).toBe(25);
+    // 25 for the share rule and 25 for the Social Butterfly badge it earns.
+    // The badge counts verified shares rather than points, so it is evaluated
+    // when the share verifies rather than only when the rule awards.
+    expect((await getBalance(tenant.id, sharer.id)).balance).toBe(50);
   });
 });
 

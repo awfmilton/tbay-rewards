@@ -8,6 +8,7 @@ import { getTenantById } from '../src/services/tenants.js';
 import {
   assignRankManually,
   awardBadgeManually,
+  upsertBadge,
   badgesForContact,
   createCoupon,
   evaluateBadges,
@@ -23,6 +24,7 @@ import {
   upsertRank,
 } from '../src/services/gamification.js';
 import { upsertPointType } from '../src/services/point-types.js';
+import { forgetTimezone } from '../src/services/rewards.js';
 
 let tenant: TestTenant;
 
@@ -650,5 +652,71 @@ describe('the profile reports the rank the member actually holds (MEDIUM)', () =
 
     expect((await profile(tenant.id, contact)).rank?.key).toBe('spender');
     expect((await profile(tenant.id, contact, db(), 'status')).rank?.key).toBe('insider');
+  });
+});
+
+describe('the small refusals that keep a screen honest (LOW)', () => {
+  it('will not print a coupon that grants a badge nobody defined', async () => {
+    // It failed at redemption instead -- in front of the customer, on a code
+    // the retailer had already printed.
+    await expect(
+      createCoupon(tenant.id, { code: 'GHOST', points: 10, grantBadgeKey: 'no_such_badge' }),
+    ).rejects.toThrow(/grantBadgeKey "no_such_badge" does not exist/);
+
+    await expect(
+      createCoupon(tenant.id, { code: 'GHOST2', points: 10, grantRankKey: 'no_such_rank' }),
+    ).rejects.toThrow(/grantRankKey "no_such_rank" does not exist/);
+  });
+
+  it('still accepts a coupon granting something that exists', async () => {
+    await upsertBadge(tenant.id, { key: 'real_badge', name: 'Real' });
+    const coupon = await createCoupon(tenant.id, {
+      code: 'REAL', points: 10, grantBadgeKey: 'real_badge',
+    });
+    expect(coupon.code).toBe('REAL');
+  });
+
+  it('refuses a badge level the badge does not have', async () => {
+    // A three-tier badge showing "Level 20" has no artwork, no name and no
+    // meaning, and it lands on the customer's profile.
+    const contact = (await member('levels@example.com')).id;
+    await upsertBadge(tenant.id, {
+      key: 'tiered',
+      name: 'Tiered',
+      tiers: [
+        { level: 1, threshold: 1 },
+        { level: 2, threshold: 5 },
+        { level: 3, threshold: 10 },
+      ],
+    });
+
+    await expect(awardBadgeManually(tenant.id, contact, 'tiered', 20)).rejects.toThrow(
+      /has levels 1, 2, 3; 20 is not one of them/,
+    );
+    // The levels it does have still work.
+    await expect(awardBadgeManually(tenant.id, contact, 'tiered', 3)).resolves.toBeTruthy();
+  });
+});
+
+describe('a streak day belongs to the retailer, not the server (LOW)', () => {
+  it('rolls over at the store\'s midnight', async () => {
+    // CURRENT_DATE is UTC in production, so a Montana store's daily streak
+    // rolled over at five in the afternoon: somebody visiting each evening was
+    // counted twice on one day and missed the next, and their streak broke
+    // while they did exactly what was asked.
+    await db().query(`UPDATE tenants SET timezone = 'America/Denver' WHERE id = $1`, [tenant.id]);
+    forgetTimezone(tenant.id);
+    const contact = (await member('streaky@example.com')).id;
+
+    await recordStreak(tenant.id, contact, 'daily_login');
+
+    const { rows } = await db().query<{ last_day: string; store_day: string }>(
+      `SELECT s.last_day::text AS last_day,
+              (now() AT TIME ZONE 'America/Denver')::date::text AS store_day
+         FROM streaks s WHERE s.tenant_id = $1 AND s.contact_id = $2`,
+      [tenant.id, contact],
+    );
+
+    expect(rows[0]!.last_day).toBe(rows[0]!.store_day);
   });
 });

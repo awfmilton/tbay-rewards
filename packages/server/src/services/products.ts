@@ -96,11 +96,18 @@ export async function bumpProductStat(
 
   const column = metric;
   await runner.query(
+    // Clamped at zero, because `amount` may be negative: a refund unwinds the
+    // purchase it recorded, and a count below zero would be worse than the
+    // over-count it is correcting.
+    //
+    // The update adds $4 rather than EXCLUDED. EXCLUDED is the proposed row,
+    // which VALUES has already clamped to zero -- so a negative delta added
+    // nothing at all and the refund quietly did not happen.
     `INSERT INTO product_stats (tenant_id, product_ref, stat_date, ${column}, revenue_cents)
-     VALUES ($1, $2, $3::date, $4, $5)
+     VALUES ($1, $2, $3::date, GREATEST(0, $4::bigint), GREATEST(0, $5::bigint))
      ON CONFLICT (tenant_id, product_ref, stat_date) DO UPDATE SET
-       ${column}     = product_stats.${column} + EXCLUDED.${column},
-       revenue_cents = product_stats.revenue_cents + EXCLUDED.revenue_cents`,
+       ${column}     = GREATEST(0, product_stats.${column} + $4::bigint),
+       revenue_cents = GREATEST(0, product_stats.revenue_cents + $5::bigint)`,
     [tenantId, productRef, at.toISOString().slice(0, 10), amount, revenueCents],
   );
 }

@@ -230,7 +230,7 @@ export async function collect(
 
     let heatmapCells = 0;
     if (!isBot) {
-      heatmapCells = await ingestHeatmaps(client, tenant, session, payload, patterns, isNew);
+      heatmapCells = await ingestHeatmaps(client, tenant, session, payload, patterns);
 
       if (payload.cart) {
         await upsertCart(client, tenant.id, {
@@ -260,7 +260,6 @@ async function ingestHeatmaps(
   session: Session,
   payload: CollectPayload,
   patterns: string[],
-  isNewSession: boolean,
 ): Promise<number> {
   const batches = payload.heatmap ?? [];
   if (batches.length === 0) return 0;
@@ -291,9 +290,11 @@ async function ingestHeatmaps(
       viewportWidth: batch.viewportWidth ?? null,
     });
 
-    if (isNewSession && !countedPages.has(key)) {
+    // Once per session per page, decided by the dedupe table rather than by
+    // whether this happened to be the session's first request.
+    if (!countedPages.has(key)) {
       countedPages.add(key);
-      await countHeatmapSession(client, tenant.id, key, device);
+      await countHeatmapSession(client, tenant.id, key, device, session.id);
     }
   }
 

@@ -432,3 +432,98 @@ describe('concurrent ingest on a hot page', () => {
     expect(rows.map((row) => Number(row.views))).toEqual([24, 24, 24]);
   });
 });
+
+describe('reports count people, not crawlers (LOW)', () => {
+  it('keeps bot pageviews out of the top pages', async () => {
+    // Every other figure on the dashboard excludes bots; this one did not, so
+    // the pages a merchandiser reorders the shop around were whichever ones a
+    // crawler happened to like.
+    const human = ids();
+    await post({
+      ...human,
+      url: 'https://shop.example.com/quiet',
+      events: [{ type: 'pageview', path: '/quiet' }],
+    });
+
+    const crawler = ids();
+    for (let hit = 0; hit < 5; hit += 1) {
+      await post(
+        {
+          ...crawler,
+          url: 'https://shop.example.com/crawled',
+          events: [{ type: 'pageview', path: '/crawled' }],
+        },
+        BOT_UA,
+      );
+    }
+
+    const { topPages } = await import('../src/services/analytics.js');
+    const pages = await topPages(
+      tenant.id,
+      new Date(Date.now() - 60_000),
+      new Date(Date.now() + 60_000),
+    );
+
+    expect(pages.map((page) => page.path)).toEqual(['/quiet']);
+  });
+});
+
+describe('the heatmap says how many sessions it rests on (LOW)', () => {
+  it('counts a session whose first batch arrives on a later beat', async () => {
+    // The tracker flushes pointer samples on a timer, so a visitor who reads
+    // for a few seconds before moving the mouse sends their first batch after
+    // the session already exists. That used to count nobody, and the screen
+    // reported a heatmap built from no sessions at all beside a full set of
+    // cells -- which reads as broken, and hides how thin the data is.
+    const visit = ids();
+
+    // Beat one: a pageview, no pointer samples yet.
+    await post({
+      ...visit,
+      url: 'https://shop.example.com/product/flag',
+      events: [{ type: 'pageview', path: '/product/flag' }],
+    });
+
+    // Beat two: the samples.
+    await post({
+      ...visit,
+      url: 'https://shop.example.com/product/flag',
+      heatmap: [
+        {
+          page: 'https://shop.example.com/product/flag',
+          kind: 'move',
+          samples: [{ x: 0.5, y: 0.5, w: 1 }],
+        },
+      ],
+    });
+
+    const { rows } = await db().query<{ sample_sessions: number }>(
+      'SELECT sample_sessions FROM heatmap_pages WHERE tenant_id = $1',
+      [tenant.id],
+    );
+    expect(rows[0]!.sample_sessions).toBe(1);
+  });
+
+  it('counts one session once, however many batches it sends', async () => {
+    const visit = ids();
+    for (let beat = 0; beat < 3; beat += 1) {
+      await post({
+        ...visit,
+        url: 'https://shop.example.com/product/flag',
+        heatmap: [
+          {
+            page: 'https://shop.example.com/product/flag',
+            kind: 'move',
+            samples: [{ x: 0.5, y: 0.5, w: 1 }],
+          },
+        ],
+      });
+    }
+
+    const { rows } = await db().query<{ sample_sessions: number }>(
+      'SELECT sample_sessions FROM heatmap_pages WHERE tenant_id = $1',
+      [tenant.id],
+    );
+    expect(rows[0]!.sample_sessions).toBe(1);
+  });
+});

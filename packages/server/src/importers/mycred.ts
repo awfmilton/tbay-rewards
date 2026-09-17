@@ -3,7 +3,13 @@ import { upsertContact } from '../services/contacts.js';
 import { award } from '../services/points.js';
 import { evaluateRank } from '../services/gamification.js';
 import { parseCsvTable, pick } from './csv.js';
-import { emptyReport, recordError, type ImportOptions, type ImportReport } from './types.js';
+import {
+  emptyReport,
+  recordError,
+  warnIfTruncated,
+  type ImportOptions,
+  type ImportReport,
+} from './types.js';
 
 /**
  * Import myCred balances, badges and ranks.
@@ -29,6 +35,7 @@ export async function importMyCredBalances(
 ): Promise<ImportReport> {
   const report = emptyReport('mycred', options.dryRun === true);
   const table = parseCsvTable(input.csv);
+  warnIfTruncated(report, table);
 
   if (table.headers.length === 0) {
     report.warnings.push('The file appears to be empty.');
@@ -179,6 +186,7 @@ export async function importMyCredHistory(
 ): Promise<ImportReport> {
   const report = emptyReport('mycred_history', options.dryRun === true);
   const table = parseCsvTable(input.csv);
+  warnIfTruncated(report, table);
 
   if (table.headers.length === 0) {
     report.warnings.push('The file appears to be empty.');

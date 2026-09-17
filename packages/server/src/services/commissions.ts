@@ -403,6 +403,34 @@ export async function refundOrder(
       [tenant.id, orderRef],
     );
 
+    // The merchandising numbers, unwound on the day the order was placed.
+    //
+    // A refunded order kept counting as a purchase, with its revenue, so a
+    // product with a heavy return rate read as a bestseller on the screen
+    // buyers restock from. Dated to the original order rather than to today,
+    // so the day's figures net out where they were wrong rather than pushing
+    // the correction into a week nobody is looking at.
+    const sold = await queryOne<{ items: Array<Record<string, unknown>>; placed_at: Date }>(
+      client,
+      'SELECT items, placed_at FROM orders WHERE tenant_id = $1 AND order_ref = $2',
+      [tenant.id, orderRef],
+    );
+    for (const item of sold?.items ?? []) {
+      const productRef = typeof item.productRef === 'string' ? item.productRef : null;
+      if (!productRef) continue;
+      const quantity = Number(item.quantity ?? 1);
+      const subtotal = Number(item.subtotalCents ?? 0);
+      await bumpProductStat(
+        client,
+        tenant.id,
+        productRef,
+        'purchases',
+        -Math.max(1, Number.isFinite(quantity) ? quantity : 1),
+        -(Number.isFinite(subtotal) ? subtotal : 0),
+        sold?.placed_at ?? new Date(),
+      );
+    }
+
     // Everything this order paid out, not only the purchase line.
     //
     // Reversing `rule_key = 'purchase'` alone left every other award the order
