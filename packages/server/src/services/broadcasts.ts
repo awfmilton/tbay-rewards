@@ -87,6 +87,14 @@ export async function upsertBroadcast(
      */
     blocks?: unknown;
     preheader?: string | null;
+    /**
+     * Which topic this send belongs to.
+     *
+     * Omitted, it is inherited from the template — which is where a retailer
+     * sets it. Null means the send belongs to no topic, so it reaches everyone
+     * who consents whatever they chose per topic.
+     */
+    topicKey?: string | null;
   },
   runner: Queryable = db(),
 ): Promise<Broadcast> {
@@ -141,10 +149,20 @@ export async function upsertBroadcast(
   // `EXCLUDED.send_at` turned every such save into "draft, never sends".
   const sendAt = input.sendAt === undefined ? existing?.send_at ?? null : input.sendAt;
 
+  // Which topic this send belongs to, so a recipient's per-topic choice is
+  // honoured. The column existed and nothing ever wrote it, which made the
+  // preference centre work for automations and do nothing for campaigns — the
+  // one kind of mail people actually turn off.
+  let topicKey = input.topicKey === undefined ? existing?.topic_key ?? null : input.topicKey;
+
   if (templateKey) {
-    if (!(await getTemplate(tenantId, templateKey, runner))) {
+    const namedTemplate = await getTemplate(tenantId, templateKey, runner);
+    if (!namedTemplate) {
       throw ApiError.notFound(`No email template "${templateKey}"`);
     }
+    // Inherited unless the caller said otherwise: the topic belongs to the
+    // message, and the message is the template's.
+    if (input.topicKey === undefined) topicKey = namedTemplate.topic_key ?? null;
     if (input.preheader) {
       // It would be stored and never read: the template's own preheader is
       // already rendered into the body this send goes out with.
@@ -164,10 +182,11 @@ export async function upsertBroadcast(
   const row = await queryOne<Broadcast>(
     runner,
     `INSERT INTO broadcasts
-       (tenant_id, key, name, segment_id, template_key, subject, send_at, status, blocks, preheader)
+       (tenant_id, key, name, segment_id, template_key, subject, send_at, status,
+        blocks, preheader, topic_key)
      VALUES ($1, $2, $3, $4, $5, $6, $7,
              CASE WHEN $7::timestamptz IS NULL THEN 'draft' ELSE 'scheduled' END,
-             $8::jsonb, $9)
+             $8::jsonb, $9, $10)
      ON CONFLICT (tenant_id, key) DO UPDATE SET
        name = COALESCE(EXCLUDED.name, broadcasts.name),
        segment_id = COALESCE(EXCLUDED.segment_id, broadcasts.segment_id),
@@ -179,6 +198,7 @@ export async function upsertBroadcast(
        status = CASE WHEN EXCLUDED.send_at IS NULL THEN 'draft' ELSE 'scheduled' END,
        blocks = EXCLUDED.blocks,
        preheader = EXCLUDED.preheader,
+       topic_key = EXCLUDED.topic_key,
        updated_at = now()
      RETURNING *`,
     [
@@ -191,6 +211,7 @@ export async function upsertBroadcast(
       sendAt,
       blocks,
       preheader,
+      topicKey,
     ],
   );
   return row!;
@@ -233,8 +254,12 @@ export async function cancelBroadcast(
 ): Promise<Broadcast> {
   const row = await queryOne<Broadcast>(
     runner,
+    // `failed` included: a broadcast that hit an exception mid-walk could not
+    // be cancelled, could not be edited, and could not be re-armed — its key
+    // was spent and the rest of its audience never heard from it.
     `UPDATE broadcasts SET status = 'cancelled', finished_at = now(), updated_at = now()
-      WHERE tenant_id = $1 AND key = $2 AND status IN ('draft', 'scheduled', 'sending')
+      WHERE tenant_id = $1 AND key = $2
+        AND status IN ('draft', 'scheduled', 'sending', 'failed')
       RETURNING *`,
     [tenantId, key],
   );
@@ -583,7 +608,11 @@ export async function startBroadcast(
   const broadcast = await getBroadcast(tenantId, key, runner);
   if (!broadcast) throw ApiError.notFound(`No broadcast "${key}"`);
   if (!broadcast.segment_id) throw ApiError.badRequest('That broadcast has no segment');
-  if (broadcast.status !== 'draft' && broadcast.status !== 'scheduled') {
+  // `failed` can be armed again: the walk stopped on an exception partway
+  // through, and the cursor plus the per-recipient dedupe key mean resuming
+  // picks up where it stopped without mailing anybody twice. Leaving it stuck
+  // meant the rest of the audience never got the message at all.
+  if (!['draft', 'scheduled', 'failed'].includes(broadcast.status)) {
     throw ApiError.conflict(`That broadcast is already ${broadcast.status}`);
   }
 
@@ -598,6 +627,28 @@ export async function startBroadcast(
     [broadcast.segment_id],
   );
   const size = segment ? (await segmentAudience(tenantId, segment.key, { limit: 10_000 }, runner)).length : 0;
+
+  // A segment nobody has built yet has no members, so the walk finishes
+  // immediately, marks the send `sent` — to nobody — and reports success. The
+  // builder runs every ten minutes and saving a segment does not build it, so
+  // "create the segment, then send" within that window silently sent nothing.
+  //
+  // Only the never-built case is refused. A built segment that happens to be
+  // empty right now is a legitimate thing to arm: a send scheduled for Friday
+  // does not need its audience to exist on Tuesday.
+  if (segment) {
+    const built = await queryOne<{ last_built_at: Date | null }>(
+      runner,
+      'SELECT last_built_at FROM segments WHERE tenant_id = $1 AND key = $2',
+      [tenantId, segment.key],
+    );
+    if (!built?.last_built_at) {
+      throw ApiError.badRequest(
+        `The segment "${segment.key}" has not been built yet, so it has nobody in it. ` +
+          'Build it, then send.',
+      );
+    }
+  }
 
   const row = await queryOne<Broadcast>(
     runner,

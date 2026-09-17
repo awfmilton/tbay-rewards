@@ -60,16 +60,23 @@ export async function runCartRecovery(): Promise<RecoveryRun> {
 }
 
 async function queueRecoveryEmail(cart: RecoveryCandidate): Promise<boolean> {
-  if (!cart.email) return false;
-  // Recovery mail is transactional-adjacent but still marketing; respect consent.
-  if (!cart.marketing_consent) return false;
+  // Recovery mail is marketing, so consent is required — and it is now part of
+  // the query that picks candidates, because returning early here left the
+  // cart due forever and stalled the whole queue behind it.
+  if (!cart.email || !cart.marketing_consent) return false;
 
   const tenant = await getTenantById(cart.tenant_id);
   if (!tenant) return false;
 
   const stage = cart.recovery_stage + 1;
   const template = await getTemplate(tenant.id, `cart_recovery_${stage}`);
-  if (!template) return false;
+  if (!template) {
+    // A retailer who deleted this stage's template does not want this stage.
+    // Advanced rather than skipped, so the cart moves on to the next one
+    // instead of being re-selected every minute for the rest of its life.
+    await advanceRecoveryStage(db(), cart.id, stage);
+    return false;
+  }
 
   const base = config().publicUrl;
   const unsubscribeUrl = unsubscribeRequestUrl(tenant.id, cart.email);

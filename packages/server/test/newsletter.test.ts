@@ -278,7 +278,17 @@ describe('email queue', () => {
     });
 
     await subscribe(await tenantObject(), { email: 'reader@example.com' });
-    for (let i = 0; i < 6; i += 1) await flushEmailQueue();
+    for (let i = 0; i < 6; i += 1) {
+      await flushEmailQueue();
+      // Retries back off — 1, 2, 4, 8 minutes — so that five attempts spread
+      // over a quarter of an hour instead of a minute. Without the wait, an
+      // hour of throttling from the provider suppressed the address for thirty
+      // days. Nothing here is waiting a quarter of an hour, so the clock moves.
+      await db().query(
+        'UPDATE email_messages SET next_attempt_at = now() WHERE tenant_id = $1',
+        [tenant.id],
+      );
+    }
 
     expect(attempts).toBe(5);
     const { rows } = await db().query('SELECT status, attempts FROM email_messages WHERE tenant_id = $1', [

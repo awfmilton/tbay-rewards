@@ -466,6 +466,64 @@ describe('configuration preflight', () => {
     }
   });
 
+  it('refuses a production deployment with weak or shared secrets', async () => {
+    const { resetConfig } = await import('../src/config.js');
+    const { preflight } = await import('../src/lib/preflight.js');
+
+    const saved = {
+      env: process.env.NODE_ENV,
+      salt: process.env.IDENTITY_SALT,
+      token: process.env.TOKEN_SECRET,
+      url: process.env.PUBLIC_URL,
+    };
+
+    try {
+      process.env.NODE_ENV = 'production';
+
+      // Short enough to brute-force. TOKEN_SECRET signs unsubscribe and
+      // preference links; IDENTITY_SALT is what stops a hashed email being
+      // reversed with a wordlist.
+      process.env.IDENTITY_SALT = 'short';
+      process.env.TOKEN_SECRET = 'alsoshort';
+      process.env.PUBLIC_URL = 'https://rewards.example.com';
+      resetConfig();
+      expect(preflight().map((f) => f.code)).toContain('weak_secret');
+
+      // One value doing two jobs: a weakness in either is a weakness in both.
+      const shared = 'a'.repeat(48);
+      process.env.IDENTITY_SALT = shared;
+      process.env.TOKEN_SECRET = shared;
+      resetConfig();
+      expect(preflight().map((f) => f.code)).toContain('shared_secret');
+
+      // Cookies are Secure in production, so over plain http the browser never
+      // sends them back and attribution silently stops.
+      process.env.IDENTITY_SALT = 'a'.repeat(48);
+      process.env.TOKEN_SECRET = 'b'.repeat(48);
+      process.env.PUBLIC_URL = 'http://rewards.example.com';
+      resetConfig();
+      expect(preflight().map((f) => f.code)).toContain('insecure_public_url');
+
+      // And a sound configuration raises none of them.
+      process.env.PUBLIC_URL = 'https://rewards.example.com';
+      resetConfig();
+      const codes = preflight().map((f) => f.code);
+      expect(codes).not.toContain('weak_secret');
+      expect(codes).not.toContain('shared_secret');
+      expect(codes).not.toContain('insecure_public_url');
+    } finally {
+      if (saved.env === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = saved.env;
+      if (saved.salt === undefined) delete process.env.IDENTITY_SALT;
+      else process.env.IDENTITY_SALT = saved.salt;
+      if (saved.token === undefined) delete process.env.TOKEN_SECRET;
+      else process.env.TOKEN_SECRET = saved.token;
+      if (saved.url === undefined) delete process.env.PUBLIC_URL;
+      else process.env.PUBLIC_URL = saved.url;
+      resetConfig();
+    }
+  });
+
   it('rejects a cap larger than the L1 reserve can back', async () => {
     const { resetConfig } = await import('../src/config.js');
     const { preflight } = await import('../src/lib/preflight.js');

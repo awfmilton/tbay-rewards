@@ -896,6 +896,9 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
       // clears it and goes back to the template.
       blocks: z.array(z.record(z.unknown())).max(60).nullish(),
       preheader: z.string().max(200).nullish(),
+      // Omitted, a send inherits its template's topic. Null sends it to
+      // everybody who consents, whatever they chose per topic.
+      topicKey: z.string().regex(/^[a-z0-9_]{2,40}$/).nullish(),
     });
     const input = parse(schema, request.body);
     return { broadcast: await upsertBroadcast(tenant.id, { key: request.params.key, ...input }) };

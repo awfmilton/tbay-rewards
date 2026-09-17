@@ -138,17 +138,63 @@ export function preflight(): PreflightFinding[] {
     });
   }
 
-  for (const [key, value] of [
+  const secrets = [
     ['IDENTITY_SALT', cfg.security.identitySalt],
     ['TOKEN_SECRET', cfg.security.tokenSecret],
-  ] as const) {
-    if (cfg.isProduction && value.startsWith('dev-')) {
+  ] as const;
+
+  for (const [key, value] of secrets) {
+    if (!cfg.isProduction) continue;
+
+    if (value.startsWith('dev-')) {
       findings.push({
         level: 'error',
         code: 'default_secret',
         message: `${key} is still the development default in production.`,
       });
+      continue;
     }
+
+    // Short enough to brute-force is short enough to matter: `TOKEN_SECRET`
+    // signs unsubscribe and preference links, and `IDENTITY_SALT` is what
+    // stops a hashed email being reversed with a wordlist.
+    if (value.length < 32) {
+      findings.push({
+        level: 'error',
+        code: 'weak_secret',
+        message:
+          `${key} is ${value.length} characters. Use at least 32 random ones — ` +
+          '`openssl rand -hex 32`.',
+      });
+    }
+  }
+
+  // One value doing two jobs means a weakness in either is a weakness in both,
+  // and rotating one silently rotates the other.
+  if (
+    cfg.isProduction &&
+    cfg.security.identitySalt !== '' &&
+    cfg.security.identitySalt === cfg.security.tokenSecret
+  ) {
+    findings.push({
+      level: 'error',
+      code: 'shared_secret',
+      message: 'IDENTITY_SALT and TOKEN_SECRET are the same value. Generate them separately.',
+    });
+  }
+
+  // Attribution and preference cookies are set `Secure` in production, so a
+  // plain-http public URL means the browser never sends them back and
+  // attribution silently stops working.
+  if (cfg.isProduction && cfg.publicUrl.startsWith('http://')) {
+    findings.push({
+      level: 'error',
+      code: 'insecure_public_url',
+      message:
+        `PUBLIC_URL is ${cfg.publicUrl}. Cookies are set Secure in production, so ` +
+        'over plain http the browser will never send them back: attribution, ' +
+        'unsubscribe links and the preference centre all stop working.',
+    });
   }
 
   return findings;

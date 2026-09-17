@@ -325,13 +325,22 @@ async function completeSubscription(
 
   const balance = await getBalance(tenant.id, contact.id, client);
   const base = config().publicUrl;
+  // A signed request link when there is no list token, rather than the site
+  // root. After a double opt-in confirmation the token has already been spent,
+  // so the welcome email carried an "unsubscribe" link that went to the
+  // homepage and no List-Unsubscribe header at all — the one message most
+  // likely to be the first a person wants out of.
+  const unsubscribeUrl = unsubToken
+    ? `${base}/n/unsubscribe/${unsubToken}`
+    : unsubscribeRequestUrl(tenant.id, contact.email);
+
   const rendered = renderTemplate(template, {
     tenant_name: tenant.name,
     name: contact.name ?? '',
     points: outcome.awarded ? outcome.points : 0,
     balance: balance.balance,
     rewards_url: (tenant.settings?.siteUrl as string) ?? base,
-    unsubscribe_url: unsubToken ? `${base}/n/unsubscribe/${unsubToken}` : base,
+    unsubscribe_url: unsubscribeUrl,
   });
 
   await queueEmail(
@@ -344,9 +353,11 @@ async function completeSubscription(
       html: rendered.html,
       text: rendered.text,
       dedupeKey: `newsletter_welcome:${subscription.id}`,
-      // A welcome carries the list's real token, which is what makes the mail
-      // client's one-click unsubscribe work for the whole subscription.
-      unsubscribeUrl: unsubToken ? `${base}/n/unsubscribe/${unsubToken}` : null,
+      // A welcome carries the list's real token where there is one, which is
+      // what makes the mail client's one-click unsubscribe work for the whole
+      // subscription — and a signed request link otherwise, so the header is
+      // there either way.
+      unsubscribeUrl,
       ...senderFor(tenant),
     },
     client,

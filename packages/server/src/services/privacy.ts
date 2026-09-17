@@ -201,6 +201,50 @@ export async function eraseContact(
       [tenantId, contactId, emailHash],
     );
 
+    // The cross-tenant identity row.
+    //
+    // `members` links one person's contacts across every retailer on the
+    // platform, keyed by a hash of their address and their wallet. Stripping
+    // the contact row while leaving that intact meant an erased record was
+    // still trivially re-linkable: hash the address again and the row is
+    // right there, pointing at the contact that is supposed to have been
+    // forgotten.
+    //
+    // Detached rather than deleted: the member may hold contacts at other
+    // retailers who have not asked to be erased, and their linkage is theirs.
+    // The identifiers only go when this was the last contact using them.
+    const { rows: memberRows } = await client.query<{ member_id: string | null }>(
+      'SELECT member_id FROM contacts WHERE tenant_id = $1 AND id = $2',
+      [tenantId, contactId],
+    );
+    const memberId = memberRows[0]?.member_id ?? null;
+
+    await client.query(
+      'UPDATE contacts SET member_id = NULL WHERE tenant_id = $1 AND id = $2',
+      [tenantId, contactId],
+    );
+
+    if (memberId) {
+      await client.query(
+        `UPDATE members SET email_hash = NULL, wallet_address = NULL, updated_at = now()
+          WHERE id = $1
+            AND NOT EXISTS (SELECT 1 FROM contacts WHERE member_id = $1)`,
+        [memberId],
+      );
+    }
+
+    // The audit log records who did what, and its `target` is the address the
+    // operator typed — including on the erase request itself. Replaced with
+    // the same salted hash the contact row keeps, so the record of the action
+    // survives without the address surviving with it.
+    await client.query(
+      `UPDATE audit_log
+          SET target = 'erased:' || $2
+        WHERE tenant_id = $1 AND target IS NOT NULL AND $2 <> ''
+          AND lower(target) = lower($3)`,
+      [tenantId, emailHash, contact.email ?? contact.email_normalised ?? ''],
+    );
+
     await client.query(
       `INSERT INTO erasure_log (
          tenant_id, contact_id, email_hash, reason, requested_by, points_forfeited, rows_deleted
@@ -483,16 +527,34 @@ export async function runRetentionSweep(
     }
 
     if (policy.session_days !== null) {
+      // `events.session_id` cascades, so deleting a session takes its events
+      // with it — whatever the event policy says. A tenant keeping events
+      // forever and sessions for thirty days was losing every event older than
+      // thirty days, in an unbounded cascade behind a bounded delete.
+      //
+      // So a session is only removed once its events are out of retention too.
+      // A tenant who keeps events forever keeps the sessions that hold them,
+      // which is the honest reading of "keep events forever".
       bump(
         'sessions',
         await deleteBatch(
           runner,
           `DELETE FROM sessions WHERE ctid IN (
-             SELECT ctid FROM sessions
-              WHERE tenant_id = $1 AND started_at < now() - ($2 || ' days')::interval
+             SELECT s.ctid FROM sessions s
+              WHERE s.tenant_id = $1 AND s.started_at < now() - ($2 || ' days')::interval
+                AND ($3::text IS NOT NULL)
+                AND NOT EXISTS (
+                  SELECT 1 FROM events e
+                   WHERE e.session_id = s.id
+                     AND e.occurred_at >= now() - ($3 || ' days')::interval
+                )
               LIMIT ${batchSize}
            )`,
-          [policy.tenant_id, String(policy.session_days)],
+          [
+            policy.tenant_id,
+            String(policy.session_days),
+            policy.event_days === null ? null : String(policy.event_days),
+          ],
         ),
       );
     }
@@ -500,11 +562,20 @@ export async function runRetentionSweep(
     if (policy.email_body_days !== null) {
       // The body only. Delivery metadata is what a suppression list is
       // justified by, and deleting it makes every suppression unexplainable.
+      //
+      // Bounded like every other leg. Unbounded, the first pass after a
+      // retailer enabled this rewrote every old message in one transaction —
+      // multi-kilobyte rows, all of it through the WAL at once — on a table
+      // that is usually the largest one they have.
       const { rowCount } = await runner.query(
         `UPDATE email_messages SET html = '', text = NULL
-          WHERE tenant_id = $1
-            AND created_at < now() - ($2 || ' days')::interval
-            AND (html <> '' OR text IS NOT NULL)`,
+          WHERE ctid IN (
+            SELECT ctid FROM email_messages
+             WHERE tenant_id = $1
+               AND created_at < now() - ($2 || ' days')::interval
+               AND (html <> '' OR text IS NOT NULL)
+             LIMIT ${batchSize}
+          )`,
         [policy.tenant_id, String(policy.email_body_days)],
       );
       bump('email_bodies', rowCount ?? 0);

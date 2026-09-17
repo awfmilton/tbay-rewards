@@ -390,6 +390,25 @@ export async function reverse(
   options: ReverseOptions = {},
 ): Promise<LedgerEntry | null> {
   const run = async (client: Queryable): Promise<LedgerEntry | null> => {
+    // Which contact this entry belongs to, so the contact can be held before
+    // anything else is locked. Read without a lock: the row it names cannot
+    // change, and taking the ledger lock first is exactly the inversion this
+    // avoids.
+    const owner = await queryOne<{ contact_id: string }>(
+      client,
+      'SELECT contact_id FROM points_ledger WHERE tenant_id = $1 AND id = $2',
+      [tenantId, entryId],
+    );
+    if (!owner) return null;
+
+    // Contact, then ledger, then balance — the order `holdContact` documents
+    // and the order a merge takes. Reversing took the ledger row first and the
+    // balance second, which is the opposite of the merge's contact→balance→
+    // ledger, so a refund racing a merge deadlocked and Postgres aborted one of
+    // them: an HTTP 500 that rolled back the whole refund, leaving the points
+    // un-clawed-back and the commissions still payable.
+    await holdContact(client, tenantId, owner.contact_id);
+
     const original = await queryOne<LedgerEntry>(
       client,
       `SELECT * FROM points_ledger
@@ -485,6 +504,10 @@ export async function releaseMaturedPoints(runner: Queryable = db()): Promise<nu
     );
 
     for (const row of rows) {
+      // Same ordering as everywhere else. This sweep already holds the ledger
+      // rows it claimed, so without it a merge holding those contacts would
+      // wait on the ledger while this waited on the balances.
+      await holdContact(client, row.tenant_id, row.contact_id);
       await applyToBalance(client, row.tenant_id, row.contact_id, {
         balance: row.delta_points,
         pending: -row.delta_points,

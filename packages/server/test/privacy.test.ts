@@ -85,6 +85,58 @@ async function seedMember(email = 'erase-me@example.com') {
 }
 
 describe('erasure keeps the retailer’s books', () => {
+  it('leaves nothing that re-links the erased record to the address', async () => {
+    // `members` links one person's contacts across every retailer on the
+    // platform, keyed by a hash of their address. Stripping the contact row
+    // and leaving that intact meant hashing the address again found the row
+    // pointing straight back at the contact that was supposed to be forgotten.
+    const contact = (await upsertContact(tenant.id, { email: 'relink@example.com' })).id;
+    const before = await db().query<{ member_id: string | null }>(
+      'SELECT member_id FROM contacts WHERE id = $1',
+      [contact],
+    );
+    const memberId = before.rows[0]!.member_id;
+    expect(memberId).not.toBeNull();
+
+    await eraseContact(tenant.id, contact, { reason: 'request' });
+
+    const after = await db().query<{ member_id: string | null }>(
+      'SELECT member_id FROM contacts WHERE id = $1',
+      [contact],
+    );
+    expect(after.rows[0]!.member_id).toBeNull();
+
+    const { rows: member } = await db().query<{ email_hash: string | null; wallet_address: string | null }>(
+      'SELECT email_hash, wallet_address FROM members WHERE id = $1',
+      [memberId],
+    );
+    // This was their only contact, so the identifiers go with it.
+    expect(member[0]!.email_hash).toBeNull();
+    expect(member[0]!.wallet_address).toBeNull();
+  });
+
+  it('takes the address out of the audit log too', async () => {
+    // The audit log records who did what, and its target is the address an
+    // operator typed — including on the erase request itself.
+    const contact = (await upsertContact(tenant.id, { email: 'audited@example.com' })).id;
+    await db().query(
+      `INSERT INTO audit_log (tenant_id, action, status, target)
+       VALUES ($1, 'POST /v1/privacy/erase', 200, 'audited@example.com')`,
+      [tenant.id],
+    );
+
+    await eraseContact(tenant.id, contact, { reason: 'request' });
+
+    const { rows } = await db().query<{ target: string }>(
+      'SELECT target FROM audit_log WHERE tenant_id = $1',
+      [tenant.id],
+    );
+    for (const row of rows) {
+      expect(row.target).not.toContain('audited@example.com');
+    }
+    expect(rows.some((row) => row.target.startsWith('erased:'))).toBe(true);
+  });
+
   it('strips every identifier while the ledger survives', async () => {
     const contact = await seedMember();
     const before = await db().query(
@@ -538,5 +590,73 @@ describe('an erased person reads as erased', () => {
     );
     expect(after.contact.erased_at).not.toBeNull();
     expect(after.contact.email).toBeNull();
+  });
+});
+
+describe('retention deletes what the policy names, and no more', () => {
+  it('does not take events with a session when events are kept forever', async () => {
+    // `events.session_id` cascades. Deleting a session by the session policy
+    // took its events too, whatever the event policy said — so "keep events
+    // forever, keep sessions thirty days" quietly destroyed the events.
+    const { runRetentionSweep } = await import('../src/services/privacy.js');
+
+    await authed('PUT', '/v1/privacy/retention', { sessionDays: 30, eventDays: null });
+
+    const { rows: visitor } = await db().query<{ id: string }>(
+      `INSERT INTO visitors (tenant_id, anon_id) VALUES ($1, gen_random_uuid()::text)
+       RETURNING id`,
+      [tenant.id],
+    );
+    const { rows: session } = await db().query<{ id: string }>(
+      `INSERT INTO sessions (tenant_id, visitor_id, client_session_id, started_at, last_event_at)
+       VALUES ($1, $2, 'cs-keep', now() - interval '90 days',
+               now() - interval '90 days')
+       RETURNING id`,
+      [tenant.id, visitor[0]!.id],
+    );
+    await db().query(
+      `INSERT INTO events (tenant_id, session_id, type, occurred_at)
+       VALUES ($1, $2, 'pageview', now() - interval '90 days')`,
+      [tenant.id, session[0]!.id],
+    );
+
+    await runRetentionSweep();
+
+    const { rows: left } = await db().query<{ n: string }>(
+      'SELECT count(*) AS n FROM events WHERE tenant_id = $1',
+      [tenant.id],
+    );
+    expect(Number(left[0]!.n)).toBe(1);
+  });
+
+  it('removes the session once its events are out of retention too', async () => {
+    const { runRetentionSweep } = await import('../src/services/privacy.js');
+    await authed('PUT', '/v1/privacy/retention', { sessionDays: 30, eventDays: 30 });
+
+    const { rows: visitor } = await db().query<{ id: string }>(
+      `INSERT INTO visitors (tenant_id, anon_id) VALUES ($1, gen_random_uuid()::text)
+       RETURNING id`,
+      [tenant.id],
+    );
+    const { rows: session } = await db().query<{ id: string }>(
+      `INSERT INTO sessions (tenant_id, visitor_id, client_session_id, started_at, last_event_at)
+       VALUES ($1, $2, 'cs-sweep', now() - interval '90 days',
+               now() - interval '90 days')
+       RETURNING id`,
+      [tenant.id, visitor[0]!.id],
+    );
+    await db().query(
+      `INSERT INTO events (tenant_id, session_id, type, occurred_at)
+       VALUES ($1, $2, 'pageview', now() - interval '90 days')`,
+      [tenant.id, session[0]!.id],
+    );
+
+    await runRetentionSweep();
+
+    const { rows: left } = await db().query<{ n: string }>(
+      'SELECT count(*) AS n FROM sessions WHERE tenant_id = $1',
+      [tenant.id],
+    );
+    expect(Number(left[0]!.n)).toBe(0);
   });
 });

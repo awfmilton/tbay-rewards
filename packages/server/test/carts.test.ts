@@ -270,3 +270,44 @@ describe('cart recovery emails', () => {
     expect(stats.abandonment_rate).toBeCloseTo(0.6667, 3);
   });
 });
+
+describe('the recovery queue does not stall', () => {
+  it('does not let carts nobody may email block the ones we may', async () => {
+    // The worker returned early for a contact without consent and never
+    // advanced the stage, so the cart stayed due forever. The batch is the 200
+    // oldest carts platform-wide and consent defaults to false, so those carts
+    // filled the window permanently and recovery mail stopped for everybody.
+    const { dueForRecovery } = await import('../src/services/carts.js');
+
+    const older = new Date(Date.now() - 48 * 3600 * 1000);
+    for (let n = 0; n < 3; n += 1) {
+      const contact = await upsertContact(tenant.id, {
+        email: `nocondsent${n}@example.com`,
+        marketingConsent: false,
+      });
+      await db().query(
+        `INSERT INTO carts (tenant_id, contact_id, cart_token, status, item_count,
+                            subtotal_cents, currency, abandoned_at, recovery_token)
+         VALUES ($1, $2, $3, 'abandoned', 2, 5000, 'USD', $4, $5)`,
+        [tenant.id, contact.id, `stall-${n}`, older, `rt-stall-${n}`],
+      );
+    }
+
+    // One newer cart from somebody who did consent.
+    const willing = await upsertContact(tenant.id, {
+      email: 'willing@example.com',
+      marketingConsent: true,
+    });
+    await db().query(
+      `INSERT INTO carts (tenant_id, contact_id, cart_token, status, item_count,
+                          subtotal_cents, currency, abandoned_at, recovery_token)
+       VALUES ($1, $2, 'willing-1', 'abandoned', 1, 2500, 'USD', $3, 'rt-willing')`,
+      [tenant.id, willing.id, new Date(Date.now() - 4 * 3600 * 1000)],
+    );
+
+    // Even with a window smaller than the number of stuck carts, the one we
+    // may actually email is the one that comes back.
+    const due = await dueForRecovery(db(), 2);
+    expect(due.map((cart) => cart.recovery_token)).toEqual(['rt-willing']);
+  });
+});

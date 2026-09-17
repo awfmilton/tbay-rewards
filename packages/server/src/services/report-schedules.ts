@@ -156,15 +156,27 @@ export function periodKey(cadence: Cadence, local: Date): string {
   return `${thursday.getUTCFullYear()}-W${String(week).padStart(2, '0')}`;
 }
 
-/** Wall-clock time at the tenant, as a Date whose UTC fields read local. */
+/**
+ * Wall-clock time at the tenant, as a Date whose UTC fields read local.
+ *
+ * Returned as text and reassembled here rather than let through as a
+ * timestamp. `now() AT TIME ZONE $1` is a `timestamp without time zone`, and
+ * node-postgres parses one of those using the *process* timezone — so on a
+ * container running anything but UTC, the fields this function promises were
+ * shifted by the host's offset. A London tenant on a Toronto host read four
+ * hours ahead: reports fired early, and weekly and monthly ones landed on the
+ * wrong day because the weekday and date had rolled.
+ */
 async function localNow(tenantId: string, runner: Queryable): Promise<Date> {
   const zone = await tenantTimezone(tenantId, runner);
-  const row = await queryOne<{ local: Date }>(
+  const row = await queryOne<{ local: string }>(
     runner,
-    `SELECT (now() AT TIME ZONE $1) AS local`,
+    `SELECT to_char(now() AT TIME ZONE $1, 'YYYY-MM-DD"T"HH24:MI:SS') AS local`,
     [zone],
   );
-  return row!.local;
+  // The `Z` is what makes the UTC getters read the tenant's wall clock, which
+  // is what `periodKey` and `isDue` are written against.
+  return new Date(`${row!.local}Z`);
 }
 
 export function isDue(schedule: ReportSchedule, local: Date): boolean {
@@ -211,8 +223,27 @@ export async function runDueReports(runner: Queryable = db()): Promise<number> {
       );
       if ((rowCount ?? 0) === 0) continue;
 
-      await sendOne(schedule as never, period, runner);
-      sent += 1;
+      try {
+        await sendOne(schedule as never, period, runner);
+        sent += 1;
+      } catch (err) {
+        // Hand the period back. The claim is written before the send so two
+        // workers cannot both send — but keeping it after a failure meant the
+        // period was simply skipped: Monday's report never went and never
+        // retried, because the next pass saw the period already claimed.
+        //
+        // Safe to retry: `sendOne` queues with a dedupe key per recipient and
+        // period, so a failure after some messages were queued does not
+        // produce a second copy of them.
+        await runner
+          .query(
+            `UPDATE report_schedules SET last_period = $2
+              WHERE id = $1 AND last_period = $3`,
+            [schedule.id, schedule.last_period, period],
+          )
+          .catch(() => {});
+        throw err;
+      }
     } catch (err) {
       await runner
         .query(

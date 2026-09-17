@@ -193,6 +193,13 @@ export async function dueForRecovery(
       WHERE c.status = 'abandoned'
         AND c.item_count > 0
         AND ct.email IS NOT NULL
+        -- Filtered here, not in the worker. The worker returned early for a
+        -- contact without consent and never advanced the stage, so the cart
+        -- stayed due forever — and because the batch is the 200 oldest carts
+        -- platform-wide, and consent defaults to false, those carts filled the
+        -- window permanently. Recovery mail stopped for everybody, quietly,
+        -- once 200 of them had accumulated.
+        AND ct.marketing_consent
         AND c.recovery_stage < $1
         AND c.abandoned_at < now() - ((($2::numeric[])[c.recovery_stage + 1]) || ' hours')::interval
       ORDER BY c.abandoned_at

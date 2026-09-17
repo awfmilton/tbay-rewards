@@ -135,7 +135,7 @@ interface CompiledQuery {
 }
 
 /** The retailer's own fields, as the compiler wants them: key to kind. */
-async function customFieldsFor(tenantId: string, runner: Queryable): Promise<CustomFields> {
+export async function customFieldsFor(tenantId: string, runner: Queryable): Promise<CustomFields> {
   const fields = await listFields(tenantId, runner);
   return new Map(fields.map((field) => [field.key, field.kind]));
 }

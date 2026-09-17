@@ -142,9 +142,14 @@ describe('an outage does not suppress everyone (MEDIUM)', () => {
     }
   });
 
-  it('still spots a real hard bounce and a real complaint', () => {
+  it('still spots a real hard bounce, and treats a spam rejection as soft', () => {
     expect(classifyFailure('550 5.1.1 User unknown')).toBe('hard');
-    expect(classifyFailure('Message refused: recipient reported as spam')).toBe('complaint');
+    // Not a complaint. An SMTP reply mentioning spam is the receiver refusing
+    // our message, and reading it as a complaint suppressed the address
+    // permanently and withdrew that person's consent — so Gmail blocking our
+    // content for an hour took the whole batch off the list. Real complaints
+    // arrive out of band.
+    expect(classifyFailure('Message refused: recipient reported as spam')).toBe('soft');
   });
 
   it('lets a repeated-failure suppression lapse rather than lasting forever', async () => {
@@ -422,6 +427,54 @@ describe('the public site key cannot rewrite a known customer (MEDIUM)', () => {
       "SELECT name FROM contacts WHERE email_normalised = 'brand-new@example.com'",
     );
     expect(rows[0]!.name).toBe('New Person');
+  });
+
+  it('cannot switch a known customer\'s marketing consent off', async () => {
+    // A subscribe form passes its list's default, which for a double-opt-in
+    // list is `false`. Unguarded, that meant an unauthenticated request naming
+    // a known customer's address dropped them out of every campaign and
+    // rewrote the field recording how they consented in the first place.
+    await authed('POST', '/v1/contacts', {
+      email: 'consenting@example.com',
+      marketingConsent: true,
+      consentSource: 'store_import',
+    });
+
+    await (await testApp()).inject({
+      method: 'POST',
+      url: '/v1/newsletter/subscribe',
+      headers: { 'x-tbay-key': tenant.publicKey },
+      payload: { key: tenant.publicKey, email: 'consenting@example.com' },
+    });
+
+    const { rows } = await db().query<{ marketing_consent: boolean; consent_source: string }>(
+      `SELECT marketing_consent, consent_source FROM contacts
+        WHERE email_normalised = 'consenting@example.com'`,
+    );
+    expect(rows[0]!.marketing_consent).toBe(true);
+    expect(rows[0]!.consent_source).toBe('store_import');
+  });
+
+  it('still lets a single opt-in form grant consent', async () => {
+    // The other direction has to keep working: a form on a single-opt-in list
+    // is somebody asking to be mailed.
+    await authed('POST', '/v1/contacts', {
+      email: 'willing@example.com',
+      marketingConsent: false,
+    });
+    await db().query('UPDATE lists SET double_optin = false WHERE tenant_id = $1', [tenant.id]);
+
+    await (await testApp()).inject({
+      method: 'POST',
+      url: '/v1/newsletter/subscribe',
+      headers: { 'x-tbay-key': tenant.publicKey },
+      payload: { key: tenant.publicKey, email: 'willing@example.com' },
+    });
+
+    const { rows } = await db().query<{ marketing_consent: boolean }>(
+      "SELECT marketing_consent FROM contacts WHERE email_normalised = 'willing@example.com'",
+    );
+    expect(rows[0]!.marketing_consent).toBe(true);
   });
 
   it('applies the same rule to the newsletter form', async () => {
