@@ -1164,4 +1164,64 @@ describe('the GET beacon gets a per-visitor bucket too (MEDIUM)', () => {
 
     expect(allowed).toBe(600);
   });
+
+  it('ignores a query parameter the handler never reads', async () => {
+    // Preferring a plain `?visitor=` made the limiter and the handler disagree
+    // about who the visitor was: rotate the parameter and every request opened
+    // a fresh bucket, while all the events still landed on the one real
+    // visitor inside `d`.
+    const app = await testApp();
+    const packed = Buffer.from(
+      JSON.stringify({
+        visitor: 'honest-visitor',
+        session: 'honest-session',
+        url: 'https://shop.example/p',
+        events: [{ type: 'pageview', url: 'https://shop.example/p' }],
+      }),
+    ).toString('base64url');
+
+    let allowed = 0;
+    for (let n = 0; n < 650; n += 1) {
+      const response = await app.inject({
+        method: 'GET',
+        url: `/v1/collect?d=${packed}&visitor=rotating-${n}`,
+        headers: { 'x-tbay-key': tenant.publicKey, 'x-forwarded-for': '198.51.100.21, 10.0.0.5' },
+      });
+      if (response.statusCode !== 429) allowed += 1;
+    }
+
+    expect(allowed).toBe(600);
+  });
+});
+
+describe('the limiter evicts the flood, not the regulars (HIGH)', () => {
+  it('holds on to a busy bucket when a flood touches each key twice', async () => {
+    // Two wrong answers came before this one. Insertion order took the
+    // longest-lived buckets -- the tenant's admin key, every steady visitor.
+    // Then "count <= 1" was defeated by touching each minted key twice, which
+    // costs an attacker nothing and put every flood key out of reach of the
+    // rule, falling back to insertion order again: admin evicted, 0 of 20
+    // steady visitors kept, 70,000 of 70,000 flood keys kept.
+    const { rateLimit, resetRateLimits } = await import('../src/lib/ratelimit.js');
+    resetRateLimits();
+
+    const LIMIT = 1_000_000;
+    // A regular, created first and used steadily.
+    for (let n = 0; n < 40; n += 1) rateLimit('regular', LIMIT);
+
+    // A flood that touches each key twice, which is what defeated the last
+    // version of this.
+    for (let n = 0; n < 260_000; n += 1) {
+      rateLimit(`flood:${n}`, LIMIT);
+      rateLimit(`flood:${n}`, LIMIT);
+    }
+
+    // Let a size-triggered sweep run.
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    rateLimit('tick', LIMIT);
+
+    // A surviving bucket remembers its count; an evicted one starts again.
+    const regular = rateLimit('regular', LIMIT);
+    expect(LIMIT - regular.remaining).toBeGreaterThan(2);
+  });
 });

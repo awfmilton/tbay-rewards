@@ -22,6 +22,7 @@ import {
   evaluateBadges,
   evaluateRank,
   recordStreak,
+  reevaluateAll,
   redeemCoupon,
   transferPoints,
   upsertBadge,
@@ -777,73 +778,81 @@ describe('every writer reaches for the contact before anything else', () => {
     ).toEqual({ waited: true, tookTheOtherLockFirst: false });
   });
 
-  it('makes an order wait for the contact, not merely read it', async () => {
-    // An unlocked SELECT let a merge delete the row between the check and the
-    // INSERT, and the order then failed on the foreign key -- a constraint
-    // name as a 500, to a storefront reporting a sale that really happened.
-    const contact = await upsertContact(tenant.id, { email: 'orderer@example.com' });
-    const tenantRow = (await getTenantById(tenant.id))!;
-    await recordOrder(tenantRow, {
-      orderRef: 'lock-order-first',
-      totalCents: 1_000,
-      contactId: contact.id,
-      email: 'orderer@example.com',
+  /**
+   * Two writers whose first write is an INSERT referencing the contact cannot
+   * be tested by lock order at all, and pretending otherwise produced two
+   * vacuous tests: `waited` came free from the KEY SHARE lock the foreign key
+   * takes -- the very mechanism holdContact exists so as not to rely on -- and
+   * `tookTheOtherLockFirst` was trivially false because neither writer ever
+   * locks the probed row. One of them probed a row it was never going to
+   * touch.
+   *
+   * What holdContact actually buys them is the answer a person gets when the
+   * contact goes away mid-request: a sentence instead of a constraint name.
+   * That is the property, so that is what these assert.
+   */
+  async function afterTheContactVanishes(run: (contactId: string) => Promise<unknown>) {
+    const keep = await upsertContact(tenant.id, { email: 'survivor@example.com' });
+    const lose = await upsertContact(tenant.id, { email: 'vanisher@example.com' });
+    await award(tenant.id, {
+      contactId: lose.id, points: 100, reason: 'seed', idempotencyKey: `seed-${lose.id}`,
     });
+    await mergeContacts(tenant.id, keep.id, lose.id);
+    return run(lose.id);
+  }
 
-    expect(
-      await stopsAtTheContact(
-        contact.id,
-        {
-          sql: 'SELECT 1 FROM orders WHERE tenant_id = $1 AND order_ref = $2',
-          params: [tenant.id, 'lock-order-first'],
-        },
-        () => recordOrder(tenantRow, {
-          orderRef: 'lock-order-second',
+  it('tells an order writer the contact is gone, not the constraint name', async () => {
+    const tenantRow = (await getTenantById(tenant.id))!;
+
+    await expect(
+      afterTheContactVanishes((contactId) =>
+        recordOrder(tenantRow, {
+          orderRef: 'vanished-order',
           totalCents: 2_000,
-          contactId: contact.id,
-          email: 'orderer@example.com',
+          contactId,
+          email: 'vanisher@example.com',
         }),
       ),
-    ).toEqual({ waited: true, tookTheOtherLockFirst: false });
+    ).rejects.toThrow(/no longer exists/i);
   });
 
-  it('makes rank evaluation wait for the contact, not the balance', async () => {
-    // Added to redeemCoupon, recordOrder and evaluateBadges in one commit and
-    // missed here, in a function that same commit was editing: 52 foreign-key
-    // violations and a deadlock in a 780-operation fuzz.
-    const contact = await upsertContact(tenant.id, { email: 'ranker@example.com' });
-    await award(tenant.id, {
-      contactId: contact.id, points: 600, reason: 'seed', idempotencyKey: 'lock-rank-seed',
-    });
-
-    expect(
-      await stopsAtTheContact(
-        contact.id,
-        {
-          sql: 'SELECT 1 FROM points_balances WHERE tenant_id = $1 AND contact_id = $2',
-          params: [tenant.id, contact.id],
-        },
-        () => evaluateRank(tenant.id, contact.id),
-      ),
-    ).toEqual({ waited: true, tookTheOtherLockFirst: false });
+  it('tells badge evaluation the contact is gone, not the constraint name', async () => {
+    await expect(
+      afterTheContactVanishes((contactId) => evaluateBadges(tenant.id, contactId)),
+    ).rejects.toThrow(/no longer exists/i);
   });
 
-  it('makes badge evaluation wait for the contact', async () => {
-    const contact = await upsertContact(tenant.id, { email: 'badger@example.com' });
-    await award(tenant.id, {
-      contactId: contact.id, points: 600, reason: 'seed', idempotencyKey: 'lock-badge-seed',
-    });
+  it('tells rank evaluation the contact is gone, not the constraint name', async () => {
+    await expect(
+      afterTheContactVanishes((contactId) => evaluateRank(tenant.id, contactId)),
+    ).rejects.toThrow(/no longer exists/i);
+  });
 
-    expect(
-      await stopsAtTheContact(
-        contact.id,
-        {
-          sql: 'SELECT 1 FROM points_balances WHERE tenant_id = $1 AND contact_id = $2',
-          params: [tenant.id, contact.id],
-        },
-        () => evaluateBadges(tenant.id, contact.id),
-      ),
-    ).toEqual({ waited: true, tookTheOtherLockFirst: false });
+  it('does not end a bulk re-evaluation because one contact was merged', async () => {
+    // The sweep walks the whole member list, so a contact merged away while it
+    // runs is ordinary -- and that friendly "no longer exists" used to abort
+    // the run, leaving a tenant's re-rank half applied.
+    //
+    // A race, deliberately: the merge has to land while the sweep is in
+    // flight. It cannot fail spuriously (a merge that lands too late simply
+    // finds nothing to disturb), and with the handler removed it fails
+    // reliably, which is what a regression test has to do.
+    const contacts: string[] = [];
+    for (let n = 0; n < 60; n += 1) {
+      const contact = await upsertContact(tenant.id, { email: `sweep${n}@example.com` });
+      await award(tenant.id, {
+        contactId: contact.id, points: 600, reason: 'seed', idempotencyKey: `sweep-${n}`,
+      });
+      contacts.push(contact.id);
+    }
+
+    const merges = [10, 20, 30, 40].map((n) =>
+      mergeContacts(tenant.id, contacts[n - 1]!, contacts[n]!).catch(() => null),
+    );
+    const swept = await reevaluateAll(tenant.id, { badges: false, ranks: true });
+    await Promise.all(merges);
+
+    expect(swept.contacts).toBeGreaterThan(0);
   });
 
   it('says what happened when the contact was merged away mid-flight', async () => {

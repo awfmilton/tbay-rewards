@@ -149,9 +149,14 @@ function usable(id: string | null): string | null {
  * handler is what reports the error.
  */
 function visitorFromQuery(request: FastifyRequest): string | null {
+  // Only what is inside `d`, which is the only thing the handler reads.
+  //
+  // Preferring a plain `?visitor=` meant the limiter and the handler disagreed
+  // about who the visitor was: rotate the query parameter and every request
+  // opened a fresh bucket while all the events still landed on the one real
+  // visitor. That is the bypass this function was added to close, reopened by
+  // a line meant as a convenience.
   const query = request.query as Record<string, unknown> | undefined;
-  if (typeof query?.visitor === 'string') return query.visitor;
-
   const packed = query?.d;
   if (typeof packed !== 'string' || packed === '' || packed.length > 8192) return null;
   try {

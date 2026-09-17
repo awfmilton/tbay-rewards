@@ -564,6 +564,30 @@ export async function supplyStatus(runner: Queryable = db()): Promise<{
  * Set CLAIM_REFUND_ON_EXPIRY=true only against a contract that enforces a
  * deadline inside claim().
  */
+/**
+ * Close out spend intents nobody completed.
+ *
+ * A `pending` intent is created every time somebody taps "Pay with TBAY", and
+ * nothing in the product ever moved one out of `pending`: `verifySpendIntent`
+ * refuses an expired intent, and there was no cancel route, no service call
+ * and no worker. So an abandoned checkout stayed pending forever -- which was
+ * merely untidy until erasure started refusing while one was open, at which
+ * point a customer who changed their mind could never be erased at all.
+ *
+ * Nothing is refunded, because nothing was taken: an intent is a statement of
+ * what the customer is about to send, not a record that they sent it. If the
+ * transfer did happen and simply was not verified in time, the tokens are at
+ * the retailer's payout wallet and the retailer settles it by hand -- the same
+ * position as before this worker existed.
+ */
+export async function expireStaleSpendIntents(runner: Queryable = db()): Promise<number> {
+  const { rowCount } = await runner.query(
+    `UPDATE token_spend_intents SET status = 'expired'
+      WHERE status = 'pending' AND expires_at <= now()`,
+  );
+  return rowCount ?? 0;
+}
+
 export async function expireStaleClaims(runner: Queryable = db()): Promise<number> {
   const cfg = config();
 
