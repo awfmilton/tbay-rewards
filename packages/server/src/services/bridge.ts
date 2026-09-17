@@ -9,6 +9,7 @@ import {
   type TokenTransfer,
 } from '../lib/chain.js';
 import { walletDigest } from '../lib/crypto.js';
+import { isAddress } from 'ethers';
 import { splitBridgeAmount, txUrl } from '../lib/chains.js';
 
 /**
@@ -280,17 +281,51 @@ export async function getWithdrawal(
  * the provider's error in it.
  */
 export type PayableTo =
-  | { address: string; reason?: undefined }
-  | { address: null; reason: 'chain_unavailable' | 'chain_error' | 'burn_not_found' | 'no_match' };
+  | {
+      address: string;
+      /** False for a row erased before commitments existed; see recipientFor. */
+      verified: boolean;
+      reason?: undefined;
+    }
+  | {
+      address: null;
+      verified?: undefined;
+      reason:
+        | 'chain_unavailable'
+        | 'chain_error'
+        | 'burn_not_found'
+        | 'no_match'
+        | 'ambiguous_legacy'
+        | 'chain_busy'
+        | 'unreadable';
+    };
 
-export async function recipientFor(
-  withdrawal: Pick<BridgeWithdrawal, 'l1_recipient' | 'burn_tx_hash'>,
-): Promise<PayableTo> {
-  const digest = ERASED_RECIPIENT.exec(withdrawal.l1_recipient);
-  if (!digest) return { address: withdrawal.l1_recipient };
+type ErasableWithdrawal = Pick<BridgeWithdrawal, 'l1_recipient' | 'burn_tx_hash'>;
+
+export async function recipientFor(withdrawal: ErasableWithdrawal): Promise<PayableTo> {
+  const commitment = ERASED_COMMITMENT.exec(withdrawal.l1_recipient);
+  const legacy = !commitment && ERASED_SENTINEL.test(withdrawal.l1_recipient);
+
+  if (!commitment && !legacy) {
+    // Anything that is neither a commitment nor the old sentinel has to be an
+    // address, and is checked as one. Returning the column verbatim handed
+    // back '' and half-written values as payable addresses.
+    return isAddress(withdrawal.l1_recipient)
+      ? { address: withdrawal.l1_recipient, verified: true }
+      : { address: null, reason: 'unreadable' };
+  }
 
   const client = chain();
   if (!client) return { address: null, reason: 'chain_unavailable' };
+
+  // Bounded in number as well as in time. withChainTimeout abandons the losing
+  // promise rather than cancelling it -- which is why the verification path
+  // wraps the identical call in a concurrency limit -- so repeated operator
+  // reads against a slow node would otherwise stack sockets without limit.
+  if (lookupsInFlight >= MAX_CONCURRENT_LOOKUPS) {
+    return { address: null, reason: 'chain_busy' };
+  }
+  lookupsInFlight += 1;
 
   let transfers: TokenTransfer[];
   try {
@@ -301,6 +336,8 @@ export async function recipientFor(
     );
   } catch {
     return { address: null, reason: 'chain_error' };
+  } finally {
+    lookupsInFlight -= 1;
   }
 
   const burns = transfers.filter(
@@ -308,17 +345,46 @@ export async function recipientFor(
   );
   if (burns.length === 0) return { address: null, reason: 'burn_not_found' };
 
+  if (legacy) {
+    // Rows erased by a build that overwrote the wallet with a sentinel and
+    // left nothing to check a candidate against.
+    //
+    // Without this branch they were the one thing this function must never
+    // produce: the sentinel came back as a plausible, well-formed payable
+    // address, so the operator's only answer to "where do I send this L1
+    // release?" was the burn hole -- irreversibly. Those rows cannot heal
+    // themselves either: the erasure that would re-digest them matches on
+    // contact_id, which the same statement nulled, and erasure is one-shot.
+    //
+    // A single burn in the transaction is unambiguous, and is exactly what
+    // recordWithdrawal would have recorded. Several is not, and there is no
+    // commitment to break the tie, so nobody is paid. `verified: false` says
+    // which of the two this was, because an operator about to move money is
+    // owed that distinction.
+    return burns.length === 1
+      ? { address: burns[0]!.from.toLowerCase(), verified: false }
+      : { address: null, reason: 'ambiguous_legacy' };
+  }
+
+  const tenantId = commitment![1]!;
   const match = burns.find(
-    (burn) => `erased:${digest[1]!}:${walletDigest(burn.from, digest[1]!)}` === withdrawal.l1_recipient,
+    (burn) => `erased:${tenantId}:${walletDigest(burn.from, tenantId)}` === withdrawal.l1_recipient,
   );
-  return match ? { address: match.from.toLowerCase() } : { address: null, reason: 'no_match' };
+  return match
+    ? { address: match.from.toLowerCase(), verified: true }
+    : { address: null, reason: 'no_match' };
 }
 
 /** What privacy.ts writes over an erased person's wallet: erased:<tenant>:<digest>. */
-const ERASED_RECIPIENT = /^erased:([0-9a-f-]{36}):[0-9a-f]{32}$/i;
+const ERASED_COMMITMENT = /^erased:([0-9a-f-]{36}):[0-9a-f]{32}$/i;
 
-/** A read-only route may not hang on a slow node. */
+/** What an earlier build wrote instead: a well-formed address nobody owns. */
+const ERASED_SENTINEL = /^0x0{38}ff$/i;
+
+/** A read-only route may not hang on a slow node, nor pile up against one. */
 const RECIPIENT_LOOKUP_TIMEOUT_MS = 15_000;
+const MAX_CONCURRENT_LOOKUPS = 4;
+let lookupsInFlight = 0;
 
 export async function markReleased(
   id: string,

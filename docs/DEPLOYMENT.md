@@ -118,7 +118,7 @@ The ones that matter most:
 |---|---|
 | `PUBLIC_URL` | Every generated link. Wrong value = broken opt-in and share links. **https in production** — cookies are set `Secure`, so over plain http the browser never sends them back and attribution stops |
 | `IDENTITY_SALT` | Changing it un-links members across retailers. Set once. At least 32 random characters |
-| `TOKEN_SECRET` | Signs attribution cookies and opt-in tokens, and keys the wallet digests left by an erasure. **Rotating it makes every already-erased spend intent unsettleable and every already-erased bridge withdrawal unpayable** — settle anything outstanding first. |
+| `TOKEN_SECRET` | Signs attribution cookies and opt-in tokens, and keys the wallet digests left by an erasure. Must **not** be the same value as `IDENTITY_SALT`. **Rotating it makes every already-erased spend intent unsettleable and every already-erased bridge withdrawal unpayable** — settle anything outstanding first. |
 | `TBAY_CHAIN_ID` | 300 = zkSync Sepolia, 324 = Era mainnet |
 | `TBAY_CLAIM_SIGNER_KEY` | Must hold `CLAIMER_ROLE`. Signing only — no gas needed |
 | `TBAY_REWARD_SUPPLY_CAP_WEI` | **Set before mainnet.** See [TOKEN.md](TOKEN.md) |

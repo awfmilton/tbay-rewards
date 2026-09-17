@@ -64,6 +64,8 @@ interface Klass {
    * by how many callers can actually be rejected inside one window.
    */
   floor: number;
+  /** When this class last turned its generations over. */
+  rotatedAt: number;
 }
 
 /**
@@ -131,14 +133,26 @@ function unexpired(windows: Map<string, Window>, now: number): Map<string, Windo
   return keep;
 }
 
-function rotate(klass: Klass, now: number): void {
+function rotate(klass: Klass, ceiling: number, now: number): void {
   const carried = new Map<string, Window>();
   for (const [key, window] of klass.live) {
+    // The carry is capped at the ceiling itself, never at a fraction of it,
+    // and the difference is the whole point. A fractional cap dropped blocked
+    // callers while most of the map was ordinary traffic, which is a ranking
+    // by insertion order wearing a threshold. This can only bite once an
+    // entire class's worth of keys are simultaneously over their limits --
+    // roughly sixty million requests inside one window at the shipped rates --
+    // and at that point every key in the map is a caller being rejected, so
+    // there is nothing else left to drop. Without any cap, `floor` grew by a
+    // ceiling per generation: measured at six times the class ceiling and
+    // 143 MB before it stopped being worth continuing.
+    if (carried.size >= ceiling) break;
     if (window.resetAt > now && window.count >= window.limit) carried.set(key, window);
   }
   klass.old = klass.live;
   klass.live = carried;
   klass.floor = carried.size;
+  klass.rotatedAt = now;
 }
 
 export function rateLimit(key: string, limit: number, windowMs = 60_000): RateLimitResult {
@@ -149,14 +163,20 @@ export function rateLimit(key: string, limit: number, windowMs = 60_000): RateLi
   // map never fills and expired windows would otherwise sit there until it
   // did.
   if (now - lastSweep > windowMs) {
-    for (const [name, klass] of classes) {
-      // Only a class rotation is not already clearing. A busy class turns its
-      // generations over on its own, and rebuilding two full maps there cost
-      // 81 ms of blocked event loop for nothing -- measured with both
-      // generations full of unexpired windows, which freed one key. This is
-      // for the quiet class, where the map never fills and expired windows
-      // would otherwise sit until it did.
-      if (klass.live.size + klass.old.size > CEILINGS[name]!) continue;
+    for (const klass of classes.values()) {
+      // Skipped only while rotation is doing the job. A class turning its
+      // generations over faster than once a window reclaims on its own, and
+      // rebuilding two full maps there cost 81 ms of blocked event loop to
+      // free one key.
+      //
+      // Keyed on when it last rotated, not on how large it is. On size, a
+      // class that filled once and then went quiet was skipped forever --
+      // rotation needs a ceiling of fresh keys and there are none -- so
+      // 100,000 windows that expired an hour ago stayed resident, and the
+      // regression test guarding this very sweep passed with the sweep never
+      // running. Measured: 18 MB held at t+60m, against 0 MB before the skip
+      // existed.
+      if (now - klass.rotatedAt <= windowMs) continue;
       // Both generations, and by filtering rather than discarding. Emptying
       // `old` outright threw away unexpired windows a rotation had only just
       // demoted, so a bucket that should have survived two full generations
@@ -172,7 +192,7 @@ export function rateLimit(key: string, limit: number, windowMs = 60_000): RateLi
   const name = classOf(key);
   let klass = classes.get(name);
   if (!klass) {
-    klass = { live: new Map(), old: new Map(), floor: 0 };
+    klass = { live: new Map(), old: new Map(), floor: 0, rotatedAt: 0 };
     classes.set(name, klass);
   }
 
@@ -197,7 +217,7 @@ export function rateLimit(key: string, limit: number, windowMs = 60_000): RateLi
       previous.count += 1;
       previous.limit = limit;
       klass.live.set(key, previous);
-      if (klass.live.size >= klass.floor + CEILINGS[name]!) rotate(klass, now);
+      if (klass.live.size >= klass.floor + CEILINGS[name]!) rotate(klass, CEILINGS[name]!, now);
       return {
         allowed: previous.count <= limit,
         remaining: Math.max(0, limit - previous.count),
@@ -208,7 +228,7 @@ export function rateLimit(key: string, limit: number, windowMs = 60_000): RateLi
 
   const resetAt = now + windowMs;
   klass.live.set(key, { count: 1, resetAt, limit });
-  if (klass.live.size >= klass.floor + CEILINGS[name]!) rotate(klass, now);
+  if (klass.live.size >= klass.floor + CEILINGS[name]!) rotate(klass, CEILINGS[name]!, now);
 
   return { allowed: 1 <= limit, remaining: Math.max(0, limit - 1), resetAt };
 }
@@ -216,6 +236,21 @@ export function rateLimit(key: string, limit: number, windowMs = 60_000): RateLi
 export function resetRateLimits(): void {
   classes.clear();
   lastSweep = Date.now();
+}
+
+/**
+ * What each class carried into its current generation. Diagnostics helper.
+ *
+ * The carry is the one number that decides whether this design is bounded: it
+ * is what a generation starts from, and without a cap it grew by up to a
+ * ceiling every time. Reported rather than inferred from the map sizes,
+ * because a test that has to construct six generations to see it climb is a
+ * test nobody will keep.
+ */
+export function rateLimitFloors(): Record<string, number> {
+  const floors: Record<string, number> = Object.create(null) as Record<string, number>;
+  for (const [name, klass] of classes) floors[name] = klass.floor;
+  return floors;
 }
 
 /** Live key counts per class. Test and diagnostics helper. */
