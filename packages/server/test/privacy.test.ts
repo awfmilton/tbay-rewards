@@ -518,7 +518,9 @@ describe('nothing identifying survives anywhere', () => {
     // A wallet is the strongest identifier in the schema -- a public chain
     // address, permanent, and tied to everything ever done with it. The sweep
     // searched for the email and the name only, and no fixture in it had a
-    // wallet, so four surviving copies went unnoticed for three rounds.
+    // wallet, so four surviving copies went unnoticed for three rounds. The
+    // fixture also sets a phone and an external ref; those are searched for
+    // now too, rather than being set and ignored.
     const wallet = '0x00000000000000000000000000000000DeaDBeef';
 
     const contact = await upsertContact(tenant.id, {
@@ -600,8 +602,10 @@ describe('nothing identifying survives anywhere', () => {
           WHERE "${column.column_name}"::text ILIKE $1
              OR "${column.column_name}"::text ILIKE $2
              OR "${column.column_name}"::text ILIKE $3
+             OR "${column.column_name}"::text ILIKE $4
+             OR "${column.column_name}"::text ILIKE $5
           LIMIT 1`,
-        [`%${email}%`, `%${name}%`, `%${wallet}%`],
+        [`%${email}%`, `%${name}%`, `%${wallet}%`, '%+1 807 555 0199%', '%ext-needle%'],
       );
       if (rows.length > 0) hits.push(`${column.table_name}.${column.column_name}`);
     }
@@ -915,5 +919,147 @@ describe('the erase request does not log the address it erased (MEDIUM)', () => 
       expect(row.target ?? '').not.toContain(email);
     }
     expect(rows.some((row) => row.action.includes('/v1/privacy/erase'))).toBe(true);
+  });
+});
+
+describe('erasure never destroys money in flight (HIGH)', () => {
+  /**
+   * Round four overwrote every address on the chain tables with the zero
+   * address, unconditionally. That destroyed funds twice over: a pending spend
+   * intent is settled by matching an on-chain transfer against the addresses
+   * recorded here, so blanking them meant the customer had sent their TBAY,
+   * the retailer had it, and the credit could never be issued -- and a
+   * `burn_verified` withdrawal has its L2 tokens already burned, with an
+   * operator about to send L1 tokens to `l1_recipient`, which had just been
+   * repointed at the address bridge.ts uses as its burn address.
+   */
+  const WALLET = '0x14dc79964da2c08b23698b3d3cc7ca32193d9955';
+
+  async function withSpendIntent(email: string, status: string) {
+    const contact = await upsertContact(tenant.id, { email });
+    await db().query(
+      `INSERT INTO token_spend_intents (
+         tenant_id, contact_id, member_id, token_amount_wei, from_address, to_address,
+         chain_id, contract_address, credit_cents, currency, status, expires_at
+       )
+       SELECT $1, $2, c.member_id, 1, $3, $4, 300,
+              '0x74eb73aca939fc911f79d9589e808f0207684d09', 100, 'USD', $5,
+              now() + interval '1 day'
+         FROM contacts c WHERE c.id = $2`,
+      [tenant.id, contact.id, WALLET, '0x1111111111111111111111111111111111111111', status],
+    );
+    return contact;
+  }
+
+  it('refuses while a token spend is still pending', async () => {
+    const contact = await withSpendIntent('spender@example.com', 'pending');
+
+    await expect(eraseContact(tenant.id, contact.id)).rejects.toThrow(
+      /unsettled on-chain transaction/i,
+    );
+
+    // Nothing was touched, so the intent can still settle.
+    const { rows } = await db().query<{ from_address: string; to_address: string }>(
+      'SELECT from_address, to_address FROM token_spend_intents WHERE contact_id = $1',
+      [contact.id],
+    );
+    expect(rows[0]!.from_address).toBe(WALLET);
+    expect(rows[0]!.to_address).toBe('0x1111111111111111111111111111111111111111');
+  });
+
+  it('erases once the spend has settled, and leaves the retailer their own wallet', async () => {
+    const contact = await withSpendIntent('settled@example.com', 'verified');
+
+    await eraseContact(tenant.id, contact.id);
+
+    const { rows } = await db().query<{
+      from_address: string; to_address: string; member_id: string | null;
+    }>(
+      'SELECT from_address, to_address, member_id FROM token_spend_intents WHERE contact_id = $1',
+      [contact.id],
+    );
+    expect(rows[0]!.from_address).not.toBe(WALLET);
+    expect(rows[0]!.member_id).toBeNull();
+    // `to_address` is the retailer's payout wallet, not the erased person's
+    // data. Blanking it protects nobody and costs the retailer their books.
+    expect(rows[0]!.to_address).toBe('0x1111111111111111111111111111111111111111');
+  });
+
+  async function withWithdrawal(email: string, status: string) {
+    const contact = await upsertContact(tenant.id, { email });
+    await db().query(
+      `INSERT INTO bridge_withdrawals (
+         tenant_id, contact_id, member_id, from_address, l1_recipient,
+         l2_amount_wei, l1_amount, dust_wei, burn_tx_hash, status, l2_chain_id, l1_chain_id
+       )
+       SELECT $1, $2, c.member_id, $3, $3, 1, 1, 0, $4, $5, 300, 1
+         FROM contacts c WHERE c.id = $2`,
+      [tenant.id, contact.id, WALLET, `0xburn-${status}`, status],
+    );
+    return contact;
+  }
+
+  it('refuses between the burn and the release', async () => {
+    // The worst moment to lose the recipient: the L2 tokens are gone and the
+    // L1 payout has not happened yet.
+    const contact = await withWithdrawal('bridging@example.com', 'burn_verified');
+
+    await expect(eraseContact(tenant.id, contact.id)).rejects.toThrow(
+      /unsettled on-chain transaction/i,
+    );
+    const { rows } = await db().query<{ l1_recipient: string }>(
+      'SELECT l1_recipient FROM bridge_withdrawals WHERE contact_id = $1',
+      [contact.id],
+    );
+    expect(rows[0]!.l1_recipient).toBe(WALLET);
+  });
+
+  it('erases a released withdrawal, and not at the burn address', async () => {
+    const { BURN_ADDRESS } = await import('../src/services/bridge.js');
+    const contact = await withWithdrawal('bridged@example.com', 'released');
+
+    await eraseContact(tenant.id, contact.id);
+
+    const { rows } = await db().query<{ l1_recipient: string; from_address: string }>(
+      'SELECT l1_recipient, from_address FROM bridge_withdrawals WHERE contact_id = $1',
+      [contact.id],
+    );
+    expect(rows[0]!.from_address).not.toBe(WALLET);
+    // The zero address means "burned" in this schema, so it is the one
+    // sentinel that must not be used to mean "erased".
+    expect(rows[0]!.l1_recipient).not.toBe(BURN_ADDRESS);
+    expect(rows[0]!.from_address).not.toBe(BURN_ADDRESS);
+  });
+
+  it('breaks the cross-tenant identity link', async () => {
+    // member_id is uuid, and the schema sweep only reads text-ish columns, so
+    // the headline fix had no test at all. It is the platform-wide link that
+    // nulling contacts.member_id exists to break, and it survived one join
+    // away in a row keyed by the erased contact id.
+    const contact = await withSpendIntent('linked@example.com', 'verified');
+    const before = await db().query<{ member_id: string | null }>(
+      'SELECT member_id FROM token_spend_intents WHERE contact_id = $1',
+      [contact.id],
+    );
+    expect(before.rows[0]!.member_id).not.toBeNull();
+
+    await eraseContact(tenant.id, contact.id);
+
+    const { rows } = await db().query<{ table_name: string; n: string }>(
+      `SELECT 'token_claims' AS table_name, count(*)::text AS n
+         FROM token_claims WHERE contact_id = $1 AND member_id IS NOT NULL
+       UNION ALL
+       SELECT 'token_spend_intents', count(*)::text
+         FROM token_spend_intents WHERE contact_id = $1 AND member_id IS NOT NULL
+       UNION ALL
+       SELECT 'bridge_withdrawals', count(*)::text
+         FROM bridge_withdrawals WHERE contact_id = $1 AND member_id IS NOT NULL`,
+      [contact.id],
+    );
+    expect(rows.map((row) => [row.table_name, row.n])).toEqual([
+      ['token_claims', '0'],
+      ['token_spend_intents', '0'],
+      ['bridge_withdrawals', '0'],
+    ]);
   });
 });

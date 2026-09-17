@@ -1053,15 +1053,24 @@ describe('the client address is only as trusted as the deployment (HIGH)', () =>
 
   it('counts hops from this process outwards', async () => {
     // With one appending proxy, the rightmost entry is the only one nginx
-    // wrote, and that is the one that counts. Everything to its left is the
-    // caller talking.
+    // wrote; everything to its left is the caller talking. Measured by
+    // exhausting a bucket rather than by sending two requests and checking
+    // they were accepted -- which an earlier version of this test did, and
+    // which holds for every value of trustProxyHops, including the
+    // over-trusting ones it claimed to detect.
     const app = await testApp();
-    const seen: string[] = [];
-    for (const forwarded of ['203.0.113.1, 10.0.0.9', '198.51.100.1, 10.0.0.9']) {
+    let allowed = 0;
+    for (let n = 0; n < 700; n += 1) {
       const response = await app.inject({
         method: 'POST',
         url: '/v1/collect',
-        headers: { 'x-tbay-key': tenant.publicKey, 'x-forwarded-for': forwarded },
+        headers: {
+          'x-tbay-key': tenant.publicKey,
+          // The left-hand entry changes every time. If it were trusted, each
+          // request would look like a different address and open its own
+          // per-visitor bucket.
+          'x-forwarded-for': `203.0.113.${n % 250}, 10.0.0.42`,
+        },
         payload: {
           visitor: 'hops-visitor',
           session: 'hops-session',
@@ -1069,12 +1078,11 @@ describe('the client address is only as trusted as the deployment (HIGH)', () =>
           events: [{ type: 'pageview', url: 'https://shop.example/p' }],
         },
       });
-      seen.push(String(response.statusCode));
+      if (response.statusCode !== 429) allowed += 1;
     }
 
-    // Both land in the same bucket, because the claimed left-hand entry is
-    // ignored -- so neither is rejected and neither minted a new allowance.
-    expect(seen).toEqual(['204', '204']);
+    // One bucket, one allowance. Over-trusting reads 700.
+    expect(allowed).toBe(600);
   });
 });
 
@@ -1123,5 +1131,37 @@ describe('the site key cannot set categories on a product the store knows (MEDIU
       [tenant.id, 'SKU-CAT'],
     );
     expect(after[0]!.categories).toEqual(['wall-art']);
+  });
+});
+
+describe('the GET beacon gets a per-visitor bucket too (MEDIUM)', () => {
+  it('reads the visitor out of the packed payload', async () => {
+    // `/v1/collect` also accepts its whole payload base64url-encoded in `d`,
+    // for environments that block POST beacons. The limiter reads the body,
+    // and a GET has none -- so one visitor on that path got the full
+    // per-address ceiling instead of their own share, and the half of the
+    // rate-limit fix that was announced as done was done for one of the two
+    // routes.
+    const app = await testApp();
+    const packed = Buffer.from(
+      JSON.stringify({
+        visitor: 'beacon-visitor',
+        session: 'beacon-session',
+        url: 'https://shop.example/p',
+        events: [{ type: 'pageview', url: 'https://shop.example/p' }],
+      }),
+    ).toString('base64url');
+
+    let allowed = 0;
+    for (let n = 0; n < 650; n += 1) {
+      const response = await app.inject({
+        method: 'GET',
+        url: `/v1/collect?d=${packed}`,
+        headers: { 'x-tbay-key': tenant.publicKey, 'x-forwarded-for': '198.51.100.20, 10.0.0.5' },
+      });
+      if (response.statusCode !== 429) allowed += 1;
+    }
+
+    expect(allowed).toBe(600);
   });
 });

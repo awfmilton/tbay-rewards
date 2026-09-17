@@ -18,7 +18,11 @@ import { upsertPointType } from '../src/services/point-types.js';
 import { setFieldValues, upsertField } from '../src/services/contact-fields.js';
 import {
   awardBadgeManually,
+  createCoupon,
+  evaluateBadges,
+  evaluateRank,
   recordStreak,
+  redeemCoupon,
   transferPoints,
   upsertBadge,
 } from '../src/services/gamification.js';
@@ -753,6 +757,91 @@ describe('every writer reaches for the contact before anything else', () => {
           params: [tenant.id, contact.id],
         },
         () => releaseMaturedPoints(),
+      ),
+    ).toEqual({ waited: true, tookTheOtherLockFirst: false });
+  });
+
+  it('makes a coupon redemption wait for the contact, not the coupon row', async () => {
+    const contact = await upsertContact(tenant.id, { email: 'redeemer@example.com' });
+    await createCoupon(tenant.id, { code: 'LOCKME', points: 25 });
+
+    expect(
+      await stopsAtTheContact(
+        contact.id,
+        {
+          sql: 'SELECT 1 FROM point_coupons WHERE tenant_id = $1 AND code = $2',
+          params: [tenant.id, 'LOCKME'],
+        },
+        () => redeemCoupon(tenant.id, contact.id, 'LOCKME'),
+      ),
+    ).toEqual({ waited: true, tookTheOtherLockFirst: false });
+  });
+
+  it('makes an order wait for the contact, not merely read it', async () => {
+    // An unlocked SELECT let a merge delete the row between the check and the
+    // INSERT, and the order then failed on the foreign key -- a constraint
+    // name as a 500, to a storefront reporting a sale that really happened.
+    const contact = await upsertContact(tenant.id, { email: 'orderer@example.com' });
+    const tenantRow = (await getTenantById(tenant.id))!;
+    await recordOrder(tenantRow, {
+      orderRef: 'lock-order-first',
+      totalCents: 1_000,
+      contactId: contact.id,
+      email: 'orderer@example.com',
+    });
+
+    expect(
+      await stopsAtTheContact(
+        contact.id,
+        {
+          sql: 'SELECT 1 FROM orders WHERE tenant_id = $1 AND order_ref = $2',
+          params: [tenant.id, 'lock-order-first'],
+        },
+        () => recordOrder(tenantRow, {
+          orderRef: 'lock-order-second',
+          totalCents: 2_000,
+          contactId: contact.id,
+          email: 'orderer@example.com',
+        }),
+      ),
+    ).toEqual({ waited: true, tookTheOtherLockFirst: false });
+  });
+
+  it('makes rank evaluation wait for the contact, not the balance', async () => {
+    // Added to redeemCoupon, recordOrder and evaluateBadges in one commit and
+    // missed here, in a function that same commit was editing: 52 foreign-key
+    // violations and a deadlock in a 780-operation fuzz.
+    const contact = await upsertContact(tenant.id, { email: 'ranker@example.com' });
+    await award(tenant.id, {
+      contactId: contact.id, points: 600, reason: 'seed', idempotencyKey: 'lock-rank-seed',
+    });
+
+    expect(
+      await stopsAtTheContact(
+        contact.id,
+        {
+          sql: 'SELECT 1 FROM points_balances WHERE tenant_id = $1 AND contact_id = $2',
+          params: [tenant.id, contact.id],
+        },
+        () => evaluateRank(tenant.id, contact.id),
+      ),
+    ).toEqual({ waited: true, tookTheOtherLockFirst: false });
+  });
+
+  it('makes badge evaluation wait for the contact', async () => {
+    const contact = await upsertContact(tenant.id, { email: 'badger@example.com' });
+    await award(tenant.id, {
+      contactId: contact.id, points: 600, reason: 'seed', idempotencyKey: 'lock-badge-seed',
+    });
+
+    expect(
+      await stopsAtTheContact(
+        contact.id,
+        {
+          sql: 'SELECT 1 FROM points_balances WHERE tenant_id = $1 AND contact_id = $2',
+          params: [tenant.id, contact.id],
+        },
+        () => evaluateBadges(tenant.id, contact.id),
       ),
     ).toEqual({ waited: true, tookTheOtherLockFirst: false });
   });
