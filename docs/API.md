@@ -97,7 +97,32 @@ Idempotent on `(tenant, orderRef)`.
 → `{ order_id, contact_id, points_awarded, commissions[] }`
 
 ### `POST /v1/orders/:orderRef/refund`
-Voids commissions and reverses purchase points.
+Voids commissions, reverses every reward the order paid, and takes the
+purchase back out of the product figures on the day it was placed. A referral
+the order qualified is unwound too, unless the customer has another order that
+still stands.
+
+### `PUT /v1/products/:productRef`
+The catalogue, stated by the store.
+
+```json
+{
+  "name": "Red Ensign",
+  "url": "https://shop.example.com/product/flag",
+  "imageUrl": "https://shop.example.com/img/flag.jpg",
+  "priceCents": 4999,
+  "currency": "CAD",
+  "categories": ["flags", "heritage"]
+}
+```
+
+The tracker also reports products it sees, but under the public site key —
+which is in every page's source, so those details are whatever the caller
+sent. A tracked product is therefore only ever *introduced*: it may fill in a
+product nobody has seen before, never restate one the store already has. This
+route is how a correction actually lands, and it is the only way to change a
+product's categories, which reward rules match on and which therefore decide
+what buying it earns.
 
 ---
 

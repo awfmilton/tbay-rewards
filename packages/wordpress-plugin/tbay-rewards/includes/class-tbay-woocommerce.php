@@ -54,6 +54,17 @@ class TBAY_Rewards_WooCommerce {
 		add_action( 'wp_ajax_tbay_apply_credit', array( $this, 'ajax_apply_credit' ) );
 		add_action( 'wp_ajax_nopriv_tbay_apply_credit', array( $this, 'ajax_apply_credit' ) );
 
+		// The catalogue, stated by the store rather than guessed from a page.
+		//
+		// The tracker sends product details too, but those arrive under the
+		// public site key, which is in every page's source -- so the platform
+		// only lets them fill in a product nobody has seen before, never
+		// restate one. This is the authoritative copy: it goes over the secret
+		// key, so a price change, a rename or a re-categorisation actually
+		// lands. Categories especially, because reward rules match on them.
+		add_action( 'woocommerce_update_product', array( $this, 'sync_product' ), 20 );
+		add_action( 'woocommerce_new_product', array( $this, 'sync_product' ), 20 );
+
 		// Keep contact records current.
 		add_action( 'user_register', array( $this, 'sync_new_user' ) );
 		add_action( 'woocommerce_created_customer', array( $this, 'sync_new_user' ) );
@@ -338,6 +349,47 @@ class TBAY_Rewards_WooCommerce {
 	 *
 	 * @param int $order_id Order id.
 	 */
+	/**
+	 * Push one product's details to the platform over the secret key.
+	 *
+	 * Runs on save rather than on a schedule: a catalogue sync that only
+	 * happens nightly means a price corrected at ten in the morning is wrong
+	 * on every report until the following day.
+	 */
+	public function sync_product( int $product_id ): void {
+		$product = wc_get_product( $product_id );
+		if ( ! $product instanceof WC_Product ) {
+			return;
+		}
+
+		$categories = array();
+		$terms      = get_the_terms( $product_id, 'product_cat' );
+		if ( is_array( $terms ) ) {
+			foreach ( $terms as $term ) {
+				$categories[] = $term->slug;
+			}
+		}
+
+		$price = $product->get_price();
+
+		$result = $this->api->request(
+			'PUT',
+			'/v1/products/' . rawurlencode( (string) $product_id ),
+			array(
+				'name'       => $product->get_name(),
+				'url'        => get_permalink( $product_id ) ?: null,
+				'imageUrl'   => wp_get_attachment_image_url( $product->get_image_id(), 'thumbnail' ) ?: null,
+				'priceCents' => '' === $price || null === $price ? null : (int) round( (float) $price * 100 ),
+				'currency'   => get_woocommerce_currency(),
+				'categories' => $categories,
+			)
+		);
+
+		if ( is_wp_error( $result ) ) {
+			$this->api->log( 'Product sync failed for ' . $product_id . ': ' . $result->get_error_message() );
+		}
+	}
+
 	public function sync_refund( int $order_id ): void {
 		$order = wc_get_order( $order_id );
 		if ( ! $order instanceof WC_Order || ! $order->get_meta( self::ORDER_SYNCED_META ) ) {
