@@ -1311,39 +1311,37 @@ describe('the GET beacon gets a per-visitor bucket too (MEDIUM)', () => {
 
 describe('a key flood cannot buy anybody a fresh window (HIGH)', () => {
   /**
-   * Three rounds of this were spent hunting for a ranking that would pick the
-   * right key to drop, and the attacker chose every one of them: insertion
-   * order took the longest-lived buckets (the tenant's own), "count <= 1" and
-   * then ranking by count were both beaten by touching each minted key twice,
-   * which costs nothing -- measured at admin evicted in every configuration and
-   * 200,000 of 210,000 flood keys kept.
+   * Four attempts came before the one this tests. Three looked for a ranking
+   * that would pick the right key to drop, and the attacker chose every
+   * candidate. The fourth used least-recently-used order on the theory that a
+   * key at its limit is one being sent to constantly -- which is false in the
+   * one case that matters, because a caller being rejected stops sending.
    *
-   * These test the two properties a ranking was being asked to provide, which
-   * is what should have been tested all along. Eviction hands out a *fresh*
-   * window, so the harm is never "an idle caller was dropped" -- an idle caller
-   * was not being limited. The harm is a blocked caller getting a free pass, or
-   * a flood reaching a bucket it has no business touching.
+   * These test the property directly rather than a traffic pattern that
+   * happens to be safe.
    */
-  it('keeps blocking a caller who is at their limit throughout a flood', async () => {
+  it('keeps blocking a caller who backs off after their 429', async () => {
     const { rateLimit, resetRateLimits } = await import('../src/lib/ratelimit.js');
     resetRateLimits();
 
-    // A caller who has spent their whole allowance.
-    for (let n = 0; n < 12; n += 1) rateLimit('ingest:t1:i:1.2.3.4', 10);
-    expect(rateLimit('ingest:t1:i:1.2.3.4', 10).allowed).toBe(false);
+    // A caller who has spent their allowance -- and then, as the tracker does
+    // on a 429, stops. Not one further request from them during the flood.
+    // The previous version re-touched this key every thousand flood keys,
+    // which is exactly the interleaving where LRU cannot fail.
+    for (let n = 0; n < 12; n += 1) rateLimit('ingest:victim:i:1.2.3.4', 10);
+    expect(rateLimit('ingest:victim:i:1.2.3.4', 10).allowed).toBe(false);
 
-    // A flood in the same class, well past its ceiling, touching each key
-    // twice. Interleaved, because a flood is concurrent with real traffic --
-    // and because a caller being rejected is a caller still sending.
-    let freePasses = 0;
-    for (let n = 0; n < 260_000; n += 1) {
-      rateLimit(`ingest:t1:i:10.0.${n % 256}.${n % 251}:a:v${n}`, 1_000_000);
-      rateLimit(`ingest:t1:i:10.0.${n % 256}.${n % 251}:a:v${n}`, 1_000_000);
-      if (n % 1_000 === 0 && rateLimit('ingest:t1:i:1.2.3.4', 10).allowed) freePasses += 1;
+    // A flood large enough to turn the map over several times, under a
+    // different tenant -- a public site key is in every storefront's page
+    // source, so this is not a privileged position to attack from.
+    for (let n = 0; n < 600_000; n += 1) {
+      rateLimit(`ingest:flooder:i:10.0.0.1:a:v${n}`, 1_000_000);
+      rateLimit(`ingest:flooder:i:10.0.0.1:a:v${n}`, 1_000_000);
     }
 
-    expect(freePasses).toBe(0);
-    expect(rateLimit('ingest:t1:i:1.2.3.4', 10).allowed).toBe(false);
+    const after = rateLimit('ingest:victim:i:1.2.3.4', 10);
+    expect(after.allowed).toBe(false);
+    expect(after.remaining).toBe(0);
   });
 
   it('cannot reach the tenant bucket from the ingest class at all', async () => {
@@ -1355,13 +1353,12 @@ describe('a key flood cannot buy anybody a fresh window (HIGH)', () => {
     // Every tenant on the box, idle: one admin call each and nothing since.
     for (let t = 0; t < 20; t += 1) rateLimit(`admin:tenant-${t}`, 10);
 
-    for (let n = 0; n < 260_000; n += 1) {
-      rateLimit(`ingest:t1:i:10.0.0.1:a:v${n}`, 1_000_000);
-      rateLimit(`ingest:t1:i:10.0.0.1:a:v${n}`, 1_000_000);
+    for (let n = 0; n < 600_000; n += 1) {
+      rateLimit(`ingest:flooder:i:10.0.0.1:a:v${n}`, 1_000_000);
     }
 
-    // Not one of them was evicted: a surviving bucket remembers its count, an
-    // evicted one starts again at 1.
+    // Not one was evicted: a surviving bucket remembers its count, an evicted
+    // one starts again at 1.
     for (let t = 0; t < 20; t += 1) {
       const admin = rateLimit(`admin:tenant-${t}`, 10);
       expect(10 - admin.remaining, `tenant-${t}`).toBe(2);
@@ -1370,30 +1367,52 @@ describe('a key flood cannot buy anybody a fresh window (HIGH)', () => {
     // And the flood is held at its own ceiling rather than growing without
     // bound: sweeping alone frees nothing while the keys are still live.
     const sizes = rateLimitSizes();
-    expect(sizes.ingest).toBeLessThanOrEqual(200_000);
+    expect(sizes.ingest).toBeLessThanOrEqual(400_000); // two generations
     expect(sizes.admin).toBe(20);
   });
 
+  it('does not let a key class be invented by its name', async () => {
+    // `name in CEILINGS` is true for 'toString', 'constructor' and 'valueOf',
+    // and the ceiling then comes back as a *function* -- so `size >= ceiling`
+    // is NaN, nothing rotates, and that class grows without bound. No call
+    // site mints such a key today, which is exactly why it would have gone
+    // unnoticed.
+    const { rateLimit, resetRateLimits, rateLimitSizes } = await import(
+      '../src/lib/ratelimit.js'
+    );
+    resetRateLimits();
+    for (let n = 0; n < 120_000; n += 1) rateLimit(`toString:${n}`, 10);
+    expect(Object.keys(rateLimitSizes())).toEqual(['other']);
+    expect(rateLimitSizes().other).toBeLessThanOrEqual(100_000);
+  });
+
   it('does not spend the event loop on the flood it is absorbing', async () => {
-    // The size-triggered sweep ran a full walk and then a full sort of the map
-    // whenever it was large, on a path that runs twice per ingest request.
-    // Past the threshold that was one sort of 200,000 entries per second:
-    // 60 ms of blocked event loop per second and 15 MB of garbage per sweep,
-    // which is a worse denial of service than the one it guarded against.
+    // Keeping LRU order cost a `delete` and a `set` on every touch, and
+    // evicting walked `keys()` from the front. Both leave tombstones in V8's
+    // Map that later iteration must walk past: measured at 40 us per insert
+    // and 58 us per touch on a map at its ceiling, against 1.8 us for the same
+    // Map operations in isolation. Two calls per ingest request made the
+    // limiter the denial of service.
     const { rateLimit, resetRateLimits } = await import('../src/lib/ratelimit.js');
     resetRateLimits();
 
     for (let n = 0; n < 220_000; n += 1) rateLimit(`ingest:t1:i:10.0.0.1:a:v${n}`, 1_000_000);
 
-    // Steady state, over the ceiling, which is where the sort used to live.
-    let worst = 0;
-    for (let n = 0; n < 20_000; n += 1) {
-      const started = performance.now();
-      rateLimit(`ingest:t1:i:10.0.0.2:a:w${n}`, 1_000_000);
-      worst = Math.max(worst, performance.now() - started);
-    }
-    // One insert, one eviction. Anything linear in the map size shows up here
-    // immediately: the sort measured 60 ms on a map this size.
-    expect(worst).toBeLessThan(15);
+    // Both paths, at the ceiling, where the cost used to live. Timed in bulk
+    // rather than per call: a per-call worst case is a GC pause, while a mean
+    // over 20,000 is the throughput the API actually gets.
+    const insertStart = performance.now();
+    for (let n = 0; n < 20_000; n += 1) rateLimit(`ingest:t1:i:10.0.0.2:a:w${n}`, 1_000_000);
+    const perInsert = ((performance.now() - insertStart) * 1000) / 20_000;
+
+    const touchStart = performance.now();
+    for (let n = 0; n < 20_000; n += 1) rateLimit('ingest:t1:i:10.0.0.3:a:steady', 10_000_000);
+    const perTouch = ((performance.now() - touchStart) * 1000) / 20_000;
+
+    // Two of these run per ingest request. The bar is roughly four times what
+    // generations measure and a tenth of what the LRU version did, so it
+    // separates the two designs rather than merely being satisfiable.
+    expect(perInsert, `${perInsert.toFixed(1)}us per insert`).toBeLessThan(6);
+    expect(perTouch, `${perTouch.toFixed(1)}us per touch`).toBeLessThan(6);
   });
 });

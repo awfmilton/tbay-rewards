@@ -902,11 +902,18 @@ identity — and keeps the wallet wherever money is still owed to it.
 
 | State | What happens |
 |---|---|
-| Spend intent `pending`/`verifying`, still live | **Refused**, with the intent named. A checkout is in progress and erasing mid-payment loses the store credit the customer is about to be owed. It clears itself when the intent expires, or `POST /v1/token/spend/{id}/cancel` clears it now. |
-| Spend intent `expired` inside 30 days | Erased, but `from_address` is **kept**. `expires_at` bounds the quote, not the money: a customer who sent their TBAY and lost the tab has tokens at the retailer's payout wallet, and that address is the only thing a hand-settlement can match on. `POST .../verify` still works on it. |
-| Spend intent `verified`, `cancelled`, or expired over 30 days ago | Fully scrubbed. Nothing is owed. |
-| Bridge withdrawal `pending` or `burn_verified` | Erased, addresses **kept**, and counted in `obligations_kept` on the response. The L2 tokens are already burned and the L1 release has to reach the wallet that burned them. |
+| Spend intent `pending`/`verifying`, still live | **Refused**, with the intent named. A checkout is in progress and erasing mid-payment loses the store credit the customer is about to be owed. `POST /v1/token/spend/{id}/cancel` clears an open intent now, and one stuck mid-verification ten minutes after the request that abandoned it; otherwise it clears itself. |
+| Spend intent lapsed inside 30 days | Erased, with `from_address` replaced by a **tenant-salted digest**. `expires_at` bounds the quote, not the money: a customer who sent their TBAY and lost the tab has tokens at the retailer's payout wallet. The digest answers the only question a settlement asks — "did this transfer come from the wallet this intent was opened for?" — so `POST .../verify` still works, while the address itself is gone and cannot be joined back to anyone. |
+| Spend intent `verified`, `cancelled`, or lapsed over 30 days ago | Fully scrubbed. Nothing is owed. |
+| Bridge withdrawal `pending` or `burn_verified` | Addresses **kept**, `contact_id` and `member_id` nulled, and counted in `obligations_kept` on the response. The L2 tokens are already burned and the L1 release can only reach the wallet that burned them, so a digest is no use — somebody has to send to that address. The link goes instead: what is left is a debt to a wallet with nothing in the system saying whose it was. The retailer finds it the way they find every other outstanding release, by listing `burn_verified` withdrawals. |
 | Bridge withdrawal `released` or `rejected` | Fully scrubbed. |
+
+A wallet address is never kept in a form that can be joined back to a person.
+`members.wallet_address` is plaintext, unique and platform-wide, and it is only
+cleared when the erased contact was that person's last one anywhere — so a kept
+raw address on a spend intent joined straight to their live, fully identified
+record at another retailer. That is why the intent keeps a digest and the
+withdrawal keeps no link.
 
 Erasure never refuses indefinitely and never destroys a payout address. An
 earlier version refused on any unsettled withdrawal and named "release or

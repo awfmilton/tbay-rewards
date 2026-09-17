@@ -9,51 +9,87 @@
 interface Window {
   count: number;
   resetAt: number;
+  /** The ceiling this key was last measured against; see rotate(). */
+  limit: number;
 }
 
 /**
- * One map per key class, and that is the actual defence.
+ * Two generations per class, rotated. Four attempts came before this one.
  *
- * Three rounds were spent looking for a ranking that would decide which key to
- * drop when the map is full, and every candidate was chosen by the attacker.
- * Insertion order took the longest-lived buckets, which are the tenant's own.
- * "count <= 1" was beaten by touching each minted key twice, at no cost.
- * Ranking by count was beaten the same way, because an idle admin bucket sits
- * at count 1 and a flood key touched twice sits above it -- measured at admin
- * evicted in every configuration and 200,000 of 210,000 flood keys kept.
+ * The first three looked for a *ranking* that would pick the right key to drop
+ * when the map is full, and the attacker chose every candidate: insertion order
+ * took the longest-lived buckets, which are the tenant's own; "count <= 1" and
+ * then ranking by count were both beaten by touching each minted key twice,
+ * which costs nothing.
  *
- * The mistake was looking for a ranking at all. The keys are not
- * interchangeable: `admin:<tenant>` is minted by provisioning a tenant, and
- * there is one per tenant, while `ingest:...:<address>:<visitor>` is minted by
- * whoever is calling. Only the second kind is unbounded, so only the second
- * kind needs a ceiling, and a flood confined to its own class cannot reach the
- * tenant's bucket however it is shaped.
+ * The fourth used least-recently-used order, on the theory that a key at its
+ * limit is one being sent to constantly and therefore safe. That theory was
+ * wrong in the one case that matters: a caller who is being rejected *stops
+ * sending* -- the tracker drops a 429 silently -- so their bucket becomes the
+ * least recently used thing in the map and is the first to go, which hands them
+ * a brand-new window. Measured: at limit, allowed=false; after an unrelated
+ * flood, allowed=true with a full allowance restored.
  *
- * Within a class the order is least-recently-used, which is the one statistic
- * that cannot be gamed in the attacker's favour: to keep a key out of reach of
- * eviction they have to keep sending to it, and a key being sent to constantly
- * is a key the limiter is already rejecting. Being evicted hands out a fresh
- * window, so the keys that must survive are the ones at their limit -- and
- * those are, by definition, the most recently used.
+ * It was also slow. Keeping LRU order meant `delete` then `set` on every touch,
+ * and evicting meant walking `keys()` from the front. Both leave tombstones in
+ * V8's Map, and an iterator has to walk past them: measured at 40 us per insert
+ * and 58 us per touch on a map at its ceiling, against 1.8 us for the same Map
+ * operations in isolation. Two calls per ingest request made the limiter itself
+ * the denial of service.
+ *
+ * So: no ranking and no deletes. New keys land in `live`; when `live` fills, it
+ * becomes `old` and a fresh `live` starts, carrying over the buckets that are
+ * at their limit. A key touched during either generation survives; a key nobody
+ * has touched for two generations is gone. Dropping a generation is one
+ * assignment, a touch is a field write, and a caller being rejected is carried
+ * over by name rather than by hoping their traffic pattern protects them.
+ */
+interface Klass {
+  live: Map<string, Window>;
+  old: Map<string, Window>;
+}
+
+/**
+ * Where each class stops growing.
+ *
+ * The classes are the actual defence against a key flood: `admin:<tenant>` is
+ * minted by provisioning a tenant and there is one per tenant, while
+ * `ingest:...:<address>:<visitor>` is minted by whoever is calling. Only the
+ * second is unbounded, so a flood is confined to it and cannot reach a tenant's
+ * own bucket however it is shaped.
+ *
+ * Within the ingest class every tenant shares one budget, which is safe only
+ * because of the carry-over above: one site's flood can drop another site's
+ * *idle* buckets -- handing a fresh window to somebody who was not being
+ * limited, which costs nothing -- but it cannot drop a bucket that is at its
+ * limit, which is the only eviction that would actually buy anybody throughput.
  */
 const CEILINGS: Record<string, number> = {
-  // One key per tenant, minted by provisioning rather than by a caller. The
-  // ceiling is a backstop, not a budget anyone can spend.
   admin: 100_000,
-  // Per address and per visitor. This is the only unbounded class, so it is
-  // the one a flood is confined to.
   ingest: 200_000,
-  // Anything else, including keys added later that nobody thought to classify.
   other: 50_000,
 };
 
-const classes = new Map<string, Map<string, Window>>();
+/**
+ * How much of a generation may be carried over for being at its limit.
+ *
+ * A bucket only qualifies by exceeding its own limit, which costs the caller
+ * that many requests, so in practice this is far out of reach -- 200,000
+ * blocked ingest buckets would take 120 million requests inside one window. It
+ * is here so that a full carry cannot rotate the generation on every insert.
+ */
+const CARRY_FRACTION = 0.25;
+
+const classes = new Map<string, Klass>();
 let lastSweep = Date.now();
 
 function classOf(key: string): string {
   const separator = key.indexOf(':');
   const name = separator === -1 ? key : key.slice(0, separator);
-  return name in CEILINGS ? name : 'other';
+  // Own property only. `name in CEILINGS` is true for 'toString' and
+  // 'constructor', and the ceiling then comes back as a function, so
+  // `size > ceiling` is NaN and nothing is ever evicted.
+  return Object.hasOwn(CEILINGS, name) ? name : 'other';
 }
 
 export interface RateLimitResult {
@@ -62,44 +98,57 @@ export interface RateLimitResult {
   resetAt: number;
 }
 
+/**
+ * Start a new generation, keeping the buckets that are at their limit.
+ *
+ * Rebuilt rather than filtered in place: every delete leaves a tombstone that
+ * later iteration has to walk past, which is what made the previous version
+ * quadratic in practice. This runs once per ceiling-worth of inserts, so it is
+ * one carried entry per insert amortised.
+ */
+function rotate(klass: Klass, ceiling: number, now: number): void {
+  const carried = new Map<string, Window>();
+  const carryCap = Math.floor(ceiling * CARRY_FRACTION);
+  for (const [key, window] of klass.live) {
+    if (carried.size >= carryCap) break;
+    if (window.resetAt > now && window.count >= window.limit) carried.set(key, window);
+  }
+  klass.old = klass.live;
+  klass.live = carried;
+}
+
 export function rateLimit(key: string, limit: number, windowMs = 60_000): RateLimitResult {
   const now = Date.now();
 
-  // Scheduled reclamation only.
-  //
-  // There used to be a second, size-triggered sweep that ran a full walk and
-  // then a full sort whenever the map was large. Past the threshold that meant
-  // one sort of 200,000 entries per second on a path that runs twice per
-  // ingest request -- measured at 60 ms of blocked event loop per second and
-  // 15 MB of garbage per sweep, which is a bigger denial of service than the
-  // one it was guarding against. The ceilings below bound the size exactly, in
-  // constant time per insert, so there is nothing left for it to do.
+  // Scheduled reclamation, by rebuild. A generation rotation already frees
+  // whatever a busy class stops touching; this is for a quiet one, where the
+  // map never fills and expired windows would otherwise sit there until it
+  // did.
   if (now - lastSweep > windowMs) {
-    for (const windows of classes.values()) {
-      for (const [existing, window] of windows) {
-        if (window.resetAt <= now) windows.delete(existing);
+    for (const klass of classes.values()) {
+      klass.old = new Map();
+      const keep = new Map<string, Window>();
+      for (const [existing, window] of klass.live) {
+        if (window.resetAt > now) keep.set(existing, window);
       }
+      klass.live = keep;
     }
     lastSweep = now;
   }
 
-  const klass = classOf(key);
-  let windows = classes.get(klass);
-  if (!windows) {
-    windows = new Map();
-    classes.set(klass, windows);
+  const name = classOf(key);
+  let klass = classes.get(name);
+  if (!klass) {
+    klass = { live: new Map(), old: new Map() };
+    classes.set(name, klass);
   }
 
-  const current = windows.get(key);
+  // A hit in `live` is a field write and nothing else: no map mutation, so no
+  // tombstone and no rehash on the hottest path in the system.
+  const current = klass.live.get(key);
   if (current && current.resetAt > now) {
     current.count += 1;
-    // Move to the back, so "least recently used" means what it says. A Map
-    // keeps insertion order and `set` on an existing key does not change it,
-    // so without the delete this would be first-seen order -- which is how
-    // the very first version of this evicted the steady callers and kept the
-    // flood.
-    windows.delete(key);
-    windows.set(key, current);
+    current.limit = limit;
     return {
       allowed: current.count <= limit,
       remaining: Math.max(0, limit - current.count),
@@ -107,24 +156,26 @@ export function rateLimit(key: string, limit: number, windowMs = 60_000): RateLi
     };
   }
 
-  const resetAt = now + windowMs;
-  windows.delete(key);
-  windows.set(key, { count: 1, resetAt });
-
-  // Constant work: drop from the front, which is the end nobody has touched.
-  // Sweeping alone could never do this -- it only deletes windows that have
-  // already expired, so a map of live keys frees nothing however often it
-  // runs, and a caller who can mint keys (a spoofable address, a routed IPv6
-  // /64) would grow it without bound.
-  const ceiling = CEILINGS[klass]!;
-  let over = windows.size - ceiling;
-  if (over > 0) {
-    for (const oldest of windows.keys()) {
-      if (over <= 0) break;
-      windows.delete(oldest);
-      over -= 1;
+  // A hit in the previous generation is promoted, which is what makes this
+  // approximate least-recently-used rather than a fixed lifetime.
+  if (!current) {
+    const previous = klass.old.get(key);
+    if (previous && previous.resetAt > now) {
+      previous.count += 1;
+      previous.limit = limit;
+      klass.live.set(key, previous);
+      if (klass.live.size >= CEILINGS[name]!) rotate(klass, CEILINGS[name]!, now);
+      return {
+        allowed: previous.count <= limit,
+        remaining: Math.max(0, limit - previous.count),
+        resetAt: previous.resetAt,
+      };
     }
   }
+
+  const resetAt = now + windowMs;
+  klass.live.set(key, { count: 1, resetAt, limit });
+  if (klass.live.size >= CEILINGS[name]!) rotate(klass, CEILINGS[name]!, now);
 
   return { allowed: 1 <= limit, remaining: Math.max(0, limit - 1), resetAt };
 }
@@ -136,7 +187,10 @@ export function resetRateLimits(): void {
 
 /** Live key counts per class. Test and diagnostics helper. */
 export function rateLimitSizes(): Record<string, number> {
-  const sizes: Record<string, number> = {};
-  for (const [klass, windows] of classes) sizes[klass] = windows.size;
+  // Null-prototype, so a class named after an Object method cannot be
+  // confused with the method it is named after -- the same trap classOf sits
+  // next to.
+  const sizes: Record<string, number> = Object.create(null) as Record<string, number>;
+  for (const [name, klass] of classes) sizes[name] = klass.live.size + klass.old.size;
   return sizes;
 }

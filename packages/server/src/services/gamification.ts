@@ -911,8 +911,16 @@ export async function reevaluateAll(
   promoted: number;
   badgesAwarded: number;
   skipped: number;
-  /** Which contacts were skipped, capped so a huge run stays a usable reply. */
+  /** Which contacts were skipped for having gone, capped so a huge run stays a usable reply. */
   missing: string[];
+  /**
+   * Contacts the sweep could not evaluate, with the reason.
+   *
+   * Separate from `missing` because they mean opposite things: a contact that
+   * went away is the sweep working as intended, and one it refused to evaluate
+   * is a setting somebody has to change. Empty is the normal answer.
+   */
+  problems: string[];
 }> {
   const doBadges = options.badges ?? true;
   const doRanks = options.ranks ?? true;
@@ -925,6 +933,8 @@ export async function reevaluateAll(
   /** Contacts that went away mid-sweep, most often to a merge. */
   let skipped = 0;
   const missing: string[] = [];
+  /** Contacts the sweep refused to evaluate, with the reason. */
+  const problems: string[] = [];
 
   // Every currency's ladder, since a member holds one rank per currency. For a
   // retailer with a single currency this is the one pass it always was.
@@ -946,6 +956,7 @@ export async function reevaluateAll(
 
     for (const row of rows) {
       contacts += 1;
+      let badgeFailed = false;
 
       // One transaction per contact. `runner` here is the pool, so handing it
       // straight to evaluateBadges made its ledger INSERT and the balance
@@ -954,48 +965,87 @@ export async function reevaluateAll(
       // ledger is supposed to make impossible. Per contact rather than per
       // batch so a tenant with 200,000 members still never holds one snapshot
       // open for the whole run.
+      // Badges and ranks in separate transactions, not one.
+      //
+      // Each is atomic in itself -- evaluateBadges writes a ledger row and a
+      // balance together, and neither may half-apply -- but they are not
+      // atomic with *each other*, and pairing them meant a badge that refused
+      // rolled back the rank the same member had just qualified for. One
+      // retired currency on one badge and that member stayed on a stale tier,
+      // for a reason that had nothing to do with their rank. Per contact
+      // rather than per batch either way, so a tenant with 200,000 members
+      // never holds one snapshot open for the whole run.
       try {
-        await withTransaction(async (client) => {
-          if (doBadges) {
+        if (doBadges) {
+          await withTransaction(async (client) => {
             const earned = await evaluateBadges(tenantId, row.id, client);
             badgesAwarded += earned.length;
-          }
-          if (doRanks) {
+          });
+        }
+      } catch (error) {
+        if (!(error instanceof ApiError) || error.statusCode >= 500) throw error;
+        if (error.statusCode === 404) missing.push(row.id);
+        else if (problems.length < 20) problems.push(`${row.id}: ${error.message}`);
+        badgeFailed = true;
+      }
+
+      try {
+        if (doRanks) {
+          await withTransaction(async (client) => {
             for (const ladder of ladders) {
               const result = await evaluateRank(tenantId, row.id, client, ladder);
               if (result.promoted) promoted += 1;
             }
-          }
-        });
+          });
+        }
       } catch (error) {
-        // One contact that went away must not end the run -- and nothing else
-        // qualifies.
+        // A bulk job finishes, and says what it could not do.
         //
-        // This walks the whole member list, and a row can vanish under it: a
-        // merge makes the contact disappear and every writer answers "no
-        // longer exists" by design, which with no handler here aborted the
-        // sweep and left the tenant's re-rank half applied.
+        // Two wrong answers came before this one. Catching nothing meant a
+        // contact merged away mid-sweep -- ordinary, since this walks the
+        // whole member list -- aborted the run and left the tenant's re-rank
+        // half applied. Catching every 4xx meant a misconfiguration reported
+        // 200 OK with {contacts: 200, skipped: 190} while ten people were
+        // actually re-ranked, and nothing said why.
         //
-        // Catching every 4xx instead was far too wide. A misconfiguration --
-        // a point type that cannot be resolved, a rule that refuses -- fails
-        // for *every* contact, and the run reported 200 OK with
-        // {contacts: 200, skipped: 190} while ten people were actually
-        // re-ranked and nothing was written anywhere. A bulk job may skip what
-        // has gone; it may not skip what it is doing wrong.
-        const gone = error instanceof ApiError && error.statusCode === 404;
-        if (!gone) throw error;
-        skipped += 1;
-        // Named, not just counted: "190 skipped" is a number nobody can act
-        // on unless they can see which members and why.
-        missing.push(row.id);
+        // Narrowing it to 404 was the third wrong answer, and worse than
+        // either: a badge whose point type has been turned off throws 422, and
+        // only the members who *qualify* for that badge reach it, so the run
+        // died partway through and every retry died at the same contact.
+        // `POST /v1/gamification/reevaluate` stayed broken for that tenant
+        // until somebody guessed which badge was at fault, with the members
+        // after it left on stale ranks indefinitely.
+        //
+        // A 5xx is still fatal: that is the database or the process, not this
+        // contact, and carrying on would write nonsense 200,000 times.
+        if (!(error instanceof ApiError) || error.statusCode >= 500) throw error;
+        // Named and explained, not just counted. "190 skipped" is a number
+        // nobody can act on; "190 skipped, all of them 'The Stars currency is
+        // turned off'" names the setting to change.
+        if (error.statusCode === 404) {
+          if (!missing.includes(row.id)) missing.push(row.id);
+        } else if (problems.length < 20) {
+          problems.push(`${row.id}: ${error.message}`);
+        }
+        badgeFailed = true;
       }
+
+      // One contact counts once, however many of its two halves refused.
+      if (badgeFailed) skipped += 1;
     }
 
     after = rows[rows.length - 1]!.id;
     if (rows.length < batchSize) break;
   }
 
-  return { contacts, promoted, badgesAwarded, skipped, missing: missing.slice(0, 100) };
+  return {
+    contacts,
+    promoted,
+    badgesAwarded,
+    skipped,
+    missing: missing.slice(0, 100),
+    problems,
+  };
 }
 
 /**

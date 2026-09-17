@@ -12,7 +12,7 @@ import {
 } from '../lib/chain.js';
 import { getBalance, getBalances, reverse, spend, type Balance } from './points.js';
 import { assertConvertible } from './point-types.js';
-import { randomCode } from '../lib/crypto.js';
+import { hashPii, randomCode } from '../lib/crypto.js';
 import type { Tenant } from './tenants.js';
 import type { Contact } from './contacts.js';
 
@@ -41,6 +41,7 @@ export interface TokenClaim {
   status: 'signed' | 'claimed' | 'expired' | 'cancelled';
   ledger_entry_id: string | null;
   tx_hash: string | null;
+  verify_token: string | null;
   expires_at: Date;
   /** When the reconcile sweep last asked the chain about this voucher. */
   last_checked_at: Date | null;
@@ -591,7 +592,8 @@ export async function expireStaleSpendIntents(runner: Queryable = db()): Promise
   // straight back to the race the claim exists to close.
   await runner.query(
     `UPDATE token_spend_intents
-        SET status = 'pending', verify_claimed_at = NULL
+        SET status = CASE WHEN expires_at <= now() THEN 'expired' ELSE 'pending' END,
+            verify_claimed_at = NULL, verify_token = NULL
       WHERE status = 'verifying'
         AND verify_claimed_at < now() - $1::interval`,
     [STALE_VERIFY_CLAIM],
@@ -640,10 +642,22 @@ export async function cancelSpendIntent(
 ): Promise<SpendIntent | null> {
   return queryOne<SpendIntent>(
     runner,
-    `UPDATE token_spend_intents SET status = 'cancelled'
-      WHERE tenant_id = $1 AND id = $2 AND status IN ('pending', 'expired')
+    // A stranded verification counts as open.
+    //
+    // Erasure refuses while an intent is being verified and names this route
+    // as the way to clear it -- and this route refused a verifying row, so the
+    // remedy the error gave could not be carried out, which is the same defect
+    // one state narrower. A claim older than the reaper's window is not a
+    // verification in progress, it is a request that never came back.
+    `UPDATE token_spend_intents SET status = 'cancelled',
+            verify_claimed_at = NULL, verify_token = NULL
+      WHERE tenant_id = $1 AND id = $2
+        AND (
+          status IN ('pending', 'expired')
+          OR (status = 'verifying' AND verify_claimed_at < now() - $3::interval)
+        )
       RETURNING *`,
-    [tenantId, intentId],
+    [tenantId, intentId, STALE_VERIFY_CLAIM],
   );
 }
 
@@ -812,6 +826,7 @@ export interface SpendIntent {
   currency: string;
   status: 'pending' | 'verifying' | 'verified' | 'expired' | 'cancelled';
   tx_hash: string | null;
+  verify_token: string | null;
   expires_at: Date;
 }
 
@@ -942,12 +957,18 @@ export async function verifySpendIntent(
   const claimed = await queryOne<SpendIntent>(
     db(),
     `UPDATE token_spend_intents
-        SET status = 'verifying', verify_claimed_at = now()
+        SET status = 'verifying', verify_claimed_at = now(),
+            verify_token = gen_random_uuid()
       WHERE tenant_id = $1 AND id = $2
-        AND (
-          status = 'pending'
-          OR (status = 'expired' AND expires_at > now() - ($3 || ' days')::interval)
-        )
+        AND status IN ('pending', 'expired')
+        -- The window applies to both states. Bounding only the expired ones
+        -- left the whole rule leaning on a five-minute worker: with the worker
+        -- process down, or RUN_WORKERS=false, every open intent stayed pending
+        -- and was settleable indefinitely at a quote that may have carried a
+        -- promotional bonus rate since withdrawn. Measured: two identical
+        -- intents 400 days past their quote, the expired one refused and the
+        -- pending one settled for 5,500 cents.
+        AND expires_at > now() - ($3 || ' days')::interval
       RETURNING *`,
     [tenant.id, intentId, String(SPEND_SETTLEMENT_DAYS)],
   );
@@ -964,9 +985,13 @@ export async function verifySpendIntent(
     if (existing.status === 'verifying') {
       throw ApiError.conflict('That spend intent is already being verified');
     }
-    if (existing.status === 'expired') {
+    // Open, but past the window rather than in the wrong state. Said as such:
+    // "Intent is pending" for an intent four hundred days old is true and
+    // useless, and it was what a caller saw once the bound covered both
+    // states instead of only the expired ones.
+    if (existing.status === 'pending' || existing.status === 'expired') {
       throw ApiError.unprocessable(
-        `Spend intent expired more than ${SPEND_SETTLEMENT_DAYS} days ago and can no longer be settled`,
+        `Spend intent lapsed more than ${SPEND_SETTLEMENT_DAYS} days ago and can no longer be settled`,
       );
     }
     throw ApiError.unprocessable(`Intent is ${existing.status}`);
@@ -978,9 +1003,18 @@ export async function verifySpendIntent(
   // in a state only the reaper can leave.
   const release = async (): Promise<void> => {
     await db().query(
-      `UPDATE token_spend_intents SET status = 'pending', verify_claimed_at = NULL
-        WHERE id = $1 AND status = 'verifying'`,
-      [intent.id],
+      // Scoped to this claim, and restoring the status the row actually had.
+      //
+      // Unscoped, a failing request released a claim another verification was
+      // still holding, and that one came back from the chain to be told it had
+      // "already been settled". Unconditionally 'pending', an intent claimed
+      // from 'expired' came back as 'pending' -- which, before the window
+      // covered both states, laundered it into something settleable forever.
+      `UPDATE token_spend_intents
+          SET status = CASE WHEN expires_at <= now() THEN 'expired' ELSE 'pending' END,
+              verify_claimed_at = NULL, verify_token = NULL
+        WHERE id = $1 AND status = 'verifying' AND verify_token = $2`,
+      [intent.id, intent.verify_token],
     );
   };
 
@@ -995,9 +1029,19 @@ export async function verifySpendIntent(
   const required = BigInt(intent.token_amount_wei);
   const minConfirmations = opts.minConfirmations ?? 1;
 
+  // Erasure replaces `from_address` with a keyed digest on an intent that
+  // could still be settled, so that a wallet is not kept on file against
+  // somebody who asked to be forgotten. The digest still answers the only
+  // question settlement asks -- "did this transfer come from the wallet this
+  // intent was opened for?" -- so a late settlement keeps working afterwards.
+  const sentBy = (address: string): boolean =>
+    intent.from_address.startsWith('erased:')
+      ? `erased:${hashPii(address.toLowerCase(), tenant.pii_salt)}` === intent.from_address
+      : address.toLowerCase() === intent.from_address.toLowerCase();
+
   const match = transfers.find(
     (transfer) =>
-      transfer.from.toLowerCase() === intent.from_address.toLowerCase() &&
+      sentBy(transfer.from) &&
       transfer.to.toLowerCase() === intent.to_address.toLowerCase() &&
       transfer.value >= required &&
       transfer.confirmations >= minConfirmations,
@@ -1014,14 +1058,38 @@ export async function verifySpendIntent(
     return await withTransaction(async (tx) => {
       const updated = await queryOne<SpendIntent>(
         tx,
+        // A proved transfer outranks the claim that was taken to look for it.
+        //
+        // The claim exists to stop the expiry worker relabelling a row while a
+        // verification is in flight; it is not a licence, and losing it is not
+        // evidence about the chain. Guarding the write on the claim token made
+        // a genuine settlement answer 409 "already settled" whenever the RPC
+        // outlived STALE_VERIFY_CLAIM and the reaper released it first --
+        // which is reachable, because transfersInTx makes several sequential
+        // ethers calls whose default timeout is five minutes each. The
+        // customer's TBAY was at the retailer's payout wallet and the reply
+        // said the opposite of the truth.
+        //
+        // What actually happened on the chain wins, exactly as a delivered
+        // email outranks the reaper that gave up on it. Settling twice is
+        // impossible anyway: (chain_id, tx_hash) is unique.
         `UPDATE token_spend_intents
             SET status = 'verified', verified_at = now(), tx_hash = $2,
-                verify_claimed_at = NULL
-          WHERE id = $1 AND status = 'verifying'
+                verify_claimed_at = NULL, verify_token = NULL
+          WHERE id = $1 AND status NOT IN ('verified', 'cancelled')
           RETURNING *`,
         [intent.id, txHash],
       );
-      if (!updated) throw ApiError.conflict('Spend intent was already settled');
+      if (!updated) {
+        const settled = await queryOne<SpendIntent>(
+          tx,
+          'SELECT status FROM token_spend_intents WHERE id = $1',
+          [intent.id],
+        );
+        throw settled?.status === 'cancelled'
+          ? ApiError.unprocessable('That spend intent was cancelled')
+          : ApiError.conflict('Spend intent was already settled');
+      }
 
       const code = `TBAY-${randomCode(10)}`;
       const credit = await queryOne<{ code: string; amount_cents: number; currency: string }>(
@@ -1048,6 +1116,13 @@ export async function verifySpendIntent(
     // has to come back out of 'verifying' either way, or the customer cannot
     // retry and the worker has to wait ten minutes to notice.
     await release();
+    // The (chain_id, tx_hash) unique index is what stops one transfer settling
+    // two intents, and it was doing its job -- but a bare Postgres 23505 has
+    // no statusCode, so the error handler answered 500 internal_error and the
+    // customer retried into the same 500 forever. Say what actually happened.
+    if ((err as { code?: unknown } | null)?.code === '23505') {
+      throw ApiError.conflict('That transaction has already been used to settle a spend intent');
+    }
     throw err;
   }
 }

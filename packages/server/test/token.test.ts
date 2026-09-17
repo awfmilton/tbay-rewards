@@ -20,6 +20,7 @@ import {
 import { upsertContact } from '../src/services/contacts.js';
 import { award, getBalance } from '../src/services/points.js';
 import {
+  cancelSpendIntent,
   createSpendIntent,
   expireStaleClaims,
   expireStaleSpendIntents,
@@ -643,6 +644,157 @@ describe('spending TBAY at a retailer', () => {
     await expect(verifySpendIntent(tenantRow, ancient.id, '0xfeedfacefeedface')).rejects.toThrow(
       /can no longer be settled/i,
     );
+  });
+
+  it('does not let one verification release another one\'s claim (HIGH)', async () => {
+    // `release()` said only "whatever claim exists on this row", so a failing
+    // request released a claim a *different*, still-running verification was
+    // holding. That one came back from the chain with the customer's real
+    // transfer and was told 409 "Spend intent was already settled" -- the
+    // opposite of the truth, with the tokens at the retailer's payout wallet
+    // and a caller that treats 409 as terminal stopping there.
+    await updateTenantSettings(db(), tenant.id, { payoutWallet: PAYOUT });
+    const contact = await fundedContact(0, 'contended@example.com');
+    const tenantRow = await tenantObject();
+    const { intent } = await createSpendIntent(tenantRow, {
+      contact,
+      amountTokens: 5,
+      fromAddress: CUSTOMER,
+    });
+
+    let interloper: Promise<unknown> | null = null;
+    setChainClient(
+      stubChain({
+        transfersInTx: async (hash: string) => {
+          if (hash === '0xreal' && interloper === null) {
+            // While the real verification is on the chain, the worker reaps
+            // its claim and a second request with a stale hash takes the row,
+            // misses, and releases it.
+            await db().query(
+              `UPDATE token_spend_intents SET verify_claimed_at = now() - interval '20 minutes'
+                WHERE id = $1`,
+              [intent.id],
+            );
+            await expireStaleSpendIntents();
+            interloper = verifySpendIntent(tenantRow, intent.id, '0xstale').catch(() => null);
+            await interloper;
+          }
+          return hash === '0xreal'
+            ? [
+                {
+                  from: getAddress(CUSTOMER),
+                  to: getAddress(PAYOUT),
+                  value: tokensToWei(5),
+                  blockNumber: 100,
+                  confirmations: 3,
+                },
+              ]
+            : [];
+        },
+      }),
+    );
+
+    // The real settlement must still land, or be refused for a reason that is
+    // true. It must never be told the intent was settled when it was not.
+    const settled = await verifySpendIntent(tenantRow, intent.id, '0xreal').catch(
+      (err: { message?: string }) => ({ error: err.message ?? String(err) }),
+    );
+    // `message` explicitly, not JSON.stringify: an Error's message is
+    // non-enumerable, so stringifying it yields "{}" and the assertion passes
+    // whatever went wrong.
+    expect(JSON.stringify(settled)).not.toMatch(/already settled/i);
+
+    const { rows } = await db().query<{ status: string; n: string }>(
+      `SELECT i.status, (SELECT count(*)::text FROM store_credits WHERE spend_intent_id = i.id) AS n
+         FROM token_spend_intents i WHERE i.id = $1`,
+      [intent.id],
+    );
+    expect(rows[0]!.status).toBe('verified');
+    expect(rows[0]!.n).toBe('1');
+  });
+
+  it('bounds a pending intent by the settlement window too (HIGH)', async () => {
+    // The 30-day bound was written into the `expired` arm only, so it leaned
+    // entirely on a five-minute worker. With the worker process down -- or
+    // RUN_WORKERS=false, which is how the API is meant to run beside a
+    // separate worker -- every open intent stayed `pending` and was settleable
+    // indefinitely, at a quote that may have carried a promotion since ended.
+    await updateTenantSettings(db(), tenant.id, { payoutWallet: PAYOUT });
+    const contact = await fundedContact(0, 'ancient@example.com');
+    const tenantRow = await tenantObject();
+    const { intent } = await createSpendIntent(tenantRow, {
+      contact,
+      amountTokens: 5,
+      fromAddress: CUSTOMER,
+    });
+    // 400 days past the quote, and the worker never ran: still `pending`.
+    await db().query(
+      `UPDATE token_spend_intents SET expires_at = now() - interval '400 days' WHERE id = $1`,
+      [intent.id],
+    );
+    expect(
+      (await db().query<{ status: string }>('SELECT status FROM token_spend_intents WHERE id = $1', [
+        intent.id,
+      ])).rows[0]!.status,
+    ).toBe('pending');
+
+    setChainClient(
+      stubChain({
+        transfersInTx: async () => [
+          {
+            from: getAddress(CUSTOMER),
+            to: getAddress(PAYOUT),
+            value: tokensToWei(5),
+            blockNumber: 100,
+            confirmations: 3,
+          },
+        ],
+      }),
+    );
+    await expect(verifySpendIntent(tenantRow, intent.id, '0xtoolate')).rejects.toThrow(
+      /can no longer be settled/i,
+    );
+
+    // The control: the same intent inside the window still settles.
+    await db().query(
+      `UPDATE token_spend_intents SET expires_at = now() - interval '3 days' WHERE id = $1`,
+      [intent.id],
+    );
+    expect((await verifySpendIntent(tenantRow, intent.id, '0xintime')).intent.status).toBe(
+      'verified',
+    );
+  });
+
+  it('can close an intent stranded mid-verification (MEDIUM)', async () => {
+    // Erasure refuses while an intent is being verified and names the cancel
+    // route as the remedy -- and the cancel route refused a `verifying` row,
+    // so the remedy the error gave could not be carried out. That is the same
+    // defect an earlier round fixed, one state narrower.
+    await updateTenantSettings(db(), tenant.id, { payoutWallet: PAYOUT });
+    const contact = await fundedContact(0, 'stranded@example.com');
+    const tenantRow = await tenantObject();
+    const { intent } = await createSpendIntent(tenantRow, {
+      contact,
+      amountTokens: 5,
+      fromAddress: CUSTOMER,
+    });
+    await db().query(
+      `UPDATE token_spend_intents
+          SET status = 'verifying', verify_claimed_at = now(), verify_token = gen_random_uuid()
+        WHERE id = $1`,
+      [intent.id],
+    );
+
+    // A verification genuinely in progress is left alone.
+    expect(await cancelSpendIntent(tenant.id, intent.id)).toBeNull();
+
+    // One whose request never came back is not a verification in progress.
+    await db().query(
+      `UPDATE token_spend_intents SET verify_claimed_at = now() - interval '20 minutes'
+        WHERE id = $1`,
+      [intent.id],
+    );
+    expect((await cancelSpendIntent(tenant.id, intent.id))?.status).toBe('cancelled');
   });
 
   it('rejects a transfer that went to the wrong address', async () => {

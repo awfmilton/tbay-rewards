@@ -879,6 +879,90 @@ describe('every writer reaches for the contact before anything else', () => {
     expect(rows[0]!.ranked).toBe(rows[0]!.total);
   });
 
+  it('finishes a bulk run that one member refuses, and says why (HIGH)', async () => {
+    // Three wrong answers came before this. Catching nothing let a contact
+    // merged away mid-sweep abort the run. Catching every 4xx reported 200 OK
+    // with {contacts: 200, skipped: 190} and no reason. Narrowing to 404 was
+    // worse than either: a badge whose point type has been turned off throws
+    // 422 from `award`, and only the members who *qualify* for that badge
+    // reach it -- so the run died partway and every retry died at the same
+    // contact, leaving `POST /v1/gamification/reevaluate` permanently broken
+    // for that tenant and everyone after it on a stale rank.
+    await db().query(
+      `INSERT INTO ranks (tenant_id, key, name, min_points, display_order)
+       VALUES ($1, 'refused-gold', 'Gold', 500, 1)`,
+      [tenant.id],
+    );
+    // A second currency, live while the balances were earned.
+    await db().query(
+      `INSERT INTO point_types (tenant_id, key, name, enabled) VALUES ($1, 'stars', 'Stars', true)`,
+      [tenant.id],
+    );
+    const { forgetPointTypes } = await import('../src/services/point-types.js');
+    forgetPointTypes();
+    await db().query(
+      `INSERT INTO badges (tenant_id, key, name, criteria, tiers, points_per_tier, point_type)
+       VALUES ($1, 'star-badge', 'Star', '{"type":"lifetime_points"}'::jsonb,
+               '[{"level":1,"threshold":900,"label":"Star"}]'::jsonb, 10, 'stars')`,
+      [tenant.id],
+    );
+
+    const people: string[] = [];
+    for (let n = 0; n < 10; n += 1) {
+      const contact = await upsertContact(tenant.id, { email: `refuse${n}@example.com` });
+      // Only the sixth reaches the badge threshold, so the failure is
+      // per-contact and lands in the middle of the run.
+      await award(tenant.id, {
+        contactId: contact.id,
+        points: 600,
+        reason: 'seed',
+        idempotencyKey: `refuse-${n}`,
+      });
+      // Only the sixth ever earned the second currency, so only they reach the
+      // badge -- the failure is per-contact and lands mid-run, which is what
+      // makes it fatal rather than obvious.
+      if (n === 5) {
+        await award(tenant.id, {
+          contactId: contact.id,
+          points: 1_000,
+          reason: 'stars',
+          idempotencyKey: `refuse-stars-${n}`,
+          pointType: 'stars',
+        });
+      }
+      people.push(contact.id);
+    }
+
+    // Switched off afterwards, which is the ordinary way a retailer retires a
+    // currency and the state nothing else in the product complains about.
+    await db().query(
+      `UPDATE point_types SET enabled = false WHERE tenant_id = $1 AND key = 'stars'`,
+      [tenant.id],
+    );
+    forgetPointTypes();
+
+    const swept = await reevaluateAll(tenant.id, { badges: true, ranks: true });
+
+    // It finished.
+    expect(swept.contacts).toBe(10);
+    // It named the member and the setting, rather than a bare count.
+    expect(swept.problems.length).toBe(1);
+    expect(swept.problems[0]).toContain(people[5]!);
+    expect(swept.problems[0]).toMatch(/currency is turned off/i);
+    // Everybody was re-ranked -- including the member whose badge refused,
+    // whose rank has nothing to do with that badge, and including everyone
+    // after them, which is what the aborting version left on stale tiers.
+    const { rows } = await db().query<{ ranked: string; total: string }>(
+      `SELECT count(*) FILTER (WHERE current_rank_id IS NOT NULL)::text AS ranked,
+              count(*)::text AS total
+         FROM points_balances
+        WHERE tenant_id = $1 AND point_type = 'points' AND lifetime_earned >= 500`,
+      [tenant.id],
+    );
+    expect(rows[0]!.total).toBe('10');
+    expect(rows[0]!.ranked).toBe('10');
+  });
+
   it('says what happened when the contact was merged away mid-flight', async () => {
     // FOR SHARE has nothing to wait on once the row is gone, so the writer
     // carried on and failed several statements later on a foreign key --

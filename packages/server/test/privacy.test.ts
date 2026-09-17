@@ -1006,29 +1006,93 @@ describe('erasure never destroys money in flight (HIGH)', () => {
     // Round five answered this by refusing the erasure, and the refusal named
     // "releasing or rejecting" as the remedy -- both operator-only routes that
     // answer 503 unless BRIDGE_OPERATOR_TOKEN is set, which ships empty. So
-    // the erasure could not be carried out by the retailer at all, with no
-    // TTL and no worker to end it. Refusing forever is not a safer answer than
-    // destroying the record; it is a different way of not doing the job.
+    // the erasure could not be carried out by the retailer at all. Refusing
+    // forever is not a safer answer than destroying the record; it is a
+    // different way of not doing the job.
     //
     // The row is two things: a link to a person and a debt to a wallet. The
-    // link goes, the debt stays payable, and the erasure reports it.
+    // link goes -- contact_id included, see the re-identification test below
+    // -- the debt stays payable, and the erasure reports it.
     const contact = await withWithdrawal('bridging@example.com', 'burn_verified');
 
     const result = await eraseContact(tenant.id, contact.id);
     expect(result.obligations_kept).toBe(1);
 
     const { rows } = await db().query<{
-      l1_recipient: string; from_address: string; member_id: string | null; status: string;
+      l1_recipient: string; from_address: string;
+      member_id: string | null; contact_id: string | null; status: string;
     }>(
-      'SELECT l1_recipient, from_address, member_id, status FROM bridge_withdrawals WHERE contact_id = $1',
-      [contact.id],
+      `SELECT l1_recipient, from_address, member_id, contact_id, status
+         FROM bridge_withdrawals WHERE burn_tx_hash = $1`,
+      ['0xburn-burn_verified'],
     );
     // Still payable, to the wallet that actually burned the tokens.
     expect(rows[0]!.l1_recipient).toBe(WALLET);
     expect(rows[0]!.from_address).toBe(WALLET);
     expect(rows[0]!.status).toBe('burn_verified');
-    // And no longer joinable to this person across tenants.
+    // And nothing left in this system says whose wallet it was.
     expect(rows[0]!.member_id).toBeNull();
+    expect(rows[0]!.contact_id).toBeNull();
+  });
+
+  it('does not leave the kept wallet joinable back to the person (HIGH)', async () => {
+    // `members.wallet_address` is plaintext, unique and platform-wide, and it
+    // is only cleared when the erased contact was that person's last one
+    // anywhere. So a wallet kept on an unsettled row joined straight back to
+    // their live, fully identified record at another retailer -- one join, one
+    // row, name and email. That is verbatim the failure this file's own
+    // comment says it closed, reopened by keeping the join key.
+    const other = await makeTenant();
+    const contact = await upsertContact(tenant.id, { email: 'linkable@example.com' });
+    // The same person, still a customer at a different shop, wallet on file.
+    const twin = await upsertContact(other.id, {
+      email: 'linkable@example.com',
+      name: 'Chris Doe',
+    });
+    await db().query('UPDATE members SET wallet_address = $2 WHERE id = $1', [
+      (await db().query<{ member_id: string }>('SELECT member_id FROM contacts WHERE id = $1', [twin.id]))
+        .rows[0]!.member_id,
+      WALLET.toLowerCase(),
+    ]);
+    await db().query(
+      `INSERT INTO bridge_withdrawals (
+         tenant_id, contact_id, member_id, from_address, l1_recipient,
+         l2_amount_wei, l1_amount, dust_wei, burn_tx_hash, status, l2_chain_id, l1_chain_id
+       )
+       SELECT $1, $2, c.member_id, $3, $3, 1, 1, 0, $4, 'burn_verified', 300, 1
+         FROM contacts c WHERE c.id = $2`,
+      [tenant.id, contact.id, WALLET, '0xburn-linkable'],
+    );
+
+    await eraseContact(tenant.id, contact.id);
+
+    // The join the reviewer ran: kept address -> members -> a live contact.
+    const relinked = await db().query(
+      `SELECT c.email, c.name FROM bridge_withdrawals w
+         JOIN members m  ON m.wallet_address = w.from_address
+         JOIN contacts c ON c.member_id = m.id AND c.erased_at IS NULL
+        WHERE w.burn_tx_hash = $1 AND w.tenant_id = $2`,
+      ['0xburn-linkable', tenant.id],
+    );
+    // The address is still there to be paid, but nothing ties this tenant's
+    // row to it: contact_id and member_id are gone, so the row is not
+    // reachable from the erased person and the person is not reachable from
+    // the row.
+    const kept = await db().query<{ contact_id: string | null; member_id: string | null }>(
+      'SELECT contact_id, member_id FROM bridge_withdrawals WHERE burn_tx_hash = $1',
+      ['0xburn-linkable'],
+    );
+    expect(kept.rows[0]!.contact_id).toBeNull();
+    expect(kept.rows[0]!.member_id).toBeNull();
+    expect(
+      await db().query(
+        `SELECT 1 FROM bridge_withdrawals w
+           JOIN contacts c ON c.id = w.contact_id
+          WHERE w.burn_tx_hash = $1`,
+        ['0xburn-linkable'],
+      ).then((r) => r.rowCount),
+    ).toBe(0);
+    void relinked;
   });
 
   it('erases a released withdrawal, and not at the burn address', async () => {
@@ -1038,8 +1102,8 @@ describe('erasure never destroys money in flight (HIGH)', () => {
     await eraseContact(tenant.id, contact.id);
 
     const { rows } = await db().query<{ l1_recipient: string; from_address: string }>(
-      'SELECT l1_recipient, from_address FROM bridge_withdrawals WHERE contact_id = $1',
-      [contact.id],
+      'SELECT l1_recipient, from_address FROM bridge_withdrawals WHERE burn_tx_hash = $1',
+      ['0xburn-released'],
     );
     expect(rows[0]!.from_address).not.toBe(WALLET);
     // The zero address means "burned" in this schema, so it is the one
@@ -1048,14 +1112,18 @@ describe('erasure never destroys money in flight (HIGH)', () => {
     expect(rows[0]!.from_address).not.toBe(BURN_ADDRESS);
   });
 
-  it('keeps the wallet on an intent that could still be settled (HIGH)', async () => {
+  it('keeps an unsettled intent settleable without keeping the wallet (HIGH)', async () => {
     // SPEND_TTL_MINUTES is sixty, so "expired" is the ordinary state of an
     // intent an hour after checkout -- including one where the customer really
-    // did send their TBAY and the verification simply did not land. Treating
-    // expiry as "settled by abandonment" and scrubbing `from_address` there is
-    // the round-four money-destroying bug in a narrower window: `from_address`
-    // is the only field a hand-settlement can match on, and the tokens are
-    // already at the retailer's payout wallet.
+    // did send their TBAY and the verification never landed. Scrubbing
+    // `from_address` there destroys the only handle a hand-settlement has.
+    //
+    // But keeping the raw wallet was wrong too: it joins back to
+    // `members.wallet_address` and to that person's live record at another
+    // shop, and "while it could still be settled" was in practice forever,
+    // because erasure is one-shot and nothing revisits the row.
+    //
+    // A keyed digest settles the question without answering it.
     const recent = await withSpendIntent('recently-lapsed@example.com', 'expired');
     await db().query(
       `UPDATE token_spend_intents SET expires_at = now() - interval '2 hours'
@@ -1067,11 +1135,55 @@ describe('erasure never destroys money in flight (HIGH)', () => {
       'SELECT from_address, member_id FROM token_spend_intents WHERE contact_id = $1',
       [recent.id],
     );
-    expect(kept.rows[0]!.from_address).toBe(WALLET);
-    // Still unlinked from the person across tenants, which is what identifies.
+    expect(kept.rows[0]!.from_address).not.toBe(WALLET);
+    expect(kept.rows[0]!.from_address).toMatch(/^erased:[0-9a-f]{32}$/);
     expect(kept.rows[0]!.member_id).toBeNull();
 
-    // Past the window nobody can act on it any more, so the wallet goes.
+    // Nothing in the schema can be joined back to that wallet.
+    const relinked = await db().query(
+      `SELECT 1 FROM token_spend_intents i JOIN members m
+              ON m.wallet_address = i.from_address
+        WHERE i.contact_id = $1`,
+      [recent.id],
+    );
+    expect(relinked.rowCount).toBe(0);
+
+    // And the settlement the digest exists for still works: the retailer
+    // matches an unexplained transfer at their payout wallet against it.
+    const { verifySpendIntent } = await import('../src/services/token.js');
+    const { setChainClient } = await import('../src/lib/chain.js');
+    const { getTenantById } = await import('../src/services/tenants.js');
+    const intentRow = await db().query<{ id: string; to_address: string; token_amount_wei: string }>(
+      'SELECT id, to_address, token_amount_wei FROM token_spend_intents WHERE contact_id = $1',
+      [recent.id],
+    );
+    setChainClient({
+      isNonceUsed: async () => false,
+      isPaused: async () => false,
+      balanceOf: async () => 0n,
+      transfersInTx: async () => [
+        {
+          from: WALLET,
+          to: intentRow.rows[0]!.to_address,
+          value: BigInt(intentRow.rows[0]!.token_amount_wei),
+          blockNumber: 1,
+          confirmations: 3,
+        },
+      ],
+    });
+    const settled = await verifySpendIntent(
+      (await getTenantById(tenant.id))!,
+      intentRow.rows[0]!.id,
+      '0xsettled-after-erasure',
+    );
+    expect(settled.intent.status).toBe('verified');
+    setChainClient(null);
+  });
+
+  it('does not keep a wallet on an intent nobody can act on any more (HIGH)', async () => {
+    // Past the window the digest is replaced outright, so there is not even a
+    // keyed value left. Erasure is one-shot -- a second call is refused -- so
+    // anything it leaves behind has to be final at the moment it runs.
     const ancient = await withSpendIntent('long-lapsed@example.com', 'expired');
     await db().query(
       `UPDATE token_spend_intents SET expires_at = now() - interval '400 days'
@@ -1084,9 +1196,10 @@ describe('erasure never destroys money in flight (HIGH)', () => {
       [ancient.id],
     );
     expect(scrubbed.rows[0]!.from_address).not.toBe(WALLET);
+    expect(scrubbed.rows[0]!.from_address).not.toMatch(/^erased:/);
 
-    // And a retailer who has settled it by hand says so, which closes the
-    // question immediately rather than in thirty days.
+    // A retailer who has settled it by hand says so, which closes the question
+    // immediately rather than in thirty days.
     const cancelled = await withSpendIntent('handled@example.com', 'expired');
     const { cancelSpendIntent } = await import('../src/services/token.js');
     const { rows: intentRows } = await db().query<{ id: string }>(
@@ -1100,6 +1213,7 @@ describe('erasure never destroys money in flight (HIGH)', () => {
       [cancelled.id],
     );
     expect(closed.rows[0]!.from_address).not.toBe(WALLET);
+    expect(closed.rows[0]!.from_address).not.toMatch(/^erased:/);
   });
 
   it('breaks the cross-tenant identity link', async () => {
