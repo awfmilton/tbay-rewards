@@ -505,8 +505,12 @@ describe('composed templates in an automation', () => {
     const contactId = created.json().contact_id as string;
 
     await db().query(
+      // Upsert: creating a contact pays the shipped signup rule now, so the
+      // balance row already exists. This test wants the balance to *be* 1250.
       `INSERT INTO points_balances (tenant_id, contact_id, point_type, balance)
-       VALUES ($1, $2, 'points', 1250)`,
+       VALUES ($1, $2, 'points', 1250)
+       ON CONFLICT (tenant_id, contact_id, point_type)
+         DO UPDATE SET balance = EXCLUDED.balance`,
       [tenant.id, contactId],
     );
 
@@ -551,7 +555,9 @@ describe('composed templates in an automation', () => {
     const contactId = created.json().contact_id as string;
     await db().query(
       `INSERT INTO points_balances (tenant_id, contact_id, point_type, balance)
-       VALUES ($1, $2, 'points', 1000)`,
+       VALUES ($1, $2, 'points', 1000)
+       ON CONFLICT (tenant_id, contact_id, point_type)
+         DO UPDATE SET balance = EXCLUDED.balance`,
       [tenant.id, contactId],
     );
 

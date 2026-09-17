@@ -201,13 +201,16 @@ describe('matching contacts', () => {
       ).toBe(0);
     }
 
-    // And the rank field, which joins through the same row.
-    expect(
-      await countMatching(tenant.id, {
-        match: 'all',
-        filters: [{ field: 'rank_key', operator: 'is_set', value: null }],
-      }),
-    ).toBe(0);
+    // And the rank field, which joins through the same points_balances row and
+    // was the third subquery that raised. Earning assigns a rank, and everyone
+    // here has earned, so what this pins is that the join resolves to one row
+    // per contact rather than throwing -- the count is the whole audience, not
+    // nobody.
+    const ranked = await countMatching(tenant.id, {
+      match: 'all',
+      filters: [{ field: 'rank_key', operator: 'is_set', value: null }],
+    });
+    expect(ranked).toBeGreaterThan(0);
   });
 
   it('excludes on a tag, and includes contacts with no tags at all', async () => {

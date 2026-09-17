@@ -1,3 +1,4 @@
+import { upsertContact } from '../src/services/contacts.js';
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import {
   closeApp,
@@ -47,8 +48,19 @@ async function authed(
 }
 
 async function contactFor(email: string): Promise<string> {
-  const response = await authed('POST', '/v1/contacts', { email });
-  return JSON.parse(response.body).contact_id as string;
+  // Straight from the service rather than through POST /v1/contacts, which
+  // pays the shipped `account_created` rule now. Every test in this file is
+  // arithmetic about caps, clamps and cooldowns, and a signup bonus in the
+  // opening balance would be asserting event dispatch instead.
+  const contact = await upsertContact(tenant.id, {
+    email,
+    name: null,
+    phone: null,
+    externalRef: null,
+    attributes: {},
+    tags: [],
+  });
+  return contact.id;
 }
 
 async function balanceOf(contactId: string): Promise<number> {

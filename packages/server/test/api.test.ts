@@ -596,8 +596,11 @@ describe('point adjustments', () => {
       reason: 'myCred: comment',
       idempotencyKey: 'mycred:comment:7:1',
     });
+    // 320 adjusted on top of the 50 the shipped `account_created` rule pays
+    // when POST /v1/contacts creates somebody. This file exercises the API as
+    // a caller meets it, so the signup award belongs in the total.
     expect(first.json()).toMatchObject({ applied: true, points: 320 });
-    expect(first.json().balance.balance).toBe(320);
+    expect(first.json().balance.balance).toBe(370);
 
     const repeat = await authed('POST', '/v1/rewards/adjust', {
       email: 'adjusted@example.com',
@@ -606,7 +609,7 @@ describe('point adjustments', () => {
       idempotencyKey: 'mycred:comment:7:1',
     });
     expect(repeat.json().applied).toBe(false);
-    expect(repeat.json().balance.balance).toBe(320);
+    expect(repeat.json().balance.balance).toBe(370);
   });
 
   it('debits with a negative amount and refuses to overdraw', async () => {
@@ -624,7 +627,8 @@ describe('point adjustments', () => {
       reason: 'Correction',
       idempotencyKey: 'fix-1',
     });
-    expect(debit.json().balance.balance).toBe(60);
+    // 50 signup + 100 granted - 40 corrected.
+    expect(debit.json().balance.balance).toBe(110);
 
     const overdraw = await authed('POST', '/v1/rewards/adjust', {
       email: 'adjusted@example.com',

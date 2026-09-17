@@ -1,3 +1,4 @@
+import { upsertContact } from '../src/services/contacts.js';
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import {
   DESKTOP_UA,
@@ -139,7 +140,16 @@ describe('contact timeline', () => {
     // the second a retailer added a status currency this 500'd for everyone
     // holding both -- on the screen support opens to help them.
     await upsertPointType(tenant.id, { key: 'status', name: 'Status' });
-    await authed('POST', '/v1/contacts', { email: 'two@example.com' });
+    // Quietly, so the two figures this asserts are the two awards below and
+    // not the shipped signup rule as well.
+    await upsertContact(tenant.id, {
+      email: 'two@example.com',
+      name: null,
+      phone: null,
+      externalRef: null,
+      attributes: {},
+      tags: [],
+    });
     const contactId = (
       await db().query(
         `SELECT id FROM contacts WHERE tenant_id = $1 AND email_normalised = 'two@example.com'`,
@@ -171,7 +181,17 @@ describe('contact timeline', () => {
     // COALESCE inside the subquery never runs when the subquery returns no
     // rows, so a brand new contact reported a null balance to a screen whose
     // contract says number.
-    await authed('POST', '/v1/contacts', { email: 'fresh@example.com' });
+    // Straight from the service, not the route: POST /v1/contacts pays the
+    // shipped signup rule now, and a contact who has never earned is the whole
+    // premise of this test.
+    await upsertContact(tenant.id, {
+      email: 'fresh@example.com',
+      name: null,
+      phone: null,
+      externalRef: null,
+      attributes: {},
+      tags: [],
+    });
 
     const response = await authed(
       'GET',
