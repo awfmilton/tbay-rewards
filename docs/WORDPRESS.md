@@ -59,6 +59,28 @@ customer's page, with the control matching the type — a date picker for a date
 a dropdown for a list. That is the point of declaring the type: a free-text box
 is how "ON", "on" and "Ontario" become three segments.
 
+**Writing an email** is done with blocks rather than HTML. Open a template on
+the Email screen, or a draft send on the Segments & sends screen and click
+"Write it": add a heading, a paragraph, a button, a picture, a row of products
+or the recipient's points balance, and drag the order about. The list of block
+types and their fields comes from the platform, so a block added server-side
+appears without a plugin update.
+
+Any block can be limited to a segment, or hidden from one. That is how one
+message serves two audiences — a VIP paragraph above the same three products
+everybody gets — instead of sending two. **Preview** renders it, and naming a
+contact renders what *that person* would get, so a conditional block can be
+checked rather than guessed at.
+
+A send either names a template or carries its own message. Leave the template
+box blank when preparing a send and write the message on the send itself: the
+monthly newsletter is a one-off, and a template list that is really a send
+history helps nobody.
+
+Templates written by hand keep working. Editing one shows the HTML it was
+written in, with a link to rebuild it from blocks — which replaces the HTML,
+because generated HTML cannot be turned back into blocks.
+
 **Email topics** live at the bottom of the Email screen. They are what a
 recipient chooses between on the preference page every marketing email links
 to; a store that defines none keeps exactly today's behaviour. The same panel

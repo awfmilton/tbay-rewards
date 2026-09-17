@@ -48,6 +48,9 @@ Built for [tbay.tk LLC](https://tbay.tk).
 - Reports a retailer composes — revenue by campaign, points by rule — over a
   closed catalogue, emailed on a cadence so the weekly numbers arrive without
   being asked for
+- An email builder: typed blocks rendered server-side, so nobody writes HTML,
+  and blocks that can be shown to one segment and hidden from another — one
+  message serving two audiences rather than two sends
 
   *Not yet:* buying points for money. See [docs/ROADMAP.md](docs/ROADMAP.md).
 

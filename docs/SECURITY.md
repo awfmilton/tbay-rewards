@@ -81,6 +81,24 @@ Verification requires a real Transfer to the retailer's payout wallet, from the
 declared sender, for at least the promised amount, with confirmations.
 `(chain_id, tx_hash)` is unique.
 
+### An email cannot attack the admin who previews it
+
+A message composed in wp-admin is a list of typed blocks with typed fields, not
+HTML. The server renders the HTML and escapes every value, so there is no way
+to type markup into a field and have it reach anyone as markup.
+
+This is the reason the builder exists in the form it does. An HTML textarea in
+wp-admin is a stored cross-site-scripting vector against the *next* admin who
+opens the message — one compromised or careless author, and the payload runs
+with whatever capabilities the next person to look at it has. Blocks remove the
+vector rather than filtering it.
+
+Two further limits back it up. A link must be `http`, `https` or `mailto`:
+`javascript:` is mostly inert in a mail client and entirely live in a preview
+pane, and `data:` is a phishing page that never leaves the message. And the
+preview is displayed in a `sandbox=""` iframe, so even a rendering bug cannot
+reach the surrounding page.
+
 ### Tenants are isolated
 
 Every customer-facing query filters on `tenant_id`. The only cross-tenant object
@@ -97,6 +115,8 @@ wallet address.
 | SQL | Parameterised queries throughout; no string interpolation of user input |
 | Output | WordPress output escaped at every boundary (`esc_html`, `esc_attr`, `esc_url`) |
 | Email templates | All interpolated values HTML-escaped unconditionally |
+| Composed email | Built from typed blocks, never from admin-authored HTML; every field escaped, and links restricted to `http`, `https` and `mailto` |
+| Email preview | Rendered server-side and shown in a `sandbox=""` iframe, so a message cannot run script in the admin's session |
 | CSRF | WordPress REST nonces on every member action; nonce checks on form posts |
 | Webhooks | HMAC-SHA256 over `timestamp.body`, with a 5-minute freshness window to stop replay |
 | Attribution cookies | HMAC-signed, `HttpOnly`, `SameSite=Lax`, `Secure` in production |

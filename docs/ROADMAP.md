@@ -33,6 +33,10 @@ The bugs those reviews found are all fixed; see the commit history for
 | **Contact merge** | Balances summed per currency, colliding rows reconciled rather than blindly updated, and the survivor keeps its id |
 | **Operators, roles and audit** | Keys attributable to a named person and scoped to a role, enforced by one hook, with an append-only record of every change |
 | **Report builder and scheduled exports** | Composable reports over a closed catalogue of sources, dimensions and measures, emailed daily, weekly or monthly |
+| **Form-plugin earning hooks** | Ninja Forms, Gravity Forms and Contact Form 7 submissions award points |
+| **Points at checkout** | Points spend directly at checkout as well as through the TBAY store-credit round trip |
+| **myCred log history import** | Per-entry history comes across, not just the opening balance |
+| **Email builder with dynamic content** | Typed blocks rendered server-side, with per-recipient conditional blocks — one message, two audiences |
 
 ### Multiple point types, in detail
 
@@ -65,33 +69,42 @@ installed with the tenant and every endpoint falls back to it.
 
 ---
 
+### The email builder, in detail
+
+Templates were hand-written HTML. That is fine for the eight built-ins a
+developer wrote once and wrong for the thing a retailer does weekly: put this
+month's three products in a message, with a button, and send it. Doing that
+meant editing a `<table>` in a textarea, where the first unclosed tag breaks
+the layout in Outlook only.
+
+Blocks instead — typed pieces with typed fields, and the server emits the HTML.
+That is also the security property: an HTML textarea in wp-admin is a stored
+XSS vector against the next admin who opens the preview, and a list of escaped
+field values is not.
+
+Any block can name a segment it is for, or one it is not for. That is what
+makes one message serve two audiences — a VIP paragraph above the same three
+products everybody gets — instead of sending two. Membership is resolved per
+recipient as the audience is walked, one query per message however many
+conditional blocks it holds.
+
+A broadcast can carry a composed body instead of naming a template, because the
+monthly newsletter is a one-off and making somebody create a template for each
+one is how a "send" screen grows a "template" screen nobody wanted.
+
+Hand-written templates keep working untouched: `blocks` null means the template
+is still HTML, and every existing one is.
+
+---
+
 ## Still open
 
-### An email builder
+### buyCRED
 
-The Mautic gaps that remain. Each is being worked in turn; see the task list.
-
-### Earning hooks beyond commerce
-
-Points come from orders, opt-ins, shares, referrals, accounts and reviews.
-myCred also awards for comments, viewing or publishing content, video watching
-and arbitrary link clicks, and integrates with fifteen third-party plugins.
-
-The one worth adding for a WordPress store is **form submissions** — Ninja
-Forms, Gravity, Contact Form 7 — because the sites this ships to use them. The
-rest are fair to leave out.
-
-### buyCRED and a points checkout gateway
-
-Points cannot be spent directly at checkout; spending goes through the TBAY
-store-credit round trip. Buying points for money is absent entirely.
-
-### Log history import
-
-The myCred importer brings balances and badge keys with one opening ledger
-entry per member. Per-entry history does not come across, so a migrated store
-starts with a correct balance and an empty history. Documented in
-`docs/MIGRATION.md`.
+Points can be spent at checkout, but they cannot be **bought** for money.
+myCred's buyCRED sells points through a payment gateway. Nothing in the rewards
+programme needs it — points are earned, and TBAY is the thing with a price —
+so it is open rather than planned.
 
 ### Deliberately omitted, and staying omitted
 

@@ -1,6 +1,7 @@
 import { db, queryOne, withTransaction, type Queryable } from '../db/pool.js';
 import { unsubscribeRequestUrl } from './newsletter.js';
 import { mayReceive, preferencesUrl } from './preferences.js';
+import { blocksToText, personalise, renderDocument, validateBlocks } from './email-blocks.js';
 import { config } from '../config.js';
 import { ApiError } from '../lib/errors.js';
 import { limitOf } from '../lib/paging.js';
@@ -36,7 +37,8 @@ export interface Broadcast {
   key: string;
   name: string;
   segment_id: string | null;
-  template_key: string;
+  /** Null when the broadcast composes its own body from `blocks`. */
+  template_key: string | null;
   subject: string | null;
   status: BroadcastStatus;
   send_at: Date | null;
@@ -51,6 +53,16 @@ export interface Broadcast {
   updated_at: Date;
   /** Which topic this belongs to, so a recipient's choice can be honoured. */
   topic_key: string | null;
+  /**
+   * A body composed for this send, instead of naming a template.
+   *
+   * The monthly newsletter is a one-off. Making a retailer create a template
+   * for each one is how a "send" screen grows a "template" screen nobody
+   * wanted, and leaves a template list that is really a send history.
+   */
+  blocks: unknown;
+  /** The line a mail client shows beside the subject. */
+  preheader: string | null;
 }
 
 export async function upsertBroadcast(
@@ -62,6 +74,13 @@ export async function upsertBroadcast(
     templateKey?: string;
     subject?: string | null;
     sendAt?: string | null;
+    /**
+     * A body composed for this send. Supplying it clears any template this
+     * broadcast previously named: a message has one body, and leaving both set
+     * would make which one goes out depend on the order of two `if`s.
+     */
+    blocks?: unknown;
+    preheader?: string | null;
   },
   runner: Queryable = db(),
 ): Promise<Broadcast> {
@@ -81,23 +100,56 @@ export async function upsertBroadcast(
     segmentId = segment.id;
   }
 
-  const templateKey = input.templateKey ?? existing?.template_key;
-  if (!templateKey) throw ApiError.badRequest('A broadcast needs a templateKey');
-  if (!(await getTemplate(tenantId, templateKey, runner))) {
-    throw ApiError.notFound(`No email template "${templateKey}"`);
+  let blocks: string | null = existing?.blocks ? JSON.stringify(existing.blocks) : null;
+  if (input.blocks !== undefined) {
+    blocks = input.blocks === null ? null : JSON.stringify(validateBlocks(input.blocks));
+  }
+
+  // A composed body replaces the template; naming a template replaces the
+  // composed body. Whichever the caller sent last is the one they meant.
+  let templateKey: string | null = input.templateKey ?? existing?.template_key ?? null;
+  if (input.blocks !== undefined && input.blocks !== null && !input.templateKey) {
+    templateKey = null;
+  } else if (input.templateKey) {
+    blocks = null;
+  }
+
+  const preheader =
+    input.preheader === undefined
+      ? existing?.preheader ?? null
+      : input.preheader?.trim() || null;
+
+  if (blocks) {
+    // Nothing else supplies one: a template carries its own subject, a
+    // composed body carries none.
+    if (!(input.subject ?? existing?.subject)) {
+      throw ApiError.badRequest('A composed broadcast needs a subject');
+    }
+  } else {
+    if (!templateKey) throw ApiError.badRequest('A broadcast needs a templateKey or blocks');
+    if (!(await getTemplate(tenantId, templateKey, runner))) {
+      throw ApiError.notFound(`No email template "${templateKey}"`);
+    }
   }
 
   const row = await queryOne<Broadcast>(
     runner,
-    `INSERT INTO broadcasts (tenant_id, key, name, segment_id, template_key, subject, send_at, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, CASE WHEN $7::timestamptz IS NULL THEN 'draft' ELSE 'scheduled' END)
+    `INSERT INTO broadcasts
+       (tenant_id, key, name, segment_id, template_key, subject, send_at, status, blocks, preheader)
+     VALUES ($1, $2, $3, $4, $5, $6, $7,
+             CASE WHEN $7::timestamptz IS NULL THEN 'draft' ELSE 'scheduled' END,
+             $8::jsonb, $9)
      ON CONFLICT (tenant_id, key) DO UPDATE SET
        name = COALESCE(EXCLUDED.name, broadcasts.name),
        segment_id = COALESCE(EXCLUDED.segment_id, broadcasts.segment_id),
-       template_key = COALESCE(EXCLUDED.template_key, broadcasts.template_key),
+       -- Direct, not COALESCE: switching a draft from a template to a composed
+       -- body has to be able to clear the template it used to name.
+       template_key = $5,
        subject = EXCLUDED.subject,
        send_at = EXCLUDED.send_at,
        status = CASE WHEN EXCLUDED.send_at IS NULL THEN 'draft' ELSE 'scheduled' END,
+       blocks = EXCLUDED.blocks,
+       preheader = EXCLUDED.preheader,
        updated_at = now()
      RETURNING *`,
     [
@@ -106,8 +158,10 @@ export async function upsertBroadcast(
       input.name ?? existing?.name ?? key,
       segmentId,
       templateKey,
-      input.subject ?? null,
+      input.subject ?? existing?.subject ?? null,
       input.sendAt ?? null,
+      blocks,
+      preheader,
     ],
   );
   return row!;
@@ -263,8 +317,7 @@ export async function sendBroadcastBatch(
   );
   if (!segment) throw ApiError.badRequest('That broadcast points at a deleted segment');
 
-  const template = await getTemplate(tenantId, broadcast.template_key, runner);
-  if (!template) throw ApiError.notFound(`No email template "${broadcast.template_key}"`);
+  const template = await bodyFor(tenantId, broadcast, runner);
 
   const audience = await audienceAfter(
     runner,
@@ -317,13 +370,16 @@ export async function sendBroadcastBatch(
     const unsubscribeUrl = unsubscribeRequestUrl(tenantId, contact.email);
     const preferenceUrl = preferencesUrl(tenantId, contact.email);
 
+    const body = await personalise(tenantId, contact.id, template, runner);
+
     const rendered = renderTemplate(
-      broadcast.subject ? { ...template, subject: broadcast.subject } : template,
+      broadcast.subject ? { ...body, subject: broadcast.subject } : body,
       {
         tenant_name: tenant.name,
         name: contact.name ?? '',
         email: contact.email,
         rewards_url: (tenant.settings?.siteUrl as string) ?? base,
+        points_balance: contact.points_balance ?? '',
         unsubscribe_url: unsubscribeUrl,
         preferences_url: preferenceUrl,
       },
@@ -333,7 +389,10 @@ export async function sendBroadcastBatch(
       {
         tenantId,
         contactId: contact.id,
-        templateKey: broadcast.template_key,
+        // A composed broadcast has no template, but every message records what
+        // produced it — reporting groups by this, and "the September
+        // newsletter" is the honest answer for one.
+        templateKey: broadcast.template_key ?? `broadcast:${broadcast.key}`,
         to: contact.email,
         subject: rendered.subject,
         html: rendered.html,
@@ -379,14 +438,78 @@ export async function sendBroadcastBatch(
   };
 }
 
+/**
+ * The message this broadcast sends: its own composed body, or the template it
+ * names.
+ *
+ * Returns the same shape either way, so the send loop does not branch. A
+ * composed body is rendered here rather than stored at save time because the
+ * subject can be edited after the blocks were written, and a stored copy would
+ * be one edit behind.
+ */
+async function bodyFor(
+  tenantId: string,
+  broadcast: Broadcast,
+  runner: Queryable,
+): Promise<{
+  subject: string;
+  html: string;
+  text: string | null;
+  blocks: unknown;
+  preheader: string | null;
+}> {
+  if (broadcast.blocks) {
+    const blocks = validateBlocks(broadcast.blocks);
+    if (blocks.length === 0) {
+      // A draft created before anybody wrote it. Framing an empty body would
+      // send the footer and nothing else.
+      throw ApiError.badRequest('That broadcast has no message yet');
+    }
+    return {
+      subject: broadcast.subject ?? broadcast.name,
+      // Rendered against nobody: a conditional block is resolved per recipient
+      // by `personalise` in the loop below.
+      html: renderDocument(blocks, new Set(), broadcast.preheader),
+      text: blocksToText(blocks),
+      blocks,
+      preheader: broadcast.preheader,
+    };
+  }
+
+  if (!broadcast.template_key) throw ApiError.badRequest('That broadcast has no body');
+  const template = await getTemplate(tenantId, broadcast.template_key, runner);
+  if (!template) throw ApiError.notFound(`No email template "${broadcast.template_key}"`);
+  return template;
+}
+
 async function audienceAfter(
   runner: Queryable,
   segmentId: string,
   after: string | null,
   limit: number,
-): Promise<Array<{ id: string; email: string; name: string | null }>> {
-  const { rows } = await runner.query<{ id: string; email: string; name: string | null }>(
-    `SELECT c.id, c.email, c.name
+): Promise<
+  Array<{ id: string; email: string; name: string | null; points_balance: number }>
+> {
+  const { rows } = await runner.query<{
+    id: string;
+    email: string;
+    name: string | null;
+    points_balance: number;
+  }>(
+    // The balance comes with the audience rather than being fetched per
+    // recipient: a `points` block in a 40,000-recipient send would otherwise
+    // be 40,000 extra round trips.
+    //
+    // The retailer's default currency, not the key "points": a store whose
+    // default is "credits" would otherwise show everybody a balance of zero.
+    `SELECT c.id, c.email, c.name,
+            COALESCE((SELECT b.balance
+                        FROM points_balances b
+                        JOIN point_types t
+                          ON t.tenant_id = b.tenant_id AND t.key = b.point_type
+                       WHERE b.tenant_id = c.tenant_id AND b.contact_id = c.id
+                       ORDER BY t.is_default DESC, t.key
+                       LIMIT 1), 0) AS points_balance
        FROM segment_members m
        JOIN contacts c ON c.id = m.contact_id
       WHERE m.segment_id = $1
@@ -434,6 +557,11 @@ export async function startBroadcast(
   if (broadcast.status !== 'draft' && broadcast.status !== 'scheduled') {
     throw ApiError.conflict(`That broadcast is already ${broadcast.status}`);
   }
+
+  // Resolved now rather than in the first batch: a missing template or an
+  // unrenderable block list should stop somebody arming the send, not fail it
+  // halfway through with part of the audience already mailed.
+  await bodyFor(tenantId, broadcast, runner);
 
   const segment = await queryOne<{ key: string }>(
     runner,
