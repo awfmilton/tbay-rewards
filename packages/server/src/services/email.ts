@@ -180,10 +180,19 @@ export async function flushEmailQueue(limit = 50, runner: Queryable = db()): Pro
   // earned. Not a suppression: five dead workers say nothing about the address.
   // Nothing lives in the queue forever, whatever its attempt count says.
   await runner.query(
+    // claim_token is kept, for the same reason the reaper below keeps it: a
+    // worker may be inside its send right now, and if that send succeeds the
+    // delivery is ground truth and has to be recordable. Clearing it made the
+    // 'sent' write -- which was widened to accept 'failed' for exactly this
+    // case -- match zero rows, so the customer received the email and the
+    // retailer's queue showed 'failed' with no provider id and no sent_at.
+    // and the rows this targets are precisely the ones a transport failure has
+    // been retrying every sixty seconds for three days.
     `UPDATE email_messages
         SET status = 'failed',
-            error = COALESCE(error, '') || ' (gave up after ' || $1 || ' in the queue)',
-            claimed_at = NULL, claim_token = NULL
+            error = COALESCE(NULLIF(error, ''), 'No attempt succeeded')
+                    || ' (gave up after ' || $1 || ' in the queue)',
+            claimed_at = NULL
       WHERE status IN ('queued', 'sending')
         AND created_at < now() - $1::interval`,
     [MAX_QUEUE_AGE],

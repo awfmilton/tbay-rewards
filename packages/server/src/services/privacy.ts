@@ -320,8 +320,10 @@ export async function eraseContact(
       const what = unsettled.rows.map((row) => `${row.kind} ${row.id}`).join(', ');
       throw ApiError.badRequest(
         `This person has a checkout in progress (${what}). Erasing mid-payment would ` +
-          'lose the store credit they are about to be owed. A spend intent closes ' +
-          'itself when it expires, or POST /v1/token/spend/{id}/cancel closes it now.',
+          'lose the store credit they are about to be owed. POST /v1/token/spend/{id}/cancel ' +
+          'closes an open intent now, and one stuck mid-verification ten minutes after ' +
+          'the request that abandoned it. Otherwise it closes itself: an intent lapses ' +
+          'at its own expiry, and a stalled verification is released by the worker.',
       );
     }
 
@@ -339,39 +341,57 @@ export async function eraseContact(
       [tenantId, contactId, ERASED_ADDRESS],
     );
 
-    // A spend intent keeps its `from_address` while it could still be settled.
+    // A spend intent that could still be settled keeps the *means* to settle,
+    // not the address.
     //
-    // `expires_at` bounds the quote, not the money: a customer who sent their
-    // TBAY and lost the tab has tokens sitting at the retailer's payout wallet,
-    // and `from_address` is the only field a hand-settlement can match on.
-    // Scrubbing it on every expired intent -- which is what a sixty-minute TTL
-    // made the common case -- is how the round-four bug came back narrower.
-    // Settled means settled: verified, cancelled by the retailer, or past the
-    // window in which anyone can still act on it.
-    await client.query(
-      `UPDATE token_spend_intents SET from_address = $3, member_id = NULL
+    // Keeping the raw wallet was wrong twice over. `members.wallet_address` is
+    // a plaintext, platform-wide, unique column, and it is only cleared when
+    // the erased contact was that person's last on the platform -- so a kept
+    // address joined straight back to their live, fully identified record at
+    // another retailer. Reproduced: one join, one row, name and email. And
+    // "while it could still be settled" was in practice forever, because
+    // erasure is one-shot: nothing revisits the row when the window closes and
+    // a second erasure is refused.
+    //
+    // A keyed digest settles the question without answering it. A retailer
+    // with an unexplained transfer at their payout wallet hashes the sending
+    // address and compares; the digest is salted per tenant and 160 bits of
+    // address are not enumerable, so it cannot be turned back into a wallet or
+    // joined against one. Nothing needs revisiting later, because nothing
+    // identifying is left to remove.
+    const digest = (address: string): string => `erased:${hashPii(address.toLowerCase(), tenant.pii_salt)}`;
+    const openIntents = await client.query<{ id: string; from_address: string }>(
+      `SELECT id, from_address FROM token_spend_intents
         WHERE tenant_id = $1 AND contact_id = $2
-          AND (
-            status IN ('verified', 'cancelled')
-            OR (status = 'expired' AND expires_at <= now() - ($4 || ' days')::interval)
-          )`,
-      [tenantId, contactId, ERASED_ADDRESS, String(SPEND_SETTLEMENT_DAYS)],
+          AND from_address NOT LIKE 'erased:%'
+          AND status = 'expired' AND expires_at > now() - ($3 || ' days')::interval`,
+      [tenantId, contactId, String(SPEND_SETTLEMENT_DAYS)],
     );
+    for (const intent of openIntents.rows) {
+      await client.query('UPDATE token_spend_intents SET from_address = $2 WHERE id = $1', [
+        intent.id,
+        digest(intent.from_address),
+      ]);
+    }
 
-    // Everything else on the table loses its cross-tenant link but keeps the
-    // wallet it owes against. `contact_id` stays: it points at the stripped
-    // contact row, which carries no identifier any more, and it is what lets
-    // the retailer see that an obligation belongs to an erasure rather than to
-    // nobody at all. `member_id` is the platform-wide identity and does go.
+    // Everything else on the table is settled, so the address goes outright.
+    // `contact_id` stays: it points at the stripped contact row, which carries
+    // no identifier any more, and it is what lets the retailer see that a row
+    // belongs to an erasure rather than to nobody at all. `member_id` is the
+    // platform-wide identity and does go.
     await client.query(
-      `UPDATE token_spend_intents SET member_id = NULL
+      `UPDATE token_spend_intents
+          SET member_id = NULL,
+              from_address = CASE WHEN from_address LIKE 'erased:%' THEN from_address
+                                  ELSE $3 END
         WHERE tenant_id = $1 AND contact_id = $2`,
-      [tenantId, contactId],
+      [tenantId, contactId, ERASED_ADDRESS],
     );
 
     // A released or rejected bridge withdrawal owes nothing, so its addresses
-    // go. One still in flight keeps them: those L2 tokens are burned and the
-    // L1 release has to reach the wallet that burned them.
+    // go. One still in flight has to keep them: those L2 tokens are burned and
+    // the L1 release can only reach the wallet that burned them, so a digest
+    // is no use -- somebody has to send to that address.
     await client.query(
       `UPDATE bridge_withdrawals
           SET from_address = $3, l1_recipient = $3
@@ -379,8 +399,13 @@ export async function eraseContact(
           AND status IN ('released', 'rejected')`,
       [tenantId, contactId, ERASED_ADDRESS],
     );
+    // So the *link* goes instead, `contact_id` included. What is left is a
+    // debt to a wallet with nothing in this system saying whose it was --
+    // which is the only shape that both honours the obligation and answers
+    // the erasure. The retailer finds it the way they find every other
+    // outstanding release, by listing burn_verified withdrawals.
     const stillOwed = await client.query<{ status: string }>(
-      `UPDATE bridge_withdrawals SET member_id = NULL
+      `UPDATE bridge_withdrawals SET member_id = NULL, contact_id = NULL
         WHERE tenant_id = $1 AND contact_id = $2
         RETURNING status`,
       [tenantId, contactId],

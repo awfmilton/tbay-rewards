@@ -56,6 +56,96 @@ describe('classifying a delivery failure', () => {
     }
   });
 
+  it('does not count a reputation block toward suppression either (HIGH)', async () => {
+    // Classifying a block as soft is only half of it. A soft failure still
+    // suppresses for thirty days once the attempts run out, so the gate that
+    // decides whether a failure may be *counted* has to exclude the same
+    // replies -- and checking only the wording left it doing almost nothing.
+    //
+    // Exchange Online's standard IP-reputation refusal contains none of spam,
+    // abuse, blocked, blacklist, reputation or policy, so it counted: six
+    // attempts took every Outlook recipient in a broadcast off the list
+    // together, expires_at +30 days, subscription 'bounced'. That is the
+    // disaster the gate exists to prevent, arriving through the gate.
+    for (const message of [
+      '550 5.7.606 Access denied, banned sending IP [203.0.113.7]; To request removal visit sender.office.com',
+      '550 5.7.509 Access denied, sending domain does not pass DMARC verification',
+      '554 5.7.1 Relay access denied',
+      '550 5.6.11 Message contains bare line feeds',
+    ]) {
+      const address = `blocked-${Math.random().toString(36).slice(2)}@example.com`;
+      expect(await recordFailure(tenant.id, address, message, 6, 6), message).toBe('soft');
+      expect(await isSuppressed(tenant.id, address), message).toBeNull();
+    }
+
+    // The control, unchanged: a failure that identifies nothing is exactly
+    // what the attempt budget is for, and still ends in a suppression.
+    const unexplained = `nothing-${Math.random().toString(36).slice(2)}@example.com`;
+    await recordFailure(tenant.id, unexplained, 'Message could not be delivered', 6, 6);
+    expect(await isSuppressed(tenant.id, unexplained)).not.toBeNull();
+  });
+
+  it('reads a dead mailbox that arrives with a policy status (HIGH)', () => {
+    // Returning soft for every 5.7.x was too broad in the other direction.
+    // Yandex answers an unknown recipient with "550 5.7.1 No such user!", so
+    // that address was never permanently suppressed and bounced on every
+    // broadcast, forever, from a domain whose reputation pays for it.
+    //
+    // Only unambiguous wording overrides the subject. Postfix's "Recipient
+    // address rejected" wraps blocks and dead mailboxes alike, so it
+    // deliberately does not count -- that wrapper is what made a Spamhaus
+    // listing suppress a whole batch.
+    expect(classifyFailure('550 5.7.1 No such user!')).toBe('hard');
+    expect(
+      classifyFailure('550 5.7.1 <them@example.com>: Recipient address rejected: Access denied'),
+    ).toBe('soft');
+
+    // Three more that every earlier version read as soft.
+    expect(
+      classifyFailure("554 delivery error: dd This user doesn't have a yahoo.com account"),
+    ).toBe('hard');
+    expect(classifyFailure('550 5.1.1 This account has been disabled or discontinued')).toBe('hard');
+    expect(classifyFailure('550 Unrouteable address')).toBe('hard');
+  });
+
+  it('does not let a quoted transient code outrank the final refusal (HIGH)', () => {
+    // parseReply takes the most severe code anywhere in the chain on purpose,
+    // because a bounce recounts its own history. An unconditional 421
+    // short-circuit threw that away: read as transport, the attempt is
+    // refunded, so a dead mailbox was retried every sixty seconds for three
+    // days and never suppressed.
+    expect(
+      classifyFailure('Earlier attempt: 421 4.7.0 too busy\n550 5.1.1 <them@example.com>: User unknown'),
+    ).toBe('hard');
+
+    // And 421 on its own still means the relay closed the channel on us.
+    expect(classifyFailure('421 4.7.0 Try again later')).toBe('transport');
+  });
+
+  it('does not read a quoted number as an authentication code (MEDIUM)', () => {
+    // A reply code is matched after a colon and a space, which is also how a
+    // bounce quotes anything at all. A bare 535 in the code set turned
+    // "original message size: 535 KB" into an authentication failure -- which
+    // is transport, so never suppressed and the attempt refunded.
+    expect(classifyFailure('550 5.1.1 User unknown; original message size: 535 KB accepted')).toBe(
+      'hard',
+    );
+    // The control: a real authentication refusal is still about us.
+    expect(classifyFailure('Invalid login: 535 5.7.8 Error: authentication failed')).toBe(
+      'transport',
+    );
+    expect(classifyFailure('535 5.7.3 Authentication unsuccessful')).toBe('transport');
+  });
+
+  it('reads the operative line of a verbose bounce (MEDIUM)', () => {
+    // At an 8 KB cap a reply whose real reason sat past it was classified on
+    // its header block alone and came out inverted. A DSN quoting a hundred
+    // and forty Received headers is ordinary, not hostile.
+    const verbose = `${'Received: from relay.example.com by mx.example.net\n'.repeat(300)}550 5.1.1 <them@example.com>: Recipient address rejected: User unknown`;
+    expect(verbose.length).toBeGreaterThan(8_192);
+    expect(classifyFailure(verbose)).toBe('hard');
+  });
+
   it('does not read a reputation block as a dead mailbox (HIGH)', () => {
     // Postfix words *every* rejection the same way, whatever the reason:
     // "<addr>: Recipient address rejected: <reason>". So the hard-bounce
@@ -150,27 +240,40 @@ describe('classifying a delivery failure', () => {
   });
 
   it('does not stall on a hostile reply (MEDIUM)', () => {
-    // The address stripper backtracked from every start position on a long run
-    // of non-whitespace: 64 KB took seven seconds of blocked event loop, and
-    // the text comes from a remote MTA, so anyone with a domain they control
-    // can answer with it.
+    // Measured against a control of the same length rather than a fixed
+    // millisecond bar, which is what let the last version of this test miss a
+    // 135 ms stall: the bar was 250 ms, roughly 1,900 times the honest cost of
+    // the same input, so every shape "passed". A ratio also survives being run
+    // on a slower machine, which a fixed bar does not.
     //
-    // One payload was not enough: the fix bounded the address stripper and
-    // left three patterns scanning the raw reply, where `\b550\b.*no such
-    // user` is quadratic in the number of codes -- 64 KB of "550 " took 1.5
-    // seconds and 256 KB took 23.8. Each shape below defeats a different one
-    // of the three attempts at this, so they are all kept.
-    const payloads = [
-      `550 ${'a'.repeat(64_000)}`, // one huge non-space run, no '@'
-      `${'x'.repeat(256_000)}@`, // the same, ending in the separator
-      '550 '.repeat(64_000), // many codes: the quadratic pairing
-      `550 5.1.1 ${'<a@b.example.com> '.repeat(8_000)}`, // many addresses to strip
-      `${'4.7.1 '.repeat(48_000)}user unknown`, // many enhanced statuses
-    ];
-    for (const hostile of payloads) {
+    // Three separate quadratics have lived in this function: `\b550\b.*reason`
+    // pairing a code with its wording, `\S+@\S+` walking a run of non-space,
+    // and `<[^>\s]*>` backtracking a run of `<`. Each shape below defeats one
+    // of them, so they are all kept, and the local-part scan is the reason the
+    // fourth column is here.
+    const size = 65_536;
+    const control = `550 5.1.1 ${'x'.repeat(size)} user unknown`;
+    const hostile: Record<string, string> = {
+      'run of <': `550 ${'<'.repeat(size)}`,
+      'run of non-space then @': `${'x'.repeat(size)}@`,
+      'repeated codes': '550 '.repeat(size / 4),
+      'repeated addresses': `550 5.1.1 ${'<a@b.example.com> '.repeat(size / 18)}`,
+      'repeated enhanced statuses': `${'4.7.1 '.repeat(size / 6)}user unknown`,
+      'run of colons': ':'.repeat(size),
+      'unbalanced brackets': '<'.repeat(size / 2) + '>'.repeat(size / 2),
+    };
+
+    const time = (text: string) => {
+      classifyFailure(text); // warm, so the first entry is not measuring JIT
       const started = performance.now();
-      classifyFailure(hostile);
-      expect(performance.now() - started, `${hostile.length} bytes`).toBeLessThan(250);
+      classifyFailure(text);
+      return performance.now() - started;
+    };
+
+    const baseline = Math.max(time(control), 0.05);
+    for (const [shape, text] of Object.entries(hostile)) {
+      const ratio = time(text) / baseline;
+      expect(ratio, `${shape}: ${ratio.toFixed(1)}x a well-formed reply`).toBeLessThan(25);
     }
   });
 
@@ -261,6 +364,60 @@ describe('classifying a delivery failure', () => {
     // And it is not a suppression: four days of a broken relay says nothing
     // about the mailbox.
     expect(await isSuppressed(tenant.id, 'stuck@example.com')).toBeNull();
+  });
+
+  it('can still record a delivery the queue-age reaper gave up on (HIGH)', async () => {
+    // The `sent` write was widened to accept 'failed' precisely so that a send
+    // which succeeds after the reaper has given up can still be recorded --
+    // "what actually reached the customer wins". But it is a compare-and-swap
+    // on claim_token, and the new three-day reaper cleared that token, so the
+    // write matched nothing: the customer received the email and the
+    // retailer's queue said failed, with no provider id and no sent_at to
+    // trace it by. The older abandoned-claim reaper keeps the token on purpose
+    // and says why.
+    const { queueEmail, flushEmailQueue } = await import('../src/services/email.js');
+    await queueEmail({
+      tenantId: tenant.id,
+      templateKey: 'receipt',
+      to: 'late-delivery@example.com',
+      subject: 'Your order',
+      html: '<p>Thanks</p>',
+      dedupeKey: 'late-1',
+    });
+    // Four days old, and another worker is inside its send right now.
+    const claim = await db().query<{ id: string; claim_token: string }>(
+      `UPDATE email_messages
+          SET created_at = now() - interval '4 days', status = 'sending',
+              claimed_at = now(), claim_token = gen_random_uuid()
+        WHERE tenant_id = $1 RETURNING id, claim_token`,
+      [tenant.id],
+    );
+
+    // The reaper runs at the top of every flush, i.e. every fifteen seconds.
+    await flushEmailQueue(50);
+    const reaped = await db().query<{ status: string; claim_token: string | null }>(
+      'SELECT status, claim_token FROM email_messages WHERE id = $1',
+      [claim.rows[0]!.id],
+    );
+    expect(reaped.rows[0]!.status).toBe('failed');
+
+    // That worker's send now succeeds. The write it makes is the one in
+    // flushEmailQueue, reproduced here because the send is already in flight.
+    const recorded = await db().query(
+      `UPDATE email_messages
+          SET status = 'sent', sent_at = now(), provider_id = 'relay-ok',
+              error = NULL, claimed_at = NULL, claim_token = NULL
+        WHERE id = $1 AND claim_token = $2 AND status IN ('sending', 'failed')`,
+      [claim.rows[0]!.id, claim.rows[0]!.claim_token],
+    );
+    expect(recorded.rowCount).toBe(1);
+
+    const final = await db().query<{ status: string; provider_id: string | null }>(
+      'SELECT status, provider_id FROM email_messages WHERE id = $1',
+      [claim.rows[0]!.id],
+    );
+    expect(final.rows[0]!.status).toBe('sent');
+    expect(final.rows[0]!.provider_id).toBe('relay-ok');
   });
 
   it('never writes off an address over a deferral, whatever the label (HIGH)', async () => {
