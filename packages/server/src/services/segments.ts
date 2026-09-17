@@ -72,12 +72,21 @@ export async function upsertSegment(
 
   const row = await queryOne<Segment>(
     runner,
+    // Every default belongs in the SQL, not in the parameters.
+    //
+    // `input.name ?? key` and `input.description ?? ''` substituted a
+    // non-NULL value before the statement ever ran, so the COALESCE in the
+    // DO UPDATE had nothing left to preserve: a PUT carrying only a
+    // `definition` -- which is what editing a segment's rules looks like --
+    // renamed the segment to its own key and erased its description. The
+    // COALESCE read as if it handled that, which is why it survived review.
     `INSERT INTO segments (tenant_id, key, name, description, definition, enabled)
-     VALUES ($1, $2, $3, $4, COALESCE($5::jsonb, '{"match":"all","filters":[]}'::jsonb),
+     VALUES ($1, $2, COALESCE($3, $2), COALESCE($4, ''),
+             COALESCE($5::jsonb, '{"match":"all","filters":[]}'::jsonb),
              COALESCE($6, true))
      ON CONFLICT (tenant_id, key) DO UPDATE SET
-       name = COALESCE(EXCLUDED.name, segments.name),
-       description = COALESCE(EXCLUDED.description, segments.description),
+       name = COALESCE($3, segments.name),
+       description = COALESCE($4, segments.description),
        definition = COALESCE($5::jsonb, segments.definition),
        enabled = COALESCE($6, segments.enabled),
        updated_at = now()
@@ -85,8 +94,8 @@ export async function upsertSegment(
     [
       tenantId,
       key,
-      input.name ?? key,
-      input.description ?? '',
+      input.name ?? null,
+      input.description ?? null,
       input.definition ? JSON.stringify(input.definition) : null,
       input.enabled ?? null,
     ],

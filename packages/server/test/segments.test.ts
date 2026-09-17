@@ -10,7 +10,12 @@ import {
   type TestTenant,
 } from './helpers.js';
 import { compileGroup } from '../src/services/segment-filters.js';
-import { buildSegment, countMatching, segmentAudience } from '../src/services/segments.js';
+import {
+  buildSegment,
+  countMatching,
+  segmentAudience,
+  upsertSegment,
+} from '../src/services/segments.js';
 import { suppress } from '../src/services/deliverability.js';
 
 let tenant: TestTenant;
@@ -111,6 +116,98 @@ describe('matching contacts', () => {
       filters: [{ field: 'tags', operator: 'contains', value: ['vip'] }],
     });
     expect(count).toBe(1);
+  });
+
+  it('keeps a segment\'s name and description when only its rules change (HIGH)', async () => {
+    // Editing a segment's rules is a PUT carrying a definition and nothing
+    // else, which is the shape the admin screen sends. The upsert substituted
+    // its own defaults in JavaScript -- `input.name ?? key`,
+    // `input.description ?? ''` -- so by the time the statement ran there was
+    // no NULL left for the DO UPDATE's COALESCE to preserve: the segment was
+    // renamed to its own key and its description erased, silently, on every
+    // rule edit.
+    await upsertSegment(tenant.id, {
+      key: 'vips',
+      name: 'Our best customers',
+      description: 'Anyone tagged vip, for the quarterly thank-you',
+      definition: { match: 'all', filters: [{ field: 'tags', operator: 'contains', value: ['vip'] }] },
+    });
+
+    const edited = await upsertSegment(tenant.id, {
+      key: 'vips',
+      definition: {
+        match: 'all',
+        filters: [{ field: 'tags', operator: 'contains', value: ['platinum'] }],
+      },
+    });
+
+    expect(edited.name).toBe('Our best customers');
+    expect(edited.description).toBe('Anyone tagged vip, for the quarterly thank-you');
+    expect(JSON.stringify(edited.definition)).toContain('platinum');
+
+    // And a rename still renames, rather than the fix turning into "ignore
+    // everything optional".
+    const renamed = await upsertSegment(tenant.id, {
+      key: 'vips', name: 'Platinum tier' });
+    expect(renamed.name).toBe('Platinum tier');
+    expect(renamed.description).toBe('Anyone tagged vip, for the quarterly thank-you');
+    expect(JSON.stringify(renamed.definition)).toContain('platinum');
+  });
+
+  it('still counts a segment when the retailer runs a second currency (HIGH)', async () => {
+    // `points_balances` has been keyed (tenant_id, contact_id, point_type)
+    // since migration 0013; `points_balance`, `lifetime_points` and `rank_key`
+    // were still written as if a contact had one row. A scalar subquery that
+    // returns two rows does not quietly take the first -- Postgres raises
+    // "more than one row returned by a subquery used as an expression" -- so
+    // the moment one customer earned in two currencies, the segment count,
+    // the preview and every rebuild 500'd. Multi-currency is a shipped
+    // feature; this is the crash that met anybody who used it.
+    const contactId = await makeContact({ email: 'two-currencies@example.com' });
+    await db().query(
+      `INSERT INTO point_types (tenant_id, key, name, is_default)
+       VALUES ($1, 'gems', 'Gems', false) ON CONFLICT (tenant_id, key) DO NOTHING`,
+      [tenant.id],
+    );
+    for (const [type, balance] of [
+      ['points', 400],
+      ['gems', 90],
+    ] as const) {
+      await db().query(
+        `INSERT INTO points_balances (tenant_id, contact_id, point_type, balance, lifetime_earned)
+         VALUES ($1, $2, $3, $4, $4)
+         ON CONFLICT (tenant_id, contact_id, point_type)
+           DO UPDATE SET balance = EXCLUDED.balance, lifetime_earned = EXCLUDED.lifetime_earned`,
+        [tenant.id, contactId, type, balance],
+      );
+    }
+
+    // The default currency is what "points balance" has always meant, so the
+    // 400 counts and the 90 does not -- not "either" and certainly not a 500.
+    for (const field of ['points_balance', 'lifetime_points'] as const) {
+      expect(
+        await countMatching(tenant.id, {
+          match: 'all',
+          filters: [{ field, operator: 'gte', value: 300 }],
+        }),
+        field,
+      ).toBe(1);
+      expect(
+        await countMatching(tenant.id, {
+          match: 'all',
+          filters: [{ field, operator: 'gte', value: 500 }],
+        }),
+        field,
+      ).toBe(0);
+    }
+
+    // And the rank field, which joins through the same row.
+    expect(
+      await countMatching(tenant.id, {
+        match: 'all',
+        filters: [{ field: 'rank_key', operator: 'is_set', value: null }],
+      }),
+    ).toBe(0);
   });
 
   it('excludes on a tag, and includes contacts with no tags at all', async () => {

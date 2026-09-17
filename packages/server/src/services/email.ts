@@ -111,6 +111,17 @@ export interface QueueInput {
   /** Unique per tenant; a repeat enqueue with the same key is dropped. */
   dedupeKey: string;
   /**
+   * The tenant's sender identity, from `senderFor()`.
+   *
+   * Every sender already spread `...senderFor(tenant)` in here and the queue
+   * had nowhere to put it, so it was computed five times per message and
+   * discarded, and the transport fell through to the platform default From for
+   * every tenant on the box. Left unset that is still what happens, which is
+   * what makes migration 0030 backwards-compatible for rows already queued.
+   */
+  fromName?: string;
+  fromAddress?: string;
+  /**
    * Rewrite links and add an open pixel.
    *
    * Left unset the message is not tracked, so every existing caller keeps its
@@ -149,8 +160,8 @@ export async function queueEmail(input: QueueInput, runner: Queryable = db()): P
     runner,
     `INSERT INTO email_messages (
        tenant_id, contact_id, template_key, to_email, subject, html, text, dedupe_key,
-       tracking_token, tracked_links, unsubscribe_url
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11)
+       tracking_token, tracked_links, unsubscribe_url, from_name, from_address
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13)
      ON CONFLICT (tenant_id, dedupe_key) DO NOTHING
      RETURNING id`,
     [
@@ -165,6 +176,11 @@ export async function queueEmail(input: QueueInput, runner: Queryable = db()): P
       plan && plan.links.length > 0 ? plan.token : null,
       JSON.stringify(plan?.links ?? []),
       input.unsubscribeUrl ?? null,
+      // NULL, not the platform default: a row with no sender means "whatever
+      // the default is when this goes out", and baking today's value in would
+      // freeze it into the queue.
+      input.fromName ?? null,
+      input.fromAddress ?? null,
     ],
   );
   return { id: row?.id ?? null, queued: row !== null };
@@ -225,6 +241,8 @@ export async function flushEmailQueue(limit = 50, runner: Queryable = db()): Pro
     unsubscribe_url: string | null;
     template_key: string | null;
     claim_token: string;
+    from_name: string | null;
+    from_address: string | null;
   }>(
     // The claim moves the row to `sending`, which no other claim selects.
     //
@@ -269,10 +287,11 @@ export async function flushEmailQueue(limit = 50, runner: Queryable = db()): Pro
               claim_token = gen_random_uuid()
         WHERE id IN (SELECT id FROM claimed)
         RETURNING id, tenant_id, contact_id, to_email, subject, html, text, attempts,
-                  unsubscribe_url, template_key, claim_token, created_at
+                  unsubscribe_url, template_key, claim_token, created_at,
+                  from_name, from_address
      )
      SELECT id, tenant_id, contact_id, to_email, subject, html, text, attempts,
-            unsubscribe_url, template_key, claim_token
+            unsubscribe_url, template_key, claim_token, from_name, from_address
        FROM bumped ORDER BY created_at`,
     [limit, MAX_SEND_ATTEMPTS, STALE_CLAIM],
   );
@@ -333,6 +352,12 @@ export async function flushEmailQueue(limit = 50, runner: Queryable = db()): Pro
         subject: message.subject,
         html: message.html,
         text: message.text,
+        // The tenant's own identity, which every sender computed and the
+        // queue used to discard. NULL still falls through to the platform
+        // default inside the transport, which is what every row written
+        // before migration 0030 gets.
+        fromName: message.from_name ?? undefined,
+        fromAddress: message.from_address ?? undefined,
         headers: unsubscribeHeaders(message.unsubscribe_url),
       });
       await runner.query(

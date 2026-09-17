@@ -812,6 +812,54 @@ describe('classifying a delivery failure', () => {
     ).toBe('hard');
   });
 
+  it('sends as the retailer, not as the platform (HIGH)', async () => {
+    // Five senders each spread `...senderFor(tenant)` into their queueEmail
+    // input, and the INSERT named eleven columns, none of them a sender. So
+    // the tenant's identity was computed once per message and dropped, the
+    // transport read `from_name` off a row that never carried one, and every
+    // tenant on the box sent as the platform default From.
+    //
+    // Invisible on a queue screen and fatal at the recipient: a retailer
+    // aligns SPF and DKIM for hello@theirshop.ca, and every message leaves
+    // under an address their DNS says nothing about, failing DMARC alignment.
+    setEmailTransport(null);
+    outbox().length = 0;
+
+    await queueEmail({
+      tenantId: tenant.id,
+      templateKey: 'test_sender',
+      to: 'customer@example.com',
+      subject: 'Your points',
+      html: '<p>hello</p>',
+      dedupeKey: `sender-${Math.random().toString(36).slice(2)}`,
+      fromName: 'The Flag Shop',
+      fromAddress: 'hello@theflagshop.ca',
+    });
+    await flushEmailQueue(10);
+
+    const sent = outbox().find((m) => m.to === 'customer@example.com');
+    expect(sent).toBeDefined();
+    expect(sent!.fromName).toBe('The Flag Shop');
+    expect(sent!.fromAddress).toBe('hello@theflagshop.ca');
+
+    // A message queued without one still falls through to the platform
+    // default inside the transport, which is what every row written before
+    // migration 0030 gets.
+    await queueEmail({
+      tenantId: tenant.id,
+      templateKey: 'test_sender',
+      to: 'legacy@example.com',
+      subject: 'Your points',
+      html: '<p>hello</p>',
+      dedupeKey: `sender-legacy-${Math.random().toString(36).slice(2)}`,
+    });
+    await flushEmailQueue(10);
+
+    const legacy = outbox().find((m) => m.to === 'legacy@example.com');
+    expect(legacy).toBeDefined();
+    expect(legacy!.fromAddress).toBeUndefined();
+  });
+
   it('does not read a protocol name inside the recipient address (MEDIUM)', () => {
     // Word boundaries fixed Kessler and not <ssl@example.com>, because `<`,
     // `@` and `.` are all non-word characters. The addresses are stripped
