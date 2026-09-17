@@ -1,6 +1,17 @@
 /**
  * Fixed-window in-process rate limiter.
  *
+ * **The contract is docs/RATE-LIMITING.md.** Read it before changing anything
+ * here. It numbers the nine guarantees this file provides, states the four it
+ * deliberately does not, and each one is pinned by a test in
+ * test/security-regressions.test.ts that fails if the guarantee is removed.
+ *
+ * It exists because five rewrites of this file were five attempts to infer a
+ * contract nobody had written -- insertion order, `count <= 1`, ranking by
+ * count, least-recently-used, and a fractional cap on the carry. None was a
+ * coding mistake. The mistake was deciding eviction policy one counterexample
+ * at a time, which is what a written contract is for.
+ *
  * Deliberately not distributed: it exists to stop a single misbehaving site or
  * script from flooding ingest, and each API node enforcing its own share of the
  * budget is good enough for that. Put a shared limiter at the edge if you need
