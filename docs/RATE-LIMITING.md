@@ -44,9 +44,17 @@ silently, which made "least recently used" exactly backwards.
 **G2. A flood cannot reach another class.**
 No volume of ingest traffic, under any tenant, evicts an `admin:` bucket.
 
-**G3. Eviction only ever drops a caller who is not being limited.**
-Such a caller gets a fresh window they were not using. That costs nothing,
-which is why it is the only eviction the contract permits.
+**G3. Eviction drops a caller who is not being limited, in preference to one
+who is.**
+Such a caller gets a fresh window they were not using, which costs nothing —
+so it is the eviction the design reaches for first, and the only one it
+prefers. It is not the only one it *permits*: the carry is capped at the
+ceiling, so once an entire ceiling's worth of callers are simultaneously
+blocked, a rotation does drop blocked ones. G1 states that boundary and it is
+the same boundary; an earlier wording of this guarantee said "only ever" and
+contradicted G1 two paragraphs above it. At that point every key in the map is
+a caller being rejected, so there is nothing innocent left to prefer, and the
+alternative — no cap at all — was measured at six times the ceiling and 143 MB.
 
 **G4. Within the ingest class, tenants share one budget.**
 This is safe *because of G1*: one site's flood can drop another site's idle
@@ -74,7 +82,11 @@ accumulating toward their limit kept starting again.
 
 **G8. Per-call cost does not grow with the map.**
 Measured at the ceiling: ~1.4 µs per insert, ~0.4 µs per touch. Two of these
-run per ingest request. Keeping least-recently-used order cost a `delete` and a
+run per ingest request. The two O(map) operations — a rotation and the
+scheduled sweep — run on the request that notices, so the honest statement is
+amortised rather than per-call: a rotation once per ceiling-worth of inserts,
+a sweep at most once per window per class, and the sweep skips any class that
+is rotating often enough to reclaim on its own. Keeping least-recently-used order cost a `delete` and a
 `set` per touch, and evicting walked `keys()` from the front; both leave
 tombstones that later iteration must walk past, measured at 40 µs per insert
 and 58 µs per touch — which made the limiter a worse denial of service than the
@@ -88,7 +100,9 @@ without bound.
 ## What is deliberately not guaranteed
 
 - **Exact global limits.** See above: per-node by design.
-- **That an idle caller keeps their bucket.** G3 permits dropping it.
+- **That an idle caller keeps their bucket.** G3 prefers dropping it.
+- **That a blocked caller is never dropped.** G1 and G3 give the boundary: past
+  a whole ceiling of simultaneously-blocked callers, the bound wins.
 - **That the ceiling is a hard cap on distinct keys.** G5 gives the real bound.
 - **Fairness between tenants within the ingest class.** G4 is the honest
   statement: containment is by class, not by tenant.

@@ -56,14 +56,27 @@ them without settling:
 ## Step two: the policy
 
 ```
-severity 4 (transient)  →  transport if connection, else soft; never counts
+severity 4 (transient):
+  connection, credentials        →  transport, never counts
+  everything else                →  soft,      never counts
 severity 5 or absent:
   connection, credentials        →  transport, never counts
   mailbox                        →  hard,      counts
-  domain, unknown                →  soft,      counts
-  sender, message, capacity,
-  deferral                       →  soft,      never counts
+  domain, capacity, unknown      →  soft,      counts
+  sender, message, deferral      →  soft,      never counts
 ```
+
+Two lines here were wrong and were found by review rather than by reasoning:
+
+- **`credentials` at 4xx** was `soft`, so it spent an attempt per recipient.
+  Postfix answers `454 4.7.0 Temporary authentication failure` while its own
+  SASL backend is down: five minutes of our own outage burned five of every
+  recipient's six attempts on a fault that was not theirs.
+- **`capacity` at 5xx** never counted, on the reasoning that a full mailbox can
+  be emptied. True, and it meant a mailbox nobody had emptied in a month was
+  retried through the entire seventeen-hour ladder on every broadcast, forever.
+  It counts now, which ends it on the *lapsing* thirty-day suppression — the
+  one that comes back and checks. At 4xx it still never counts.
 
 `counts` is whether an exhausted attempt budget may suppress the address. It
 matters more than the verdict itself, because anything a provider sends
@@ -93,6 +106,19 @@ Codes and enhanced statuses are read **positionally**, not scanned for:
 - Only the code a reply **opens with** may be read as an authentication
   refusal. A bare `535` anywhere matched `original message size: 535 KB`.
 
+Whether the reply **names a mailbox** is read the same way, because it is what
+separates AOL's `This account has been disabled or discontinued` from a relay
+refusing our own account with the same words. Role addresses are stripped
+*before* that question is asked: providers cite a complaint address inside the
+block itself (`postmaster@`, `abuse@`, `support@`), and counting those as a
+named recipient turned every such policy block into a hard bounce.
+
+One caveat worth knowing rather than fixing: **Postfix's own default for an
+unroutable domain is `450`, not `550`**, and only becomes permanent when the
+queue lifetime expires. So `domain` is reached far more often at transient
+severity than the row suggests, where it never counts — the counting path is
+for the relays that answer permanently on the first attempt.
+
 ## Which statuses decide, and which only lean
 
 `SUBJECT_CODES` marks each status either `decide` (the status settles it) or
@@ -107,6 +133,47 @@ reputational and lets wording say otherwise.
 `5.4.1` is the other: Exchange Online puts its unknown-recipient reply there,
 and its wording (`Recipient address rejected`) is Postfix's universal wrapper
 for reputation blocks too. The status is the only thing that separates them.
+
+### The class is part of the status
+
+Rows are keyed `class.subject.detail`, and the lookup order is exact,
+`*.subject.detail`, `class.subject.*`, `*.subject.*`. Dropping the class was
+wrong three times:
+
+- **3.x** at 4xx is the receiving server having a moment; at 5xx it is where
+  AT&T puts its RBL refusal (`553 5.3.0 ... DNSBL:RBL ... _is_blocked`). Read
+  as a connection fault — retried without limit, attempt refunded — a permanent
+  reputation block was retried every sixty seconds for three days at the
+  provider that had just blocklisted us.
+- **2.1** has two documented Google meanings: an inactive account, and *"the
+  user you are trying to contact is receiving email at a rate that prevents
+  additional messages from being delivered"*. The second is a live customer
+  with a busy inbox, and `decide: mailbox` suppressed them permanently on the
+  first attempt.
+- **4.6** is "routing loop detected" in the registry. Zoho sends it to the
+  *sending* client: `550 5.4.6 Unusual sending activity detected`, a block on
+  our own account that lifts within the hour. As a `decide: domain` row it
+  counted, so one hour of throttling suppressed every recipient for a month.
+
+A named detail has to outrank a class wildcard, not the other way round:
+consulted after `5.3.*`, the row for `*.3.4` — `552 5.3.4 Message too big for
+system`, the one 3.x reply that is about the message — was unreachable.
+
+### The backstop: blast radius
+
+Every rule above is a table row, and a table row only helps for a reply
+somebody has already seen. A provider that starts refusing us tomorrow, in
+words no row matches, produces `unknown` — which counts, by design, because six
+unexplained failures is the one case where giving up on an address is honest.
+
+Six unexplained failures for *the whole list* in the same hour is not a list of
+dead mailboxes, and no single reply carries the information needed to tell the
+difference. So that case is **counted rather than classified**: past
+twenty-five `repeated_failure` suppressions for one tenant in one hour, further
+ones are declined. Sends still fail and the retry ladder still gives up on each
+message, which is the right outcome for an outage. Hard bounces and complaints
+are untouched — those are facts about a mailbox, and a broadcast into a stale
+list genuinely does produce thousands at once.
 
 ## Adding a provider
 

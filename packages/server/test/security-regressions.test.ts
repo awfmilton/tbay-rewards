@@ -1389,6 +1389,22 @@ describe('a key flood cannot buy anybody a fresh window (HIGH)', () => {
     expect(after.allowed).toBe(false);
     expect(after.remaining).toBe(0);
 
+    // G3, stated positively, which is the half that had no assertion. The
+    // guarantee is not only that the blocked caller survives -- it is that
+    // what gets dropped instead is a caller who was *not* being limited. A
+    // limiter that retained every key would satisfy every assertion above and
+    // break the memory bound; this is the assertion that tells the two apart.
+    // The flood's own earliest bucket spent one request of a million, so it is
+    // the innocent bystander by construction, and four ceiling-sized
+    // rotations later it must be gone: a fresh window, count back to one.
+    //
+    // Committed once in a message that said this assertion existed, when the
+    // edit meant to add it had silently not matched and the test passed
+    // anyway. The review that caught that is why it is spelled out here.
+    const bystander = rateLimit('ingest:flooder:i:10.0.0.1:a:f0', 1_000_000);
+    expect(bystander.allowed).toBe(true);
+    expect(bystander.remaining).toBe(999_999);
+
     // And the other side of it, said plainly: past a whole ceiling of
     // simultaneously-blocked callers the map is bounded rather than retained.
     // Every key in it is a caller being rejected at that point, so there is
@@ -1461,6 +1477,37 @@ describe('a key flood cannot buy anybody a fresh window (HIGH)', () => {
     // generations to watch that happen.
     expect(rateLimitFloors().ingest).toBeLessThanOrEqual(100_000);
     expect(rateLimitSizes().ingest).toBeLessThanOrEqual(400_000);
+  }, 60_000);
+
+  it('G5/G6: hands back the carry when the sweep frees it, not only the keys', async () => {
+    // `floor` is the carry size, and the rotation trigger is
+    // `live.size >= floor + ceiling`. Only a rotation ever wrote it, so a
+    // sweep that freed the carried windows left the number behind -- and the
+    // class then had to reach the *old* carry plus a whole ceiling of live
+    // keys before it would rotate again, holding everything the sweep had
+    // just freed. It ratchets: every generation that carries anything raises a
+    // floor nothing lowers.
+    //
+    // Short windows again, so the carry can genuinely expire inside the test.
+    const { rateLimit, resetRateLimits, rateLimitFloors } = await import(
+      '../src/lib/ratelimit.js'
+    );
+    resetRateLimits();
+
+    // A carry: blocked callers, unexpired at the moment of the rotation.
+    for (let n = 0; n < 40_000; n += 1) {
+      const key = `ingest:blocked:i:10.5.${n % 256}.${n % 251}:a:b${n}`;
+      for (let i = 0; i < 11; i += 1) rateLimit(key, 10, 3_000);
+    }
+    for (let n = 0; n < 100_001; n += 1) rateLimit(`ingest:fill:i:9.9.9.9:a:f${n}`, 600, 3_000);
+    expect(rateLimitFloors().ingest).toBeGreaterThan(0);
+
+    // Everything above expires, then the sweep runs.
+    await new Promise((resolve) => setTimeout(resolve, 3_200));
+    rateLimit('other:floor-probe', 10, 1);
+
+    // Nothing is left to carry, so nothing is what the floor must say.
+    expect(rateLimitFloors().ingest).toBe(0);
   }, 60_000);
 
   it('G7: does not reset a caller\'s count when the sweep runs', async () => {
