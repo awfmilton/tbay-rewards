@@ -242,6 +242,11 @@ export async function evaluateBadges(
   runner?: Queryable,
 ): Promise<Array<{ badge: Badge; level: number; pointsAwarded: number }>> {
   const run = async (client: Queryable) => {
+    // The contact first, as everywhere. Without it a merge running alongside
+    // took the contact away mid-evaluation and the badge award landed on the
+    // foreign key -- another constraint name arriving as a 500.
+    await holdContact(client, tenantId, contactId);
+
     const badges = (await listBadges(tenantId, client)).filter(
       (badge) => badge.enabled && !badge.manual_only && badge.criteria?.type !== 'manual',
     );
@@ -1021,7 +1026,23 @@ export async function evaluateRank(
     );
     const rank = await rankFor(tenantId, contactId, client, type.key);
     if (pinnedRow?.rank_locked) return { rank, promoted: false };
-    if (!rank) return { rank: null, promoted: false };
+
+    // No rank applies any more -- they have earned past the ceiling of a
+    // banded rank with nothing above it. Clear what was written down.
+    //
+    // Returning early without clearing left the old rank stored, so the
+    // member's own profile (which computes) said they had none while the admin
+    // screens and every "Summer Club members" segment (which read the stored
+    // value) still said they did, and no amount of re-evaluation healed it.
+    if (!rank) {
+      await client.query(
+        `UPDATE points_balances SET current_rank_id = NULL, updated_at = now()
+          WHERE tenant_id = $1 AND contact_id = $2 AND point_type = $3
+            AND current_rank_id IS NOT NULL`,
+        [tenantId, contactId, type.key],
+      );
+      return { rank: null, promoted: false };
+    }
 
     const current = await queryOne<{ current_rank_id: string | null }>(
       client,
@@ -1489,6 +1510,13 @@ export async function redeemCoupon(
   runner?: Queryable,
 ): Promise<{ points: number; balance: Balance }> {
   const run = async (client: Queryable) => {
+    // The contact before the coupon row, like every other writer. Taking the
+    // coupon first put this the wrong way round against a merge, and when the
+    // merge won, the redemption carried on and hit the foreign key several
+    // statements later -- reporting `coupon_redemptions violates foreign key
+    // constraint` as a 500 to somebody who had just typed in a code.
+    await holdContact(client, tenantId, contactId);
+
     const coupon = await queryOne<{
       id: string;
       points: number;

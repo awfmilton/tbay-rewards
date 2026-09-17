@@ -17,6 +17,7 @@ import {
   subscribe,
   subscribersFor,
   unsubscribeByEmail,
+  ensureList,
   unsubscribeByToken,
 } from '../src/services/newsletter.js';
 import { flushEmailQueue, outbox, setEmailTransport } from '../src/services/email.js';
@@ -367,3 +368,72 @@ async function consentOf(email: string) {
   );
   return rows[0]!;
 }
+
+describe('a signup form never takes consent away (HIGH)', () => {
+  /**
+   * The guard that makes a returning unsubscriber confirm asked "has this
+   * address ever unsubscribed from anything here", and its answer was passed
+   * to upsertContact as `marketingConsent`. So a customer who left one list
+   * and later used the on-site widget for a different list they were still
+   * subscribed to had `false` written over a live `true`: unmailable account
+   * wide, with the subscription row still reading `subscribed` and
+   * `confirmed_at` set, so nothing looked wrong. Even the welcome email was
+   * suppressed, for the consent that submission had just cleared.
+   */
+  it('leaves a live subscriber alone when they re-submit a form', async () => {
+    const tenantRow = await tenantObject();
+
+    // Two single-opt-in lists, created before anyone joins them, so joining
+    // grants consent outright. (ensureList defaults to double opt-in, and a
+    // list created by the first subscribe would make that subscribe pending.)
+    await ensureList(tenant.id, 'deals');
+    await ensureList(tenant.id, 'news');
+    await db().query('UPDATE lists SET double_optin = false WHERE tenant_id = $1', [tenant.id]);
+
+    await subscribe(tenantRow, { email: 'both@example.com', listSlug: 'deals' });
+    await subscribe(tenantRow, { email: 'both@example.com', listSlug: 'news' });
+    expect((await consentOf('both@example.com')).marketing_consent).toBe(true);
+
+    // They leave one of the two, per list, the way the preference centre does
+    // it -- account-level consent is untouched, because they still want the
+    // other list. (unsubscribeByToken is the account-level exit and clears
+    // consent by design; that is not this case.)
+    await db().query(
+      `UPDATE subscriptions SET status = 'unsubscribed', unsubscribed_at = now()
+        WHERE id IN (
+          SELECT s.id FROM subscriptions s
+            JOIN lists l ON l.id = s.list_id
+            JOIN contacts c ON c.id = s.contact_id
+           WHERE l.slug = 'deals' AND c.email_normalised = 'both@example.com'
+        )`,
+      [],
+    );
+
+    const afterLeaving = await consentOf('both@example.com');
+    // Still mailable: they left a list, not the shop.
+    expect(afterLeaving.marketing_consent).toBe(true);
+
+    // Now they re-submit the form for the list they never left. Server side,
+    // which is how the WordPress plugin posts a form: `fillOnly` is the public
+    // site key's restriction, and it happens to protect consent, so the damage
+    // only showed on the path a retailer's own integration uses.
+    const again = await subscribe(tenantRow, { email: 'both@example.com', listSlug: 'news' });
+
+    const held = await consentOf('both@example.com');
+    expect(held.marketing_consent).toBe(afterLeaving.marketing_consent);
+    expect(again.status).not.toBe('pending');
+
+    // And the list they did leave is still left.
+    const { rows } = await db().query<{ slug: string; status: string }>(
+      `SELECT l.slug, s.status FROM subscriptions s
+         JOIN lists l ON l.id = s.list_id
+         JOIN contacts c ON c.id = s.contact_id
+        WHERE c.email_normalised = 'both@example.com' ORDER BY l.slug`,
+      [],
+    );
+    expect(rows.map((row) => [row.slug, row.status])).toEqual([
+      ['deals', 'unsubscribed'],
+      ['news', 'subscribed'],
+    ]);
+  });
+});

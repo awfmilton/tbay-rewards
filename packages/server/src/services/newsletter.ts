@@ -110,11 +110,21 @@ export async function subscribe(
     // exactly the right instrument: a returning subscriber clicks the link, a
     // stranger typing somebody else's address accomplishes one email and no
     // consent at all.
+    // Scoped to this list, and to consent that is currently withdrawn.
+    //
+    // Asking "has this address ever unsubscribed from anything here" was far
+    // too wide: somebody who left one list and later used the on-site form for
+    // a different list they were still subscribed to came back as a prior
+    // opt-out. That is not just a needless confirmation email -- `mustConfirm`
+    // is passed straight to upsertContact as `marketingConsent`, so `false`
+    // was written over a live `true` and the customer went unmailable account
+    // wide, with their subscription row still reading `subscribed`.
     const priorOptOut = await client.query(
       `SELECT 1
          FROM subscriptions s
          JOIN contacts c ON c.id = s.contact_id
         WHERE c.tenant_id = $1 AND c.email_normalised = lower($2)
+          AND s.list_id = $3
           AND s.status IN ('unsubscribed', 'complained')
         UNION ALL
        SELECT 1
@@ -122,7 +132,7 @@ export async function subscribe(
         WHERE c.tenant_id = $1 AND c.email_normalised = lower($2)
           AND c.marketing_consent = false AND c.consent_at IS NOT NULL
         LIMIT 1`,
-      [tenant.id, email],
+      [tenant.id, email, list.id],
     );
     const mustConfirm = list.double_optin || (priorOptOut.rowCount ?? 0) > 0;
 
@@ -132,8 +142,13 @@ export async function subscribe(
         email,
         name: input.name ?? null,
         attributes: input.attributes ?? {},
-        marketingConsent: !mustConfirm,
-        consentSource: input.source ?? 'newsletter_form',
+        // `undefined`, never `false`: this call may grant consent, and it may
+        // leave it exactly as it is. It may not take it away. Withdrawing is
+        // something only the person does, through unsubscribe or the
+        // preference centre -- a signup form that revokes consent is a bug
+        // wearing the clothes of a feature.
+        marketingConsent: mustConfirm ? undefined : true,
+        consentSource: mustConfirm ? undefined : (input.source ?? 'newsletter_form'),
       },
       client,
       { fillOnly: options.fillOnly ?? false },

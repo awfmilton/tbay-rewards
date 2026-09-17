@@ -182,12 +182,15 @@ export async function flushEmailQueue(limit = 50, runner: Queryable = db()): Pro
     `UPDATE email_messages
         SET status = 'failed',
             error = COALESCE(error, 'Sending stopped responding and ran out of attempts'),
-            claimed_at = NULL,
-            claim_token = NULL
+            claimed_at = NULL
+      -- claim_token is kept on purpose. If the worker was not dead after all
+      -- and its send succeeds, that delivery is ground truth and has to be
+      -- recordable; clearing the token here made the 'sent' write impossible
+      -- and lost the provider id with it.
       WHERE status = 'sending'
         AND attempts >= $1
         AND claimed_at < now() - $2::interval`,
-    [MAX_SEND_ATTEMPTS, STALE_CLAIM],
+    [MAX_SEND_ATTEMPTS, ABANDONED_CLAIM],
   );
 
   const { rows } = await runner.query<{
@@ -258,6 +261,29 @@ export async function flushEmailQueue(limit = 50, runner: Queryable = db()): Pro
   let sent = 0;
 
   for (const message of rows) {
+    // Renew the claim immediately before sending, and only send if it is
+    // still ours.
+    //
+    // One claim covers the whole batch and stamps every row with the same
+    // `claimed_at`, but the rows are sent serially -- so once total batch time
+    // passes STALE_CLAIM, every row this worker has not reached yet looks
+    // abandoned to the other worker, while this one still holds it and is
+    // about to send it. Fifty messages at six seconds each is enough, and so
+    // are two socket stalls anywhere in the batch. Measured: two of three
+    // recipients received the campaign twice, both rows ending `sent` with no
+    // error, so nothing on a queue screen showed it.
+    //
+    // The compare-and-swap could not help: it stops a worker writing over
+    // another's status, it cannot un-send a message. This makes the window
+    // per message, which is what the transport's own timeouts actually bound.
+    const held = await runner.query(
+      `UPDATE email_messages
+          SET claimed_at = now()
+        WHERE id = $1 AND status = 'sending' AND claim_token = $2`,
+      [message.id, message.claim_token],
+    );
+    if ((held.rowCount ?? 0) === 0) continue;
+
     // Checked at send time rather than at queue time: an address can be
     // suppressed between being queued and being sent, and the whole point of
     // a suppression list is that nothing gets past it.
@@ -293,7 +319,10 @@ export async function flushEmailQueue(limit = 50, runner: Queryable = db()): Pro
         `UPDATE email_messages
             SET status = 'sent', sent_at = now(), provider_id = $2,
                 error = NULL, claimed_at = NULL, claim_token = NULL
-          WHERE id = $1 AND status = 'sending' AND claim_token = $3`,
+          -- 'failed' as well as 'sending': the reaper may have given up on
+          -- this worker while its send was in flight, and the send then
+          -- succeeded. What actually reached the customer wins.
+          WHERE id = $1 AND claim_token = $3 AND status IN ('sending', 'failed')`,
         [message.id, providerId, message.claim_token],
       );
       sent += 1;
@@ -410,6 +439,18 @@ const MAX_SEND_ATTEMPTS = 6;
  * minutes too, or a stalled send will go out twice.
  */
 const STALE_CLAIM = '5 minutes';
+
+/**
+ * How long a claim has to sit before the message is written off entirely.
+ *
+ * Deliberately far wider than STALE_CLAIM, because the two decisions are not
+ * the same size. Reclaiming early is recoverable -- at worst a message goes
+ * out twice, which the per-message renewal above now prevents. Failing early
+ * is terminal, and it was being applied to messages that had been *delivered*:
+ * the reaper ran on its sixth attempt, the customer got their receipt, and the
+ * retailer's queue said it failed with no provider id to trace it by.
+ */
+const ABANDONED_CLAIM = '30 minutes';
 
 /**
  * How long to wait before trying a message again.

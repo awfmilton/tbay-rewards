@@ -831,28 +831,33 @@ describe('ingest rate limiting cannot be rotated away (HIGH)', () => {
    * unlimited throughput: measured at 800/800 requests through a 600/minute
    * bucket.
    */
+  // `visitor`, because that is the field the tracker and the collect schema
+  // use. An earlier version of this suite sent `anonId` -- a name that appears
+  // nowhere else in the product -- and so did the limiter, which is why both
+  // agreed with each other and neither agreed with a real request.
   const collect = (
-    anonId: string | null,
+    visitor: string | null,
     forwardedFor: string,
   ) => ({
     method: 'POST' as const,
     url: '/v1/collect',
     headers: { 'x-tbay-key': tenant.publicKey, 'x-forwarded-for': forwardedFor },
     payload: {
-      ...(anonId === null ? {} : { anonId }),
+      ...(visitor === null ? {} : { visitor, session: `${visitor}-session` }),
+      url: 'https://shop.example/p',
       events: [{ type: 'pageview', url: 'https://shop.example/p' }],
     },
   });
 
   async function countAllowed(
     requests: number,
-    key: (n: number) => { anonId: string | null; forwardedFor: string },
+    key: (n: number) => { visitor: string | null; forwardedFor: string },
   ) {
     const app = await testApp();
     let allowed = 0;
     for (let n = 0; n < requests; n += 1) {
-      const { anonId, forwardedFor } = key(n);
-      const response = await app.inject(collect(anonId, forwardedFor));
+      const { visitor, forwardedFor } = key(n);
+      const response = await app.inject(collect(visitor, forwardedFor));
       if (response.statusCode !== 429) allowed += 1;
     }
     return allowed;
@@ -860,19 +865,19 @@ describe('ingest rate limiting cannot be rotated away (HIGH)', () => {
 
   it('still gives one steady visitor their own bucket', async () => {
     const steady = await countAllowed(650, () => ({
-      anonId: 'steady-visitor',
+      visitor: 'steady-visitor',
       forwardedFor: '198.51.100.7, 10.0.0.1',
     }));
 
     expect(steady).toBe(600);
   });
 
-  it('caps a visitor who rotates their anon id at the address ceiling', async () => {
+  it('caps a visitor who rotates their visitor id at the address ceiling', async () => {
     // A fresh id per request no longer opens a fresh allowance; it spends the
     // address ceiling instead, which is the part of the key the caller does
     // not get to choose. Before this, all 3,200 went through.
     const rotating = await countAllowed(3_200, (n) => ({
-      anonId: `rotating-${n}`,
+      visitor: `rotating-visitor-${n}`,
       forwardedFor: '198.51.100.8, 10.0.0.1',
     }));
 
@@ -883,7 +888,7 @@ describe('ingest rate limiting cannot be rotated away (HIGH)', () => {
     // Every request claims a different origin address, but the entry the proxy
     // itself appended is the same throughout, and that is the one that counts.
     const spoofing = await countAllowed(3_200, (n) => ({
-      anonId: null,
+      visitor: null,
       forwardedFor: `203.0.113.${n % 250}, 10.0.0.2`,
     }));
 
@@ -894,13 +899,13 @@ describe('ingest rate limiting cannot be rotated away (HIGH)', () => {
     // The NAT case the per-visitor bucket exists for: the ceiling is shared,
     // but one heavy visitor must not spend a colleague's allowance.
     const heavy = await countAllowed(650, () => ({
-      anonId: 'heavy',
+      visitor: 'heavy-visitor',
       forwardedFor: '198.51.100.9, 10.0.0.3',
     }));
     expect(heavy).toBe(600);
 
     const colleague = await countAllowed(10, () => ({
-      anonId: 'colleague',
+      visitor: 'colleague-visit',
       forwardedFor: '198.51.100.9, 10.0.0.3',
     }));
     expect(colleague).toBe(10);
@@ -1020,5 +1025,103 @@ describe('a link owner has to be one of ours (MEDIUM)', () => {
     });
 
     expect(response.statusCode).toBe(200);
+  });
+});
+
+describe('the client address is only as trusted as the deployment (HIGH)', () => {
+  /**
+   * TRUST_PROXY_HOPS used to default to 1, matching the nginx block in the
+   * deployment doc. Every other topology -- a container exposed directly, a
+   * developer running it on a laptop, anything behind a load balancer that
+   * replaces rather than appends -- then trusted a header the caller wrote,
+   * and the address in the rate limiter, the audit log and consent records was
+   * whatever they typed. Measured: 1,200 requests through a 600 bucket by
+   * editing one header.
+   *
+   * The default is 0 now. It costs accuracy behind a proxy that is not
+   * configured, which is visible and fixable; the old default cost the
+   * guarantee, which was neither.
+   */
+  it('defaults to trusting nothing', async () => {
+    const { DEFAULT_TRUST_PROXY_HOPS, config } = await import('../src/config.js');
+
+    expect(DEFAULT_TRUST_PROXY_HOPS).toBe(0);
+    // And this suite's own value is set on purpose in helpers.ts, not
+    // inherited -- the tests below mean "behind exactly one proxy".
+    expect(config().security.trustProxyHops).toBe(1);
+  });
+
+  it('counts hops from this process outwards', async () => {
+    // With one appending proxy, the rightmost entry is the only one nginx
+    // wrote, and that is the one that counts. Everything to its left is the
+    // caller talking.
+    const app = await testApp();
+    const seen: string[] = [];
+    for (const forwarded of ['203.0.113.1, 10.0.0.9', '198.51.100.1, 10.0.0.9']) {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/collect',
+        headers: { 'x-tbay-key': tenant.publicKey, 'x-forwarded-for': forwarded },
+        payload: {
+          visitor: 'hops-visitor',
+          session: 'hops-session',
+          url: 'https://shop.example/p',
+          events: [{ type: 'pageview', url: 'https://shop.example/p' }],
+        },
+      });
+      seen.push(String(response.statusCode));
+    }
+
+    // Both land in the same bucket, because the claimed left-hand entry is
+    // ignored -- so neither is rejected and neither minted a new allowance.
+    expect(seen).toEqual(['204', '204']);
+  });
+});
+
+describe('the site key cannot set categories on a product the store knows (MEDIUM)', () => {
+  it('leaves an empty category list empty rather than treating it as unset', async () => {
+    // "Empty means unset, so filling it is allowed" sounded consistent with
+    // the other fill-only columns and was the opposite of safe: the tracker is
+    // what introduces products, and it introduces them with no categories, so
+    // the unprotected state was the normal one. Reward rules match on
+    // categories, so anyone with the site key -- it is in every page's source
+    // -- decided what an already-known product earned.
+    const app = await testApp();
+    const sighting = (categories: string[]) =>
+      app.inject({
+        method: 'POST',
+        url: '/v1/collect',
+        headers: { 'x-tbay-key': tenant.publicKey, 'user-agent': DESKTOP_UA },
+        payload: {
+          ...ids(),
+          url: 'https://shop.example/p/2',
+          events: [
+            {
+              type: 'product_view',
+              productRef: 'SKU-CAT',
+              product: { name: 'Canvas Print', priceCents: 4_999, categories },
+            },
+          ],
+        },
+      });
+
+    // First sighting, as the tracker does it: no categories.
+    await sighting([]);
+    // Second sighting, with categories the caller chose.
+    await sighting(['clearance', 'double-points']);
+
+    const { rows } = await db().query<{ categories: string[] }>(
+      'SELECT categories FROM products WHERE tenant_id = $1 AND product_ref = $2',
+      [tenant.id, 'SKU-CAT'],
+    );
+    expect(rows[0]!.categories).toEqual([]);
+
+    // The storefront still sets them, over the secret key.
+    await authed('PUT', '/v1/products/SKU-CAT', { categories: ['wall-art'] });
+    const { rows: after } = await db().query<{ categories: string[] }>(
+      'SELECT categories FROM products WHERE tenant_id = $1 AND product_ref = $2',
+      [tenant.id, 'SKU-CAT'],
+    );
+    expect(after[0]!.categories).toEqual(['wall-art']);
   });
 });

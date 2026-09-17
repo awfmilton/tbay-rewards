@@ -22,6 +22,18 @@ let lastSweep = Date.now();
  */
 const SWEEP_AT_SIZE = 50_000;
 
+/**
+ * Where the map stops growing, whatever the sweep managed to free.
+ *
+ * Sweeping only deletes windows that have already expired, so a map of
+ * 50,000 *live* keys freed nothing and then walked the whole map again on
+ * every subsequent request -- O(n) per call, still growing. A caller who can
+ * mint keys (a spoofable address, a routed IPv6 /64) turns the limiter itself
+ * into the load. Past this, the oldest windows go, which costs those callers
+ * their accumulated count and costs nobody else anything.
+ */
+const HARD_CEILING = 200_000;
+
 export interface RateLimitResult {
   allowed: boolean;
   remaining: number;
@@ -37,6 +49,18 @@ export function rateLimit(key: string, limit: number, windowMs = 60_000): RateLi
       if (window.resetAt <= now) windows.delete(existing);
     }
     lastSweep = now;
+
+    // Expiring nothing is the case that mattered: a map full of live keys
+    // sweeps clean and keeps growing. Map iterates in insertion order, so the
+    // oldest windows are the ones at the front.
+    if (windows.size > HARD_CEILING) {
+      let excess = windows.size - HARD_CEILING;
+      for (const existing of windows.keys()) {
+        if (excess <= 0) break;
+        windows.delete(existing);
+        excess -= 1;
+      }
+    }
   }
 
   const current = windows.get(key);

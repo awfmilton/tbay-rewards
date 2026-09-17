@@ -11,6 +11,7 @@ import {
   upsertBadge,
   badgesForContact,
   createCoupon,
+  currentRank,
   evaluateBadges,
   evaluateRank,
   hasUnlocked,
@@ -718,5 +719,42 @@ describe('a streak day belongs to the retailer, not the server (LOW)', () => {
     );
 
     expect(rows[0]!.last_day).toBe(rows[0]!.store_day);
+  });
+});
+
+describe('a rank nobody holds any more is cleared, not left written down (MEDIUM)', () => {
+  it('agrees with itself once a member earns past a banded rank', async () => {
+    // `profile` computes the rank; `currentRank` and the `rank` segment filter
+    // read the one `evaluateRank` wrote. When no rank applies -- earned past
+    // the ceiling of a band with nothing above it -- evaluateRank returned
+    // early without clearing, so the member's own profile said they had no
+    // rank while the admin screens and every "Summer Club members" campaign
+    // still said they did. Re-evaluating did not heal it.
+    const contact = (await member('bander@example.com')).id;
+    await db().query('DELETE FROM ranks WHERE tenant_id = $1', [tenant.id]);
+    await upsertRank(tenant.id, {
+      key: 'summer', name: 'Summer Club', minPoints: 500, maxPoints: 1_000,
+    });
+
+    await award(tenant.id, {
+      contactId: contact, points: 600, reason: 'in the band', idempotencyKey: 'band-in',
+    });
+    await evaluateRank(tenant.id, contact);
+    expect((await profile(tenant.id, contact)).rank?.key).toBe('summer');
+    expect((await currentRank(tenant.id, contact))?.key).toBe('summer');
+
+    // Past the ceiling, with nothing above it.
+    await award(tenant.id, {
+      contactId: contact, points: 600, reason: 'past the band', idempotencyKey: 'band-out',
+    });
+    await evaluateRank(tenant.id, contact);
+
+    expect((await profile(tenant.id, contact)).rank).toBeNull();
+    expect(await currentRank(tenant.id, contact)).toBeNull();
+    const { rows } = await db().query<{ current_rank_id: string | null }>(
+      'SELECT current_rank_id FROM points_balances WHERE tenant_id = $1 AND contact_id = $2',
+      [tenant.id, contact],
+    );
+    expect(rows[0]!.current_rank_id).toBeNull();
   });
 });

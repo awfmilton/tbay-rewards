@@ -9,6 +9,17 @@ function str(key: string, fallback?: string): string {
   return value;
 }
 
+/**
+ * Trust no proxy unless the deployment says otherwise.
+ *
+ * Exported so the choice is pinned rather than buried in a call argument: it
+ * was 1, matching the nginx block in the deployment doc, and every other
+ * topology then trusted a header the caller wrote. Measured at the time: 1,200
+ * requests through a 600/minute bucket by editing one header, with the same
+ * address landing in the audit log and consent records.
+ */
+export const DEFAULT_TRUST_PROXY_HOPS = 0;
+
 function num(key: string, fallback: number): number {
   const raw = process.env[key];
   if (raw === undefined || raw === '') return fallback;
@@ -81,8 +92,16 @@ export function loadConfig() {
        *
        * Counted from this process outwards: 1 for the documented single proxy,
        * 2 behind Cloudflare in front of nginx, 0 when nothing is in front.
+       *
+       * Defaults to 0, which is the only safe default: a deployment with
+       * nothing in front and a default of 1 trusts a header the caller wrote,
+       * which puts the address in the rate limiter, the audit log and consent
+       * records back under the caller's control. Getting this too low costs
+       * accuracy behind a proxy -- every visitor looks like the proxy. Getting
+       * it too high costs the guarantee. docs/DEPLOYMENT.md sets it to 1
+       * alongside the nginx block that earns it.
        */
-      trustProxyHops: num('TRUST_PROXY_HOPS', 1),
+      trustProxyHops: num('TRUST_PROXY_HOPS', DEFAULT_TRUST_PROXY_HOPS),
     },
 
     tracking: {

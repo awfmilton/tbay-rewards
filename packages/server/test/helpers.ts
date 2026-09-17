@@ -10,6 +10,11 @@ process.env.TOKEN_SECRET = 'test-token-secret';
 process.env.PUBLIC_URL = 'http://localhost:4000';
 process.env.LOG_LEVEL = 'silent';
 process.env.EMAIL_TRANSPORT = 'log';
+// The documented deployment: one appending reverse proxy in front. The
+// product default is 0 -- trust nothing -- because a deployment with nothing
+// in front and a default of 1 hands the client address back to the caller.
+// Tests that exercise the proxy path have to say which topology they mean.
+process.env.TRUST_PROXY_HOPS = '1';
 process.env.RUN_WORKERS = 'false';
 process.env.MIGRATE_ON_BOOT = 'false';
 // Deterministic key so signature assertions are stable. Test-only.

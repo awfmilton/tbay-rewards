@@ -90,13 +90,15 @@ export async function recordOrder(
     // tenant_id against a stranger. The route's own `requireContact` runs
     // after `recordOrder` has already committed, so it returned 404 while the
     // rows persisted.
+    //
+    // Held, not merely read: an unlocked SELECT lets a merge delete the row
+    // between this check and the order INSERT, and the order then fails on the
+    // foreign key -- a constraint name returned as a 500 to a storefront
+    // reporting a sale that really happened. `holdContact` refuses in the same
+    // words as every other writer.
     if (contactId) {
-      const owned = await queryOne<{ id: string }>(
-        client,
-        'SELECT id FROM contacts WHERE tenant_id = $1 AND id = $2',
-        [tenant.id, contactId],
-      );
-      if (!owned) throw ApiError.notFound('No matching contact');
+      const { holdContact } = await import('./points.js');
+      await holdContact(client, tenant.id, contactId);
     }
 
     if (!contactId && (input.email || input.externalRef)) {
@@ -519,6 +521,24 @@ async function unqualifyReferralIfUnearned(
     });
     if (compensation !== null) reversed = true;
   }
+
+  // Free the idempotency key, or the referral can never be paid again.
+  //
+  // `trigger` keys the award on rule:referral:<referrer>:<referral_id>, which
+  // does not change when the referral goes back to pending. So when the
+  // referee later placed an order they kept, re-qualifying found the reversed
+  // row, returned "already done", and paid nothing -- the referral read
+  // `qualified` and the affiliate had nothing for it, permanently. Renaming
+  // the spent key keeps the history and lets the next genuine qualification
+  // stand on its own.
+  await client.query(
+    `UPDATE points_ledger
+        SET idempotency_key = 'unwound:' || id::text
+      WHERE tenant_id = $1 AND ref_type = 'referral' AND ref_id = $2
+        AND status = 'reversed'`,
+    [tenantId, referral.id],
+  );
+
   return reversed;
 }
 

@@ -83,9 +83,21 @@ const TRANSPORT_FAILURE = new RegExp(
     // accepted the connection and went quiet spent the attempt budget and
     // suppressed the address for thirty days -- for a fault at our end.
     '^timeout$|\\btimed out\\b|greeting (?:never received|timeout)',
-    '\\b(?:421|450|451|452)\\b',            // transient SMTP
+    // Transient SMTP -- but not when the text says the mailbox is full or
+    // over quota. Those are 4xx by the letter of the spec and permanent in
+    // practice: an abandoned mailbox stays over quota, and treating it as our
+    // problem meant it was retried every minute and never written off.
+    '(?!.*(?:over ?quota|quota exceeded|mailbox (?:is )?full|insufficient (?:system )?storage))'
+      + '^(?:.*\\b(?:421|450|451|452)\\b.*)$',
     '\\b535\\b|authentication (?:failed|required)|invalid login',
-    'certificate|self.?signed|TLS|SSL',
+    // Word boundaries, because these are matched against a reply that quotes
+    // the recipient. `SSL` unanchored matched Kessler, Hassler, Gessler and
+    // Ressler, so a real "User unknown" bounce for anyone with one of those
+    // surnames was read as our TLS failing: never suppressed, attempts handed
+    // back, retried once a minute forever against a mailbox that does not
+    // exist -- a queue that never drains and a steady stream of bounces
+    // against the sending domain.
+    '\\bcertificate\\b|\\bself.?signed\\b|\\bTLS\\b|\\bSSL\\b|\\bSTARTTLS\\b',
     'greylist|try again|too many connections|rate limit',
   ].join('|'),
   'i',
