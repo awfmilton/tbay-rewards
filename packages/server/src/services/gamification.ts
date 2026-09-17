@@ -1012,6 +1012,18 @@ export async function evaluateRank(
   pointType?: string | null,
 ): Promise<{ rank: Rank | null; promoted: boolean }> {
   const run = async (client: Queryable) => {
+    // The contact first, like every other writer.
+    //
+    // Round four added this to redeemCoupon, recordOrder and evaluateBadges
+    // and missed evaluateRank, which was being edited in the same commit. It
+    // writes points_balances, so a merge taking the contact away mid-call gave
+    // `points_balances_contact_id_fkey` as a 500 -- 52 times in a 780-op fuzz,
+    // plus a deadlock. `POST /v1/gamification/evaluate` reaches it directly,
+    // and reevaluateAll aborted the whole bulk run on the first merged
+    // contact. The trigger path only looked safe because evaluateBadges now
+    // holds the contact and happens to run first.
+    await holdContact(client, tenantId, contactId);
+
     const type = await resolvePointType(tenantId, pointType, client);
 
     // myCred's Manual Mode exists because stores pin a VIP tier that no points

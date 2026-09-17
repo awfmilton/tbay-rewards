@@ -25,14 +25,24 @@ const SWEEP_AT_SIZE = 50_000;
 /**
  * Where the map stops growing, whatever the sweep managed to free.
  *
- * Sweeping only deletes windows that have already expired, so a map of
- * 50,000 *live* keys freed nothing and then walked the whole map again on
- * every subsequent request -- O(n) per call, still growing. A caller who can
- * mint keys (a spoofable address, a routed IPv6 /64) turns the limiter itself
- * into the load. Past this, the oldest windows go, which costs those callers
- * their accumulated count and costs nobody else anything.
+ * Sweeping only deletes windows that have already expired, so a map of live
+ * keys frees nothing however often it runs. A caller who can mint keys (a
+ * spoofable address, a routed IPv6 /64) would otherwise grow it without
+ * bound.
  */
 const HARD_CEILING = 200_000;
+
+/**
+ * The shortest gap between two size-triggered sweeps.
+ *
+ * Without it, "sweep whenever the map is large" meant a full walk on *every*
+ * call once past SWEEP_AT_SIZE -- measured at 0.65 ms per call at 52,000 keys
+ * and rising linearly, on a path that runs twice per ingest request. The
+ * ceiling bounded the memory and not the work. One walk a second is
+ * amortised; one per request is the load itself.
+ */
+const MIN_SWEEP_GAP_MS = 1_000;
+let lastSizeSweep = 0;
 
 export interface RateLimitResult {
   allowed: boolean;
@@ -44,17 +54,35 @@ export function rateLimit(key: string, limit: number, windowMs = 60_000): RateLi
   const now = Date.now();
 
   // Amortised cleanup so the map cannot grow without bound.
-  if (now - lastSweep > windowMs || windows.size > SWEEP_AT_SIZE) {
+  const onSchedule = now - lastSweep > windowMs;
+  const tooBig = windows.size > SWEEP_AT_SIZE && now - lastSizeSweep > MIN_SWEEP_GAP_MS;
+  if (onSchedule || tooBig) {
+    // One pass, collecting the barely-used keys as it goes.
+    const barelyUsed: string[] = [];
     for (const [existing, window] of windows) {
       if (window.resetAt <= now) windows.delete(existing);
+      else if (window.count <= 1) barelyUsed.push(existing);
     }
     lastSweep = now;
+    if (tooBig) lastSizeSweep = now;
 
-    // Expiring nothing is the case that mattered: a map full of live keys
-    // sweeps clean and keeps growing. Map iterates in insertion order, so the
-    // oldest windows are the ones at the front.
+    // Evict by how little a key has been used, not by how long it has been
+    // there.
+    //
+    // Insertion order put the *longest-lived* buckets at the front -- the
+    // tenant's admin key, every steady visitor -- so the eviction fell on
+    // exactly the callers who had done nothing wrong, handing them a fresh
+    // window while the flood that caused it kept its own. A key seen once is
+    // what a flood is made of, and dropping it costs its owner a single
+    // request of accounting.
     if (windows.size > HARD_CEILING) {
       let excess = windows.size - HARD_CEILING;
+      for (const existing of barelyUsed) {
+        if (excess <= 0) break;
+        if (windows.delete(existing)) excess -= 1;
+      }
+      // Still over: a map genuinely full of busy keys. Take from the front,
+      // which is the best that is left.
       for (const existing of windows.keys()) {
         if (excess <= 0) break;
         windows.delete(existing);

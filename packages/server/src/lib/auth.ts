@@ -126,6 +126,39 @@ export function clientIp(request: FastifyRequest): string {
  */
 function visitorKey(request: FastifyRequest): string | null {
   const body = request.body as Record<string, unknown> | undefined;
-  const id = typeof body?.visitor === 'string' ? body.visitor : null;
+  const fromBody = typeof body?.visitor === 'string' ? body.visitor : null;
+  return usable(fromBody) ?? usable(visitorFromQuery(request));
+}
+
+function usable(id: string | null): string | null {
   return id !== null && id !== '' && id.length <= 64 ? id : null;
+}
+
+/**
+ * The visitor id on the GET fallback, which has no body to read.
+ *
+ * `/v1/collect` also accepts its whole payload base64url-encoded in `d`, for
+ * environments that block POST beacons — and there the per-visitor bucket
+ * silently did not apply, so one visitor on that path got the full per-address
+ * ceiling instead of their own share. Decoded here rather than left to the
+ * handler because this is where the limiter decides, and the handler runs
+ * after it.
+ *
+ * Bounded and forgiving: this is a rate-limit key, so a payload that will not
+ * decode simply has no visitor and falls back to the address on its own. The
+ * handler is what reports the error.
+ */
+function visitorFromQuery(request: FastifyRequest): string | null {
+  const query = request.query as Record<string, unknown> | undefined;
+  if (typeof query?.visitor === 'string') return query.visitor;
+
+  const packed = query?.d;
+  if (typeof packed !== 'string' || packed === '' || packed.length > 8192) return null;
+  try {
+    const decoded: unknown = JSON.parse(Buffer.from(packed, 'base64url').toString('utf8'));
+    const visitor = (decoded as Record<string, unknown> | null)?.visitor;
+    return typeof visitor === 'string' ? visitor : null;
+  } catch {
+    return null;
+  }
 }

@@ -752,7 +752,22 @@ function creditCentsPerToken(tenant: Tenant): number {
 
 export function quoteCredit(tenant: Tenant, amountWei: bigint): number {
   const perToken = BigInt(Math.trunc(creditCentsPerToken(tenant)));
-  return Number((amountWei * perToken) / 10n ** 18n);
+  const cents = (amountWei * perToken) / 10n ** 18n;
+
+  // A quote nobody can store is not a quote.
+  //
+  // This returned Number(cents) unchecked, so an absurd amount came back as
+  // 1e23 and the INSERT answered "invalid input syntax for type bigint" -- a
+  // 500 with a Postgres error in it, on a public endpoint, for an input the
+  // caller controls. The ceiling used to sit in tokensToWei, wrongly: it
+  // refused amounts a double holds exactly and it sat above the point where
+  // exponents begin, so it made the expansion it was guarding unreachable.
+  // The question "is this more than we could ever credit" belongs here, where
+  // the answer is a number of cents and the limit is real.
+  if (cents > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw ApiError.badRequest('That is more TBAY than this retailer can credit in one go');
+  }
+  return Number(cents);
 }
 
 /**

@@ -296,9 +296,11 @@ export function tokensToWei(tokens: number): bigint {
   // input the expansion below exists to handle and made that code
   // unreachable, including the 1.5e21 case it was written for.
   //
-  // Every finite double has an exact decimal expansion and toPlainDecimal
-  // produces it, so this conversion is exact for any amount. How much is too
-  // much is a question about supply, and the mint budget is where it is asked.
+  // toPlainDecimal renders whatever String() gives -- the shortest decimal
+  // that round-trips, not the exact binary value -- and converts that without
+  // loss. So 0.1 becomes 1e17 wei rather than 100000000000000005, which is
+  // what somebody asking for a tenth of a token means. How much is too much is
+  // a question about money, and quoteCredit is where it is asked.
 
   const plain = toPlainDecimal(tokens);
   const [whole, fraction = ''] = plain.split('.');

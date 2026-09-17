@@ -56,6 +56,51 @@ describe('classifying a delivery failure', () => {
     }
   });
 
+  it('reads a full mailbox the way a real MTA words it (HIGH)', () => {
+    // A negative lookahead took over-quota out of `transport` and nothing put
+    // it into `soft`, so the common Postfix wording fell through to the
+    // hard-bounce patterns on the "Recipient address rejected" it quotes --
+    // and a mailbox that was full for one week earned a *permanent*
+    // suppression. No more receipts, confirmations or password resets, ever.
+    for (const message of [
+      "452 4.2.2 <them@example.com>: Recipient address rejected: User's mailbox is full",
+      '452 4.2.2 <them@example.com>: Recipient address rejected: mailbox is full',
+      '552 5.2.2 <them@example.com>: Recipient address rejected: Over quota',
+    ]) {
+      expect(classifyFailure(message), message).toBe('soft');
+    }
+  });
+
+  it('still reads a multi-line deferral as transport (HIGH)', () => {
+    // nodemailer joins multi-line SMTP replies with \n, which is how Gmail
+    // and Outlook word every deferral. Anchoring the transient pattern with
+    // ^...$ and no `m` flag meant none of them matched, so an afternoon of
+    // throttling spent the attempt budget and suppressed the throttled
+    // recipients for a month.
+    for (const message of [
+      '421-4.7.0 Our system has detected an unusual rate of unsolicited mail\n421 4.7.0 originating',
+      '450-4.2.1 The user you are trying to contact is receiving mail at a rate that\n450-4.2.1 prevents',
+      '451-4.3.0 Mail server temporarily rejected message.\n451 4.3.0 Please retry',
+    ]) {
+      expect(classifyFailure(message), message).toBe('transport');
+    }
+  });
+
+  it('does not read a protocol name inside the recipient address (MEDIUM)', () => {
+    // Word boundaries fixed Kessler and not <ssl@example.com>, because `<`,
+    // `@` and `.` are all non-word characters. The addresses are stripped
+    // before the transport patterns run, which removes the class rather than
+    // the examples.
+    for (const message of [
+      '550 5.1.1 <ssl@example.com>: User unknown',
+      '550 5.1.1 <jo@ssl.example.com>: User unknown',
+      '550 5.1.1 <tls@example.com>: User unknown',
+      '550 5.1.1 <certificate@example.com>: User unknown',
+    ]) {
+      expect(classifyFailure(message), message).toBe('hard');
+    }
+  });
+
   it('does not mistake the recipient\'s full mailbox for our transport', () => {
     // 4xx by the letter of the spec, permanent in practice: an abandoned
     // mailbox stays over quota. Read as transport it was never suppressed and

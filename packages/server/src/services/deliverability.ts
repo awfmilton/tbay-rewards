@@ -83,20 +83,18 @@ const TRANSPORT_FAILURE = new RegExp(
     // accepted the connection and went quiet spent the attempt budget and
     // suppressed the address for thirty days -- for a fault at our end.
     '^timeout$|\\btimed out\\b|greeting (?:never received|timeout)',
-    // Transient SMTP -- but not when the text says the mailbox is full or
-    // over quota. Those are 4xx by the letter of the spec and permanent in
-    // practice: an abandoned mailbox stays over quota, and treating it as our
-    // problem meant it was retried every minute and never written off.
-    '(?!.*(?:over ?quota|quota exceeded|mailbox (?:is )?full|insufficient (?:system )?storage))'
-      + '^(?:.*\\b(?:421|450|451|452)\\b.*)$',
+    // Transient SMTP. Over-quota is carved out by OVER_QUOTA below, which is
+    // checked first -- not by a negative lookahead here. The lookahead version
+    // needed anchors to work, and `^...$` without the `m` flag cannot match a
+    // string containing a newline: nodemailer joins multi-line SMTP replies
+    // with \n, which is how Gmail and Outlook word every deferral, so an
+    // afternoon of throttling stopped being read as transport at all.
+    '\\b(?:421|450|451|452)\\b',
     '\\b535\\b|authentication (?:failed|required)|invalid login',
-    // Word boundaries, because these are matched against a reply that quotes
-    // the recipient. `SSL` unanchored matched Kessler, Hassler, Gessler and
-    // Ressler, so a real "User unknown" bounce for anyone with one of those
-    // surnames was read as our TLS failing: never suppressed, attempts handed
-    // back, retried once a minute forever against a mailbox that does not
-    // exist -- a queue that never drains and a steady stream of bounces
-    // against the sending domain.
+    // Matched against the reply with quoted addresses stripped out; see
+    // withoutAddresses(). Word boundaries alone were not enough, because `<`,
+    // `@` and `.` are all non-word characters -- so <ssl@example.com> and
+    // <jo@ssl.example.com> still read as our TLS failing.
     '\\bcertificate\\b|\\bself.?signed\\b|\\bTLS\\b|\\bSSL\\b|\\bSTARTTLS\\b',
     'greylist|try again|too many connections|rate limit',
   ].join('|'),
@@ -105,10 +103,40 @@ const TRANSPORT_FAILURE = new RegExp(
 
 export type FailureKind = 'hard' | 'soft' | 'complaint' | 'transport';
 
+/**
+ * A mailbox with no room in it.
+ *
+ * Its own class, checked before everything else, because it is the one reply
+ * that every other rule reads wrongly. It carries a 4xx code, so the transient
+ * patterns claim it as our transport and retry it forever. It quotes
+ * "Recipient address rejected", so the hard-bounce patterns claim it and
+ * suppress the address permanently. Neither is true: the mailbox exists, its
+ * owner has not gone anywhere, and they may well empty it next week.
+ */
+const OVER_QUOTA =
+  /over ?quota|quota exceeded|mailbox (?:is )?full|user'?s mailbox is full|insufficient (?:system )?storage|\b552\b/i;
+
+/**
+ * The reply with quoted addresses taken out.
+ *
+ * Every transport pattern is matched against this rather than the raw text,
+ * because an SMTP rejection quotes the recipient and the recipient is not
+ * evidence about our connection. `SSL` inside a surname was the first version
+ * of this bug; word boundaries fixed Kessler and not <ssl@example.com>, since
+ * `<`, `@` and `.` are all non-word characters. Removing the addresses removes
+ * the whole class rather than the examples of it.
+ */
+function withoutAddresses(message: string): string {
+  return message.replace(/<[^>\s]*>/g, ' ').replace(/\S+@\S+/g, ' ');
+}
+
 export function classifyFailure(message: string): FailureKind {
-  // Checked first: a relay that rejects everything with "spam" in the text is
+  // Before anything else; see OVER_QUOTA.
+  if (OVER_QUOTA.test(message)) return 'soft';
+
+  // Checked next: a relay that rejects everything with "spam" in the text is
   // a transport problem, not four thousand people complaining.
-  if (TRANSPORT_FAILURE.test(message)) return 'transport';
+  if (TRANSPORT_FAILURE.test(withoutAddresses(message))) return 'transport';
 
   // A content or reputation block is about this message, or about our sending
   // domain. Soft, so it is retried and lapses, and — this is the part that

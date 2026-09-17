@@ -264,26 +264,63 @@ export async function eraseContact(
     // The rows stay: a token claim is a financial record and a mint against a
     // supply budget, and deleting it makes the supply unreconcilable. What
     // goes is everything that says who it was.
-    // The address columns are NOT NULL, so they are overwritten rather than
-    // emptied: the zero address is a valid address that belongs to nobody, and
-    // reads unmistakably as "this was removed" next to a real one.
-    const BURNED_ADDRESS = '0x0000000000000000000000000000000000000000';
-    for (const table of ['token_claims', 'token_spend_intents', 'bridge_withdrawals'] as const) {
-      const columns: Record<string, string[]> = {
-        token_claims: ['wallet_address'],
-        token_spend_intents: ['from_address', 'to_address'],
-        bridge_withdrawals: ['from_address', 'l1_recipient'],
-      };
-      // Table and column names are module constants, never caller input.
-      const sets = [
-        ...columns[table]!.map((column) => `${column} = $3`),
-        'member_id = NULL',
-      ].join(', ');
-      await client.query(
-        `UPDATE ${table} SET ${sets} WHERE tenant_id = $1 AND contact_id = $2`,
-        [tenantId, contactId, BURNED_ADDRESS],
+    // An on-chain obligation that has not settled is not erasable yet.
+    //
+    // Round four overwrote every address on these tables with the zero
+    // address, unconditionally, and that destroyed money twice over. A
+    // `pending` spend intent is verified by matching an on-chain transfer
+    // against the addresses recorded here, so blanking them meant the customer
+    // had sent their TBAY, the retailer had it, and the store credit could
+    // never be issued. A `burn_verified` bridge withdrawal is worse: the L2
+    // tokens are already burned and an operator is about to send L1 tokens to
+    // `l1_recipient` -- which had just been repointed at the address bridge.ts
+    // uses as its burn address.
+    //
+    // So: settle or cancel first. Refusing is the only honest answer, because
+    // the alternatives are destroying the customer's funds or keeping their
+    // wallet on file against their wishes -- and this refusal is temporary and
+    // actionable, which neither of those is.
+    const inFlight = await client.query<{ kind: string; id: string }>(
+      `SELECT 'token spend' AS kind, id::text FROM token_spend_intents
+        WHERE tenant_id = $1 AND contact_id = $2 AND status = 'pending'
+        UNION ALL
+       SELECT 'bridge withdrawal', id::text FROM bridge_withdrawals
+        WHERE tenant_id = $1 AND contact_id = $2
+          AND status IN ('pending', 'burn_verified')`,
+      [tenantId, contactId],
+    );
+    if ((inFlight.rowCount ?? 0) > 0) {
+      const what = inFlight.rows.map((row) => `${row.kind} ${row.id}`).join(', ');
+      throw ApiError.badRequest(
+        `This person has an unsettled on-chain transaction (${what}). ` +
+          'Settle or cancel it first — erasing now would destroy funds that are already in flight.',
       );
     }
+
+    // What is left is history, and its addresses can go.
+    //
+    // The columns are NOT NULL, so they are overwritten rather than emptied.
+    // `to_address` on a spend intent is deliberately untouched: that is the
+    // retailer's own payout wallet, not the erased person's data, and blanking
+    // it neither protects anybody nor leaves the retailer able to reconcile
+    // their own takings.
+    const ERASED_ADDRESS = '0x00000000000000000000000000000000000000ff';
+    await client.query(
+      `UPDATE token_claims SET wallet_address = $3, member_id = NULL
+        WHERE tenant_id = $1 AND contact_id = $2`,
+      [tenantId, contactId, ERASED_ADDRESS],
+    );
+    await client.query(
+      `UPDATE token_spend_intents SET from_address = $3, member_id = NULL
+        WHERE tenant_id = $1 AND contact_id = $2`,
+      [tenantId, contactId, ERASED_ADDRESS],
+    );
+    await client.query(
+      `UPDATE bridge_withdrawals
+          SET from_address = $3, l1_recipient = $3, member_id = NULL
+        WHERE tenant_id = $1 AND contact_id = $2`,
+      [tenantId, contactId, ERASED_ADDRESS],
+    );
 
     // The ledger keeps its rows -- the points have to reconcile -- but a
     // redemption wrote the wallet into `ref_id`, the idempotency key and the

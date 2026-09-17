@@ -636,3 +636,25 @@ describe('token amounts convert exactly (LOW)', () => {
     expect(() => tokensToWei(Number.POSITIVE_INFINITY)).toThrow(/positive number/);
   });
 });
+
+describe('an absurd amount is refused, not leaked as a database error (MEDIUM)', () => {
+  it('says so in words rather than in Postgres syntax', async () => {
+    // Removing tokensToWei's ceiling was right -- it refused amounts a double
+    // holds exactly and made the expansion it guarded unreachable -- but it
+    // also removed the only thing turning nonsense into a 400. The first
+    // objection then came from the bigint column: a 500 reading "invalid input
+    // syntax for type bigint: 1e+23", on an endpoint the caller controls. The
+    // question belongs where the answer is a number of cents.
+    const { quoteCredit } = await import('../src/services/token.js');
+    const tenantRow = (await getTenantById(tenant.id))!;
+
+    for (const tokens of [1e21, 1e60, 1e308]) {
+      expect(() => quoteCredit(tenantRow, tokensToWei(tokens))).toThrow(
+        /more TBAY than this retailer can credit/i,
+      );
+    }
+
+    // And an amount somebody might actually spend still quotes.
+    expect(quoteCredit(tenantRow, tokensToWei(5))).toBeGreaterThan(0);
+  });
+});
