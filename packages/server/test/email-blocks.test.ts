@@ -11,10 +11,12 @@ import {
 } from './helpers.js';
 import {
   blocksToText,
+  describeBlocks,
   renderBlocks,
   renderDocument,
   segmentsUsed,
   validateBlocks,
+  type BlockFieldSpec,
 } from '../src/services/email-blocks.js';
 import { buildSegment } from '../src/services/segments.js';
 import { sendBroadcastBatch, startBroadcast } from '../src/services/broadcasts.js';
@@ -88,6 +90,70 @@ describe('validating blocks', () => {
 
     const products = Array.from({ length: 13 }, (_, i) => ({ title: `P${i}` }));
     expect(() => validateBlocks([{ type: 'products', items: products }])).toThrow(/at most 12/i);
+  });
+});
+
+describe('the catalogue and the validator agree', () => {
+  // The builder UI is generated from describeBlocks(). A field described here
+  // that validateBlocks() drops looks, in wp-admin, like the block "not
+  // saving" — and fails nowhere a developer is looking.
+  const sample = (spec: BlockFieldSpec): unknown => {
+    switch (spec.kind) {
+      case 'url':
+        return 'https://example.test/x';
+      case 'choice':
+        return spec.choices![spec.choices!.length - 1]!.value;
+      case 'list':
+        return [Object.fromEntries((spec.fields ?? []).map((sub) => [sub.name, sample(sub)]))];
+      default:
+        return `sample ${spec.name}`;
+    }
+  };
+
+  it('keeps every field the catalogue describes', () => {
+    for (const spec of describeBlocks()) {
+      const input: Record<string, unknown> = { type: spec.type };
+      for (const field of spec.fields) {
+        input[field.name] = field.name === 'visibleTo' || field.name === 'hiddenFrom'
+          ? 'some_segment'
+          : sample(field);
+      }
+
+      const [block] = validateBlocks([input]) as [Record<string, unknown>];
+      for (const field of spec.fields) {
+        expect(
+          block[field.name],
+          `${spec.type}.${field.name} was described but dropped`,
+        ).toBeDefined();
+      }
+    }
+  });
+
+  it('describes every block type the validator accepts', () => {
+    const described = describeBlocks().map((spec) => spec.type);
+    // Anything the validator takes but the catalogue omits is a block a
+    // retailer can never reach from wp-admin.
+    for (const type of ['heading', 'text', 'button', 'image', 'divider', 'spacer', 'products', 'points']) {
+      expect(described).toContain(type);
+    }
+    expect(described).toHaveLength(8);
+  });
+
+  it('describes a choice field only with values the validator keeps', () => {
+    for (const spec of describeBlocks()) {
+      for (const field of spec.fields) {
+        if (field.kind !== 'choice') continue;
+        for (const choice of field.choices!) {
+          const [block] = validateBlocks([{ type: spec.type, [field.name]: choice.value }]) as [
+            Record<string, unknown>,
+          ];
+          expect(
+            String(block[field.name]),
+            `${spec.type}.${field.name} does not keep "${choice.value}"`,
+          ).toBe(choice.value);
+        }
+      }
+    }
   });
 });
 
