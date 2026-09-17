@@ -311,9 +311,16 @@ export async function eraseContact(
       // moves it out of `pending` within five minutes of its own deadline, so
       // this refusal lasts minutes and clears itself. A verification in flight
       // is about to write a store credit against this contact.
+      // FOR UPDATE, because the refusal and the digest query below decide on
+      // the same rows one statement apart, and READ COMMITTED gives each a
+      // fresh snapshot. A verification claiming in between flips the row to
+      // 'verifying', which matches neither predicate, so it falls to the
+      // sentinel scrub -- and if that verification then finds no match it is
+      // released to an unsettleable row.
       `SELECT 'token spend' AS kind, id::text FROM token_spend_intents
         WHERE tenant_id = $1 AND contact_id = $2
-          AND (status = 'verifying' OR (status = 'pending' AND expires_at > now()))`,
+          AND (status = 'verifying' OR (status = 'pending' AND expires_at > now()))
+        FOR UPDATE`,
       [tenantId, contactId],
     );
     if ((unsettled.rowCount ?? 0) > 0) {
@@ -417,15 +424,39 @@ export async function eraseContact(
     // hide -- what is ours is whether *this database* offers the join, and it
     // no longer does. The obligation survives intact: recordWithdrawal already
     // says the burn event proves who owned the tokens and nothing else does,
-    // so the operator recovers the payable address from the chain, from the
-    // same authority that put it here. See recipientFor in bridge.ts.
+    // so the operator recovers the payable address from the chain and checks
+    // it against the digest left here. See recipientFor in bridge.ts.
+    const owed = await client.query<{ id: string; l1_recipient: string }>(
+      `SELECT id, l1_recipient FROM bridge_withdrawals
+        WHERE tenant_id = $1 AND contact_id = $2 AND l1_recipient NOT LIKE 'erased:%'`,
+      [tenantId, contactId],
+    );
+    for (const row of owed.rows) {
+      // A digest, not a sentinel address.
+      //
+      // Overwriting with a well-formed 0x...ff was two mistakes at once. An
+      // operator reading the withdrawal listing sees a valid-looking address
+      // and can send an irreversible L1 transfer into a hole; and with nothing
+      // left to check against, recovering the recipient from the burn meant
+      // trusting whichever transfer the RPC returned first -- so a burn
+      // transaction carrying two burns paid the wrong wallet, and a wrong or
+      // hostile node could redirect the payout outright. Reproduced both.
+      //
+      // recordWithdrawal proves the recipient by matching the burn's sender
+      // against a declared address; the digest is what lets recipientFor do
+      // the same after the address itself is gone.
+      await client.query(
+        'UPDATE bridge_withdrawals SET from_address = $2, l1_recipient = $2 WHERE id = $1',
+        // The tenant id rides along so recipientFor can recompute the digest
+        // for a candidate address without a database lookup of its own.
+        [row.id, `erased:${tenantId}:${walletDigest(row.l1_recipient, tenantId)}`],
+      );
+    }
     const stillOwed = await client.query<{ status: string }>(
-      `UPDATE bridge_withdrawals
-          SET member_id = NULL, contact_id = NULL,
-              from_address = $3, l1_recipient = $3
+      `UPDATE bridge_withdrawals SET member_id = NULL, contact_id = NULL
         WHERE tenant_id = $1 AND contact_id = $2
         RETURNING status`,
-      [tenantId, contactId, ERASED_ADDRESS],
+      [tenantId, contactId],
     );
     const obligationsKept = stillOwed.rows.filter(
       (row) => row.status === 'pending' || row.status === 'burn_verified',

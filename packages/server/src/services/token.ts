@@ -9,10 +9,11 @@ import {
   tokensToWei,
   treasurySender,
   weiToTokenString,
+  withChainTimeout,
 } from '../lib/chain.js';
 import { getBalance, getBalances, reverse, spend, type Balance } from './points.js';
 import { assertConvertible } from './point-types.js';
-import { randomCode, walletDigest } from '../lib/crypto.js';
+import { hashPii, randomCode, walletDigest } from '../lib/crypto.js';
 import type { Tenant } from './tenants.js';
 import type { Contact } from './contacts.js';
 
@@ -610,27 +611,26 @@ export async function expireStaleSpendIntents(runner: Queryable = db()): Promise
 }
 
 /**
- * How long a verification may hold an intent before the worker takes it back.
- */
-const STALE_VERIFY_CLAIM = '10 minutes';
-
-/**
- * How long one verification may wait on the chain.
+ * How long one verification may wait on the chain, and how long it may hold
+ * the intent while it does.
  *
- * Deliberately a fraction of STALE_VERIFY_CLAIM; see the call site.
+ * The bound has to be a fraction of the claim window, because everything
+ * downstream -- the reaper, cancelSpendIntent, and the erasure error that
+ * points retailers at it -- treats a claim older than that window as a request
+ * that died. Unbounded it was not: ethers' default fetch timeout is five
+ * minutes per call and transfersInTx makes several sequentially, so a slow
+ * node put a live verification past the window and a cancel taken in good
+ * faith then voided a transfer already proved on the chain.
  */
 export const VERIFY_RPC_TIMEOUT_MS = 120_000;
 export const STALE_VERIFY_CLAIM_MS = 10 * 60_000;
 
-function withTimeout<T>(work: Promise<T>, ms: number, message: string): Promise<T> {
-  let timer: NodeJS.Timeout;
-  return Promise.race([
-    work,
-    new Promise<never>((_resolve, reject) => {
-      timer = setTimeout(() => reject(new ApiError(504, 'chain_timeout', message)), ms);
-    }),
-  ]).finally(() => clearTimeout(timer)) as Promise<T>;
-}
+// Derived, not written twice. The interval string is what the reaper and
+// cancelSpendIntent compare against, and the milliseconds are what bounds the
+// RPC; as two literals they could drift apart with nothing to notice, and the
+// test written to pin the relationship would still have compared the constant
+// to itself.
+export const STALE_VERIFY_CLAIM = `${STALE_VERIFY_CLAIM_MS} milliseconds`;
 
 /**
  * How long after expiry a transfer can still be settled by hand.
@@ -644,6 +644,10 @@ function withTimeout<T>(work: Promise<T>, ms: number, message: string): Promise<
  * for the retailer's books and for erasure.
  */
 export const SPEND_SETTLEMENT_DAYS = 30;
+
+/** Concurrent chain verifications allowed per retailer; see the call site. */
+const MAX_CONCURRENT_VERIFIES = 4;
+const verifying = new Map<string, number>();
 
 /**
  * Give up on an intent the retailer has dealt with by other means.
@@ -1051,17 +1055,43 @@ export async function verifySpendIntent(
   // Two minutes is far more than a healthy node needs and a fifth of the
   // window, so "the claim went stale" now means what the other three places
   // assume it means.
+  // How many verifications this retailer may have on the chain at once.
+  //
+  // withChainTimeout abandons the losing promise rather than cancelling it, so
+  // a caller retrying a timeout stacks undici sockets and ethers queue slots
+  // against a node that is already too slow to answer. Measured: five bounded
+  // retries in half a second left five calls in flight, all of which ran to
+  // completion afterwards. The bound is per tenant, so one retailer's bad node
+  // cannot exhaust the process for the others.
+  const inFlight = (verifying.get(tenant.id) ?? 0) + 1;
+  if (inFlight > MAX_CONCURRENT_VERIFIES) {
+    await release();
+    throw new ApiError(
+      429,
+      'chain_busy',
+      'Too many verifications are already waiting on the chain; try again shortly',
+    );
+  }
+  verifying.set(tenant.id, inFlight);
+  const done = (): void => {
+    const left = (verifying.get(tenant.id) ?? 1) - 1;
+    if (left <= 0) verifying.delete(tenant.id);
+    else verifying.set(tenant.id, left);
+  };
+
   let transfers: Awaited<ReturnType<typeof client.transfersInTx>>;
   try {
-    transfers = await withTimeout(
+    transfers = await withChainTimeout(
       client.transfersInTx(txHash),
       opts.rpcTimeoutMs ?? VERIFY_RPC_TIMEOUT_MS,
       'The chain did not answer in time; try again',
     );
   } catch (err) {
+    done();
     await release();
     throw err;
   }
+  done();
 
   const required = BigInt(intent.token_amount_wei);
   const minConfirmations = opts.minConfirmations ?? 1;
@@ -1071,10 +1101,25 @@ export async function verifySpendIntent(
   // somebody who asked to be forgotten. The digest still answers the only
   // question settlement asks -- "did this transfer come from the wallet this
   // intent was opened for?" -- so a late settlement keeps working afterwards.
-  const sentBy = (address: string): boolean =>
-    intent.from_address.startsWith('erased:')
-      ? `erased:${walletDigest(address, tenant.id)}` === intent.from_address
-      : address.toLowerCase() === intent.from_address.toLowerCase();
+  const sentBy = (address: string): boolean => {
+    if (!intent.from_address.startsWith('erased:')) {
+      return address.toLowerCase() === intent.from_address.toLowerCase();
+    }
+    if (`erased:${walletDigest(address, tenant.id)}` === intent.from_address) return true;
+    // Rows written before the digest key moved out of the database.
+    //
+    // Both forms are "erased:" plus thirty-two hex characters, so a row cannot
+    // be told apart by looking at it, and the addresses are gone -- there is
+    // nothing to migrate. Without this, deploying the key change would have
+    // made every previously erased intent permanently unsettleable: the
+    // customer's TBAY at the retailer's payout wallet, the row falling back to
+    // expired, and no route able to issue the credit. Exactly the failure the
+    // digest exists to prevent, applied retroactively.
+    //
+    // Read-only and never written. The weaker form is only ever compared
+    // against, and comparing is not what made it weak.
+    return `erased:${hashPii(address.toLowerCase(), tenant.pii_salt)}` === intent.from_address;
+  };
 
   const match = transfers.find(
     (transfer) =>

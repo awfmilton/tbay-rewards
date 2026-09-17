@@ -1003,49 +1003,72 @@ describe('erasure never destroys money in flight (HIGH)', () => {
     // The worst moment to lose the recipient: the L2 tokens are gone and the
     // L1 payout has not happened yet.
     //
-    // Round five refused the erasure outright, and the refusal named
-    // operator-only routes that answer 503 unless BRIDGE_OPERATOR_TOKEN is
-    // set -- which ships empty -- so a retailer could not complete it at all.
-    // Round eight kept the addresses and nulled the links instead, which
-    // closed nothing, because the re-identification join never used the links.
+    // Three answers came before this one. Refusing the erasure named
+    // operator-only routes a retailer cannot reach. Keeping the address and
+    // nulling the links closed nothing, because the re-identification join
+    // never used the links. Overwriting with a well-formed 0x...ff was worse
+    // again: an operator reading the listing sees a valid-looking address and
+    // can send an irreversible transfer into a hole, and with nothing left to
+    // check against, recovering the recipient from the burn meant trusting
+    // whichever transfer the node returned first.
     //
-    // The address goes, and the obligation survives anyway: recordWithdrawal
-    // derived it from the burn transaction, which is a public record, so the
-    // operator reads it back from the same authority. Nothing is destroyed;
-    // this database simply stops offering the join.
+    // A commitment is what makes recovery safe: the chain supplies the
+    // candidate, the digest decides whether it is the right one.
     const contact = await withWithdrawal('bridging@example.com', 'burn_verified');
 
     const result = await eraseContact(tenant.id, contact.id);
     expect(result.obligations_kept).toBe(1);
 
     const { rows } = await db().query<{
-      l1_recipient: string; from_address: string;
+      l1_recipient: string; from_address: string; burn_tx_hash: string;
       member_id: string | null; contact_id: string | null; status: string;
     }>(
-      `SELECT l1_recipient, from_address, member_id, contact_id, status
+      `SELECT l1_recipient, from_address, burn_tx_hash, member_id, contact_id, status
          FROM bridge_withdrawals WHERE burn_tx_hash = $1`,
       ['0xburn-burn_verified'],
     );
-    // Still owed, still findable by the retailer as an outstanding release.
     expect(rows[0]!.status).toBe('burn_verified');
-    // But nothing about it says whose it was.
-    expect(rows[0]!.l1_recipient).not.toBe(WALLET);
-    expect(rows[0]!.from_address).not.toBe(WALLET);
     expect(rows[0]!.member_id).toBeNull();
     expect(rows[0]!.contact_id).toBeNull();
+    // Not an address at all, so nobody can mistake it for one and pay it.
+    expect(rows[0]!.l1_recipient).toMatch(/^erased:[0-9a-f-]{36}:[0-9a-f]{32}$/);
+    expect(rows[0]!.from_address).toBe(rows[0]!.l1_recipient);
 
-    // And it is still payable, to the right wallet.
     const { recipientFor, BURN_ADDRESS } = await import('../src/services/bridge.js');
     const { setChainClient } = await import('../src/lib/chain.js');
-    setChainClient({
+    const OTHER = '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+    const chainOf = (transfers: unknown[]) => ({
       isNonceUsed: async () => false,
       isPaused: async () => false,
       balanceOf: async () => 0n,
-      transfersInTx: async () => [
-        { from: WALLET, to: BURN_ADDRESS, value: 1n, blockNumber: 1, confirmations: 3 },
-      ],
+      transfersInTx: async () => transfers as never,
     });
-    expect(await recipientFor(rows[0]!)).toBe(WALLET.toLowerCase());
+    const burn = (from: string, value: bigint) => ({
+      from, to: BURN_ADDRESS, value, blockNumber: 1, confirmations: 3,
+    });
+
+    // A transaction carrying two burns pays the one the commitment names, not
+    // the one the node happens to list first.
+    setChainClient(chainOf([burn(OTHER, 5n), burn(WALLET, 1n)]));
+    expect(await recipientFor(rows[0]!)).toEqual({ address: WALLET.toLowerCase() });
+
+    // A node that answers with somebody else's burn pays nobody.
+    setChainClient(chainOf([burn(OTHER, 1n)]));
+    expect(await recipientFor(rows[0]!)).toEqual({ address: null, reason: 'no_match' });
+
+    // And a node that is down, broken or has pruned the receipt says so
+    // rather than throwing a provider error out of a read-only route.
+    setChainClient(null);
+    expect(await recipientFor(rows[0]!)).toEqual({ address: null, reason: 'chain_unavailable' });
+    setChainClient({
+      ...chainOf([]),
+      transfersInTx: async () => {
+        throw new Error('SERVER_ERROR: bad response');
+      },
+    });
+    expect(await recipientFor(rows[0]!)).toEqual({ address: null, reason: 'chain_error' });
+    setChainClient(chainOf([]));
+    expect(await recipientFor(rows[0]!)).toEqual({ address: null, reason: 'burn_not_found' });
     setChainClient(null);
   });
 
@@ -1103,6 +1126,7 @@ describe('erasure never destroys money in flight (HIGH)', () => {
     expect(kept.rows[0]!.contact_id).toBeNull();
     expect(kept.rows[0]!.member_id).toBeNull();
     expect(kept.rows[0]!.l1_recipient).not.toBe(WALLET.toLowerCase());
+    expect(kept.rows[0]!.l1_recipient).toMatch(/^erased:/);
 
     // The control that makes this a fix rather than a deletion: the money is
     // still payable, because the burn transaction says who owned the tokens
@@ -1122,7 +1146,7 @@ describe('erasure never destroys money in flight (HIGH)', () => {
       'SELECT l1_recipient, burn_tx_hash FROM bridge_withdrawals WHERE burn_tx_hash = $1',
       ['0xburn-linkable'],
     );
-    expect(await recipientFor(withdrawal.rows[0]!)).toBe(WALLET.toLowerCase());
+    expect(await recipientFor(withdrawal.rows[0]!)).toEqual({ address: WALLET.toLowerCase() });
     setChainClient(null);
   });
 
@@ -1263,24 +1287,91 @@ describe('erasure never destroys money in flight (HIGH)', () => {
     const stored = rows[0]!.from_address;
     expect(stored).toMatch(/^erased:[0-9a-f]{32}$/);
 
-    // Everything the database can offer, used the way the attack used it.
-    const { hashPii, walletDigest } = await import('../src/lib/crypto.js');
+    // The property, not three guesses. Asserting inequality against a handful
+    // of hand-picked candidates and then equality with the function under test
+    // is circular: an unkeyed SHA-256 over the same input -- which anybody
+    // holding the database or this repository can recompute for every wallet
+    // in `members` -- passed it unchanged.
+    //
+    // What has to be true is that the digest depends on a secret. So: compute
+    // it under a *different* key and under no key at all, over exactly the
+    // input the real one uses, and require both to miss.
+    const { createHash, createHmac } = await import('node:crypto');
+    const input = `wallet:${tenant.id}:${WALLET.toLowerCase()}`;
+    const unkeyed = createHash('sha256').update(input).digest('hex').slice(0, 32);
+    const otherKey = createHmac('sha256', 'a-different-token-secret')
+      .update(input)
+      .digest('hex')
+      .slice(0, 32);
+    expect(stored).not.toBe(`erased:${unkeyed}`);
+    expect(stored).not.toBe(`erased:${otherKey}`);
+
+    // And nothing in the database reproduces it either.
+    const { hashPii } = await import('../src/lib/crypto.js');
     const salted = await db().query<{ pii_salt: string }>(
       'SELECT pii_salt FROM tenants WHERE id = $1',
       [tenant.id],
     );
-    const fromDatabaseAlone = [
+    for (const attempt of [
       hashPii(WALLET.toLowerCase(), salted.rows[0]!.pii_salt),
       hashPii(WALLET, salted.rows[0]!.pii_salt),
       hashPii(WALLET.toLowerCase(), tenant.id),
-    ];
-    for (const attempt of fromDatabaseAlone) {
+    ]) {
       expect(stored).not.toBe(`erased:${attempt}`);
     }
 
-    // The control: with the key that lives outside the database, it matches --
-    // which is what keeps a hand-settlement possible.
-    expect(stored).toBe(`erased:${walletDigest(WALLET, tenant.id)}`);
+    // The control, computed here rather than borrowed: the real key does
+    // reproduce it, which is what keeps a hand-settlement possible.
+    const withRealKey = createHmac('sha256', process.env.TOKEN_SECRET!)
+      .update(input)
+      .digest('hex')
+      .slice(0, 32);
+    expect(stored).toBe(`erased:${withRealKey}`);
+  });
+
+  it('still settles an intent erased under the previous digest key (HIGH)', async () => {
+    // Both digest forms are "erased:" plus thirty-two hex characters, and the
+    // addresses are gone, so a row cannot be told apart or migrated. Without a
+    // fallback comparison, deploying the key change made every
+    // already-erased intent permanently unsettleable -- the customer's TBAY at
+    // the retailer's payout wallet and no route able to issue the credit.
+    const contact = await withSpendIntent('legacy-digest@example.com', 'expired');
+    const { hashPii } = await import('../src/lib/crypto.js');
+    const { getTenantById: loadTenant } = await import('../src/services/tenants.js');
+    const salt = (await loadTenant(tenant.id))!.pii_salt;
+    const legacy = `erased:${hashPii(WALLET.toLowerCase(), salt)}`;
+    const intent = await db().query<{ id: string; to_address: string; token_amount_wei: string }>(
+      `UPDATE token_spend_intents
+          SET from_address = $2, expires_at = now() - interval '2 hours'
+        WHERE contact_id = $1
+        RETURNING id, to_address, token_amount_wei`,
+      [contact.id, legacy],
+    );
+
+    const { verifySpendIntent } = await import('../src/services/token.js');
+    const { setChainClient } = await import('../src/lib/chain.js');
+    const { getTenantById } = await import('../src/services/tenants.js');
+    setChainClient({
+      isNonceUsed: async () => false,
+      isPaused: async () => false,
+      balanceOf: async () => 0n,
+      transfersInTx: async () => [
+        {
+          from: WALLET,
+          to: intent.rows[0]!.to_address,
+          value: BigInt(intent.rows[0]!.token_amount_wei),
+          blockNumber: 1,
+          confirmations: 3,
+        },
+      ],
+    });
+    const settled = await verifySpendIntent(
+      (await getTenantById(tenant.id))!,
+      intent.rows[0]!.id,
+      '0xlegacy-settlement',
+    );
+    expect(settled.intent.status).toBe('verified');
+    setChainClient(null);
   });
 
   it('does not keep a wallet on an intent nobody can act on any more (HIGH)', async () => {

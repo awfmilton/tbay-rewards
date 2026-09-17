@@ -1,7 +1,14 @@
 import { db, queryOne, withTransaction, type Queryable } from '../db/pool.js';
 import { config } from '../config.js';
 import { ApiError } from '../lib/errors.js';
-import { assertAddress, chain, weiToTokenString } from '../lib/chain.js';
+import {
+  assertAddress,
+  chain,
+  weiToTokenString,
+  withChainTimeout,
+  type TokenTransfer,
+} from '../lib/chain.js';
+import { walletDigest } from '../lib/crypto.js';
 import { splitBridgeAmount, txUrl } from '../lib/chains.js';
 
 /**
@@ -251,35 +258,67 @@ export async function getWithdrawal(
  * actually moved — something this service cannot observe from L2.
  */
 /**
- * The wallet an L1 release must actually reach.
+ * The wallet an L1 release must actually reach, and proof that it is the
+ * right one.
  *
  * Normally `l1_recipient`, which recordWithdrawal derived from the burn. After
- * an erasure it is the sentinel address, because keeping the real one left a
- * join from this row to the erased person's live record at another retailer --
- * `members.wallet_address` is plaintext, unique and platform-wide.
+ * an erasure that column holds a keyed digest instead, because keeping the
+ * address left a join from this row to the erased person's live record at
+ * another retailer -- `members.wallet_address` is plaintext, unique and
+ * platform-wide, and nulling this row's own links did nothing about it.
  *
- * Nothing is lost by dropping it: the burn transaction is on a public chain
- * and its sender is the authority for who owned those tokens, which is exactly
- * how it got here. Recovering it costs one RPC call at the moment somebody is
- * about to send money, which is the right moment to be reading the chain
- * anyway.
+ * The digest is what makes recovery safe. Reading the burn back and taking
+ * whichever transfer came first reproduced the very hole recordWithdrawal's
+ * `from` constraint exists to close: a transaction carrying two burns paid the
+ * wrong wallet, and a wrong or hostile node could redirect the payout with
+ * nothing to compare against. Here every burn in the transaction is checked
+ * against the commitment, so the chain supplies the candidate and the database
+ * decides which one is right.
+ *
+ * Never throws: this is read on an ordinary API route, and a node that is
+ * down, slow or lying must produce a null and a reason rather than a 500 with
+ * the provider's error in it.
  */
+export type PayableTo =
+  | { address: string; reason?: undefined }
+  | { address: null; reason: 'chain_unavailable' | 'chain_error' | 'burn_not_found' | 'no_match' };
+
 export async function recipientFor(
   withdrawal: Pick<BridgeWithdrawal, 'l1_recipient' | 'burn_tx_hash'>,
-): Promise<string | null> {
-  if (!ERASED_RECIPIENT.test(withdrawal.l1_recipient)) return withdrawal.l1_recipient;
+): Promise<PayableTo> {
+  const digest = ERASED_RECIPIENT.exec(withdrawal.l1_recipient);
+  if (!digest) return { address: withdrawal.l1_recipient };
 
   const client = chain();
-  if (!client) return null;
-  const transfers = await client.transfersInTx(withdrawal.burn_tx_hash);
-  const burn = transfers.find(
+  if (!client) return { address: null, reason: 'chain_unavailable' };
+
+  let transfers: TokenTransfer[];
+  try {
+    transfers = await withChainTimeout(
+      client.transfersInTx(withdrawal.burn_tx_hash),
+      RECIPIENT_LOOKUP_TIMEOUT_MS,
+      'The chain did not answer in time',
+    );
+  } catch {
+    return { address: null, reason: 'chain_error' };
+  }
+
+  const burns = transfers.filter(
     (transfer) => transfer.to.toLowerCase() === BURN_ADDRESS && transfer.value > 0n,
   );
-  return burn ? burn.from.toLowerCase() : null;
+  if (burns.length === 0) return { address: null, reason: 'burn_not_found' };
+
+  const match = burns.find(
+    (burn) => `erased:${digest[1]!}:${walletDigest(burn.from, digest[1]!)}` === withdrawal.l1_recipient,
+  );
+  return match ? { address: match.from.toLowerCase() } : { address: null, reason: 'no_match' };
 }
 
-/** The address privacy.ts writes over an erased person's wallet. */
-const ERASED_RECIPIENT = /^0x0{38}ff$/i;
+/** What privacy.ts writes over an erased person's wallet: erased:<tenant>:<digest>. */
+const ERASED_RECIPIENT = /^erased:([0-9a-f-]{36}):[0-9a-f]{32}$/i;
+
+/** A read-only route may not hang on a slow node. */
+const RECIPIENT_LOOKUP_TIMEOUT_MS = 15_000;
 
 export async function markReleased(
   id: string,

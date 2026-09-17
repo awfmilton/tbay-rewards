@@ -1036,7 +1036,9 @@ export async function reevaluateAll(
       // as skipped whose rank had just been written -- and the whole purpose of
       // splitting the transactions was that one half failing no longer costs
       // the other. `problems` is where a half-failure is visible.
-      if ((!doBadges || badgeFailed) && (!doRanks || rankFailed)) skipped += 1;
+      const asked = (doBadges ? 1 : 0) + (doRanks ? 1 : 0);
+      const refused = (doBadges && badgeFailed ? 1 : 0) + (doRanks && rankFailed ? 1 : 0);
+      if (asked > 0 && refused === asked) skipped += 1;
     }
 
     after = rows[rows.length - 1]!.id;

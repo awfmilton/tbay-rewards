@@ -47,6 +47,23 @@ interface Window {
 interface Klass {
   live: Map<string, Window>;
   old: Map<string, Window>;
+  /**
+   * How many keys `live` started with, having been carried over.
+   *
+   * Each generation admits `ceiling` *new* keys on top of whatever it
+   * inherited, which is what lets the carry be unconditional. A fixed cap on
+   * the carry was a ranking in disguise -- rotate walks in insertion order and
+   * stopped when it filled, so the blocked caller past the threshold was
+   * dropped and came back with a full fresh allowance, which is the outcome
+   * every previous design produced. Measured at a crowd of 90,001 against a
+   * 90,000 cap.
+   *
+   * It cannot grow without bound: only unexpired buckets at their limit are
+   * carried, a bucket expires sixty seconds after its first request, and
+   * reaching a limit costs that many requests. The floor is therefore bounded
+   * by how many callers can actually be rejected inside one window.
+   */
+  floor: number;
 }
 
 /**
@@ -82,26 +99,6 @@ const CEILINGS: Record<string, number> = {
  * across every rotation however many there are.
  */
 
-/**
- * The backstop on the carry, not a budget.
- *
- * It was a quarter of the ceiling, and that quarter was a ranking in disguise:
- * rotate walks in insertion order and stops when it fills, so the fifty
- * thousand and first blocked caller was dropped -- and the scheduled sweep
- * discarded the whole previous generation unexpired, so they could be gone
- * inside sixty seconds rather than two generations. Measured: with 50,000
- * at-limit buckets ahead of them, a blocked caller came back allowed with a
- * full 3,000 allowance. The same failure as the four designs before it, moved
- * behind a threshold.
- *
- * Nine tenths, and only so that a carry cannot fill a generation outright and
- * rotate on every insert. Reaching it means 180,000 ingest buckets are
- * simultaneously over their limit, which costs about 108 million requests
- * inside one window; at that point every key in the map is a caller being
- * rejected and dropping the oldest of them is the only thing left to do.
- */
-const CARRY_FRACTION = 0.9;
-
 const classes = new Map<string, Klass>();
 let lastSweep = Date.now();
 
@@ -134,15 +131,14 @@ function unexpired(windows: Map<string, Window>, now: number): Map<string, Windo
   return keep;
 }
 
-function rotate(klass: Klass, ceiling: number, now: number): void {
+function rotate(klass: Klass, now: number): void {
   const carried = new Map<string, Window>();
-  const carryCap = Math.floor(ceiling * CARRY_FRACTION);
   for (const [key, window] of klass.live) {
-    if (carried.size >= carryCap) break;
     if (window.resetAt > now && window.count >= window.limit) carried.set(key, window);
   }
   klass.old = klass.live;
   klass.live = carried;
+  klass.floor = carried.size;
 }
 
 export function rateLimit(key: string, limit: number, windowMs = 60_000): RateLimitResult {
@@ -153,7 +149,14 @@ export function rateLimit(key: string, limit: number, windowMs = 60_000): RateLi
   // map never fills and expired windows would otherwise sit there until it
   // did.
   if (now - lastSweep > windowMs) {
-    for (const klass of classes.values()) {
+    for (const [name, klass] of classes) {
+      // Only a class rotation is not already clearing. A busy class turns its
+      // generations over on its own, and rebuilding two full maps there cost
+      // 81 ms of blocked event loop for nothing -- measured with both
+      // generations full of unexpired windows, which freed one key. This is
+      // for the quiet class, where the map never fills and expired windows
+      // would otherwise sit until it did.
+      if (klass.live.size + klass.old.size > CEILINGS[name]!) continue;
       // Both generations, and by filtering rather than discarding. Emptying
       // `old` outright threw away unexpired windows a rotation had only just
       // demoted, so a bucket that should have survived two full generations
@@ -169,7 +172,7 @@ export function rateLimit(key: string, limit: number, windowMs = 60_000): RateLi
   const name = classOf(key);
   let klass = classes.get(name);
   if (!klass) {
-    klass = { live: new Map(), old: new Map() };
+    klass = { live: new Map(), old: new Map(), floor: 0 };
     classes.set(name, klass);
   }
 
@@ -194,7 +197,7 @@ export function rateLimit(key: string, limit: number, windowMs = 60_000): RateLi
       previous.count += 1;
       previous.limit = limit;
       klass.live.set(key, previous);
-      if (klass.live.size >= CEILINGS[name]!) rotate(klass, CEILINGS[name]!, now);
+      if (klass.live.size >= klass.floor + CEILINGS[name]!) rotate(klass, now);
       return {
         allowed: previous.count <= limit,
         remaining: Math.max(0, limit - previous.count),
@@ -205,7 +208,7 @@ export function rateLimit(key: string, limit: number, windowMs = 60_000): RateLi
 
   const resetAt = now + windowMs;
   klass.live.set(key, { count: 1, resetAt, limit });
-  if (klass.live.size >= CEILINGS[name]!) rotate(klass, CEILINGS[name]!, now);
+  if (klass.live.size >= klass.floor + CEILINGS[name]!) rotate(klass, now);
 
   return { allowed: 1 <= limit, remaining: Math.max(0, limit - 1), resetAt };
 }

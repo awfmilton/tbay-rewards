@@ -355,10 +355,17 @@ export async function gamificationRoutes(app: FastifyInstance): Promise<void> {
     if (!withdrawal || withdrawal.tenant_id !== tenant.id) {
       throw ApiError.notFound('Withdrawal not found');
     }
-    // The address to actually pay, recovered from the burn transaction when
-    // the stored one was erased. See recipientFor: an erasure drops the wallet
-    // because keeping it left a join back to the person, and the chain is the
-    // authority for it either way.
+    // The address to actually pay, recovered from the burn transaction and
+    // checked against the commitment left by the erasure.
+    //
+    // Operator-only, and that is not the round-five mistake of naming a remedy
+    // nobody can reach: the L1 release itself needs this credential, so anyone
+    // who can act on the answer already holds it. Handing an erased person's
+    // wallet back to the retailer on request would undo the erasure this route
+    // exists alongside.
+    const operator = request.headers['x-tbay-operator'] as string | undefined;
+    if (!operator) return { withdrawal };
+    requireBridgeOperator(operator);
     return { withdrawal, payable_to: await recipientFor(withdrawal) };
   });
 

@@ -206,6 +206,27 @@ export interface TokenTransfer {
  * Chain reads the platform needs. Abstracted so redemption and spend
  * verification can be exercised without an RPC endpoint.
  */
+/**
+ * Bound a chain call, so a slow node cannot outlive the assumptions built on
+ * top of it.
+ *
+ * ethers' default fetch timeout is five minutes per call and a single
+ * transfersInTx makes several sequentially, which is long enough to outlive a
+ * verification claim -- and long enough that a retailer's request to a
+ * read-only route hangs. Promise.race leaves the loser running: the work is
+ * abandoned, not cancelled, which is why callers also have to bound how many
+ * they start.
+ */
+export function withChainTimeout<T>(work: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: NodeJS.Timeout;
+  return Promise.race([
+    work,
+    new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new ApiError(504, 'chain_timeout', message)), ms);
+    }),
+  ]).finally(() => clearTimeout(timer)) as Promise<T>;
+}
+
 export interface ChainClient {
   isNonceUsed(nonce: bigint): Promise<boolean>;
   isPaused(): Promise<boolean>;

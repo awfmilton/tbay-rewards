@@ -538,6 +538,63 @@ describe('spending TBAY at a retailer', () => {
     expect(rows[0]!.n).toBe('1');
   });
 
+  it('bounds how many verifications wait on the chain at once (MEDIUM)', async () => {
+    // withChainTimeout abandons the losing promise rather than cancelling it,
+    // and the error says "try again" -- so a caller retrying a timeout stacks
+    // sockets and ethers queue slots against a node already too slow to
+    // answer. Measured: five bounded retries in half a second left five calls
+    // in flight, every one of which ran to completion afterwards.
+    await updateTenantSettings(db(), tenant.id, { payoutWallet: PAYOUT });
+    const tenantRow = await tenantObject();
+    const intents: string[] = [];
+    for (let n = 0; n < 6; n += 1) {
+      const contact = await fundedContact(0, `queue${n}@example.com`);
+      const { intent } = await createSpendIntent(tenantRow, {
+        contact,
+        amountTokens: 5,
+        fromAddress: CUSTOMER,
+      });
+      intents.push(intent.id);
+    }
+
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let started = 0;
+    setChainClient(
+      stubChain({
+        transfersInTx: async () => {
+          started += 1;
+          await gate;
+          return [];
+        },
+      }),
+    );
+
+    const running = intents.map((id) =>
+      verifySpendIntent(tenantRow, id, `0x${id.slice(0, 8)}`).catch((err: { statusCode?: number }) => err),
+    );
+    // Let them all reach the chain call.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    release();
+    const results = await Promise.all(running);
+
+    const refused = results.filter(
+      (r) => (r as { statusCode?: number }).statusCode === 429,
+    ).length;
+    expect(refused).toBeGreaterThan(0);
+    expect(started).toBeLessThanOrEqual(4);
+
+    // And a refusal does not strand the intent: it is claimable again.
+    const { rows } = await db().query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM token_spend_intents
+        WHERE tenant_id = $1 AND status = 'verifying'`,
+      [tenant.id],
+    );
+    expect(rows[0]!.n).toBe('0');
+  });
+
   it('puts the claim back when the verification does not settle (HIGH)', async () => {
     // A claim that is not released is a strand: the customer cannot retry with
     // the right hash, and nothing but the ten-minute reaper would ever free it.
@@ -793,17 +850,61 @@ describe('spending TBAY at a retailer', () => {
         transfersInTx: async () => new Promise(() => {}) as never, // never answers
       }),
     );
-    // The relationship is the fix, asserted directly rather than by waiting
-    // two minutes for it: the RPC bound has to be a fraction of the window
-    // after which everything else treats the claim as abandoned.
+    // The *default* bound, exercised. Comparing the two exported constants to
+    // each other tests no product code at all: a version that exported the
+    // constant and then applied a thirty-minute one instead -- fully
+    // reinstating the defect -- passed that assertion unchanged.
+    //
+    // Fake timers with shouldAdvanceTime, so the database keeps working while
+    // the clock jumps.
     const { VERIFY_RPC_TIMEOUT_MS, STALE_VERIFY_CLAIM_MS } = await import(
       '../src/services/token.js'
     );
     expect(VERIFY_RPC_TIMEOUT_MS).toBeLessThan(STALE_VERIFY_CLAIM_MS / 2);
 
-    await expect(
-      verifySpendIntent(tenantRow, intent.id, '0xhangs', { rpcTimeoutMs: 300 }),
-    ).rejects.toMatchObject({ statusCode: 504 });
+    // And the window the reaper and cancelSpendIntent actually compare against
+    // is the same number, not a second literal beside it. As two literals they
+    // drifted silently -- a three-minute interval against a ten-minute
+    // constant violates the invariant above while every assertion about the
+    // constants stays true. Postgres is asked, because Postgres is what reads
+    // the interval.
+    const { STALE_VERIFY_CLAIM } = await import('../src/services/token.js');
+    const parsed = await db().query<{ ms: string }>(
+      'SELECT (EXTRACT(EPOCH FROM $1::interval) * 1000)::text AS ms',
+      [STALE_VERIFY_CLAIM],
+    );
+    expect(Number(parsed.rows[0]!.ms)).toBe(STALE_VERIFY_CLAIM_MS);
+
+    // The bound the code actually arms, read off the timer it sets. Waiting
+    // two minutes for it is not a test anybody will keep, and faking the clock
+    // deadlocks against the database this path queries either side of the RPC.
+    const armed: number[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    globalThis.setTimeout = ((fn: () => void, ms?: number, ...rest: unknown[]) => {
+      if (typeof ms === 'number') armed.push(ms);
+      return realSetTimeout(fn, ms, ...(rest as []));
+    }) as typeof globalThis.setTimeout;
+    try {
+      await expect(
+        verifySpendIntent(tenantRow, intent.id, '0xhangs', { rpcTimeoutMs: 300 }),
+      ).rejects.toMatchObject({ statusCode: 504 });
+      expect(armed).toContain(300);
+
+      armed.length = 0;
+      setChainClient(
+        stubChain({
+          transfersInTx: async () =>
+            new Promise((resolve) => realSetTimeout(() => resolve([]), 50)) as never,
+        }),
+      );
+      await expect(verifySpendIntent(tenantRow, intent.id, '0xslow')).rejects.toMatchObject({
+        statusCode: 422,
+      });
+      // No override: the default is what was armed.
+      expect(armed).toContain(VERIFY_RPC_TIMEOUT_MS);
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+    }
 
     // And it released the claim, so the customer can retry.
     const { rows } = await db().query<{ status: string; verify_token: string | null }>(

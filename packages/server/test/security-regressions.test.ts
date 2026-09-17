@@ -1355,13 +1355,19 @@ describe('a key flood cannot buy anybody a fresh window (HIGH)', () => {
     const { rateLimit, resetRateLimits } = await import('../src/lib/ratelimit.js');
     resetRateLimits();
 
-    // A crowd of blocked callers ahead of the victim, larger than any cap
-    // expressed as a fraction of the ceiling.
-    for (let n = 0; n < 60_000; n += 1) {
+    // A crowd of blocked callers ahead of the victim, larger than the class
+    // ceiling itself -- so no cap expressed as a fraction of it can be
+    // satisfied by this test without being satisfied outright. The previous
+    // version used 60,000 against a 90,000 cap and called that "larger than
+    // any cap", which it was not: raising the fraction to 0.61 kept it green
+    // while a crowd of 90,001 still lost its blocked caller.
+    for (let n = 0; n < 110_000; n += 1) {
       for (let i = 0; i < 11; i += 1) {
         rateLimit(`ingest:crowd:i:10.1.${n % 256}.${n % 251}:a:c${n}`, 10);
       }
     }
+    // Every one of them is still being rejected, not just the victim.
+    expect(rateLimit('ingest:crowd:i:10.1.0.0:a:c0', 10).allowed).toBe(false);
     for (let n = 0; n < 12; n += 1) rateLimit('ingest:victim:i:1.2.3.4', 10);
     expect(rateLimit('ingest:victim:i:1.2.3.4', 10).allowed).toBe(false);
 

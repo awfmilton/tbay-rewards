@@ -2,7 +2,12 @@ node_modules/
 dist/
 .env
 .env.*
+# Templates, not secrets. README.md, docs/DEPLOYMENT.md and docker-compose.yml
+# all tell you to copy .env.docker.example as the first step of a deployment,
+# and `.env.*` meant it was never committed -- so that step could not be
+# followed from a fresh clone. Every value in it is a placeholder.
 !.env.example
+!.env.docker.example
 *.log
 coverage/
 .DS_Store

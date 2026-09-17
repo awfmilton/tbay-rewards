@@ -953,6 +953,14 @@ describe('every writer reaches for the contact before anything else', () => {
     // ran and committed for all ten. "Skipped" has to mean nothing was
     // written, or the count it replaced is no more actionable than before.
     expect(swept.skipped).toBe(0);
+
+    // Asking for neither half is a no-op, not ten failures. Counting a
+    // contact as skipped when nothing was *requested* turned an empty
+    // instruction into a report that every member had been passed over.
+    const nothing = await reevaluateAll(tenant.id, { badges: false, ranks: false });
+    expect(nothing.contacts).toBe(10);
+    expect(nothing.skipped).toBe(0);
+    expect(nothing.problems).toEqual([]);
     // Everybody was re-ranked -- including the member whose badge refused,
     // whose rank has nothing to do with that badge, and including everyone
     // after them, which is what the aborting version left on stale tiers.
