@@ -163,6 +163,7 @@ export async function flushEmailQueue(limit = 50, runner: Queryable = db()): Pro
   const { rows } = await runner.query<{
     id: string;
     tenant_id: string;
+    contact_id: string | null;
     to_email: string;
     subject: string;
     html: string;
@@ -170,23 +171,44 @@ export async function flushEmailQueue(limit = 50, runner: Queryable = db()): Pro
     attempts: number;
     unsubscribe_url: string | null;
   }>(
+    // The claim moves the row to `sending`, which no other claim selects.
+    //
+    // `FOR UPDATE SKIP LOCKED` alone was not enough: those locks last only as
+    // long as the claiming statement, so once it committed the rows were
+    // `queued` again with `attempts` merely one higher — and the next worker's
+    // tick sent every one of them a second time. One worker never noticed; the
+    // shipped compose file runs two.
+    //
+    // A worker that dies mid-send leaves a row in `sending` forever, so the
+    // claim also takes back anything that has been there longer than any send
+    // could plausibly take. That is at-least-once rather than exactly-once,
+    // which is the honest guarantee for "we called an SMTP server and did not
+    // hear back".
+    //
     // RETURNING does not inherit the subselect's ORDER BY, so the final SELECT
     // is what actually sends a batch in the order it was queued.
     `WITH claimed AS (
        SELECT id FROM email_messages
-        WHERE status = 'queued' AND attempts < 5
+        WHERE attempts < $2
+          AND next_attempt_at <= now()
+          AND (
+            status = 'queued'
+            OR (status = 'sending' AND claimed_at < now() - $3::interval)
+          )
         ORDER BY created_at
         LIMIT $1
         FOR UPDATE SKIP LOCKED
      ), bumped AS (
-       UPDATE email_messages SET attempts = attempts + 1
+       UPDATE email_messages
+          SET attempts = attempts + 1, status = 'sending', claimed_at = now()
         WHERE id IN (SELECT id FROM claimed)
-        RETURNING id, tenant_id, to_email, subject, html, text, attempts,
+        RETURNING id, tenant_id, contact_id, to_email, subject, html, text, attempts,
                   unsubscribe_url, created_at
      )
-     SELECT id, tenant_id, to_email, subject, html, text, attempts, unsubscribe_url
+     SELECT id, tenant_id, contact_id, to_email, subject, html, text, attempts,
+            unsubscribe_url
        FROM bumped ORDER BY created_at`,
-    [limit],
+    [limit, MAX_SEND_ATTEMPTS, STALE_CLAIM],
   );
 
   const sender = emailTransport();
@@ -196,10 +218,21 @@ export async function flushEmailQueue(limit = 50, runner: Queryable = db()): Pro
     // Checked at send time rather than at queue time: an address can be
     // suppressed between being queued and being sent, and the whole point of
     // a suppression list is that nothing gets past it.
-    const blocked = await isSuppressed(message.tenant_id, message.to_email, runner);
+    //
+    // Unsubscribing is the same shape and was not covered. A broadcast queues
+    // 200 recipients a pass while the queue drains 50, so a large audience
+    // spends the best part of an hour in the queue — and anybody who clicked
+    // unsubscribe during it was mailed anyway, by a message written before
+    // they asked us to stop. Only marketing is re-checked: a message with no
+    // unsubscribe URL is a receipt, which withdrawing consent does not cancel.
+    const blocked =
+      (await isSuppressed(message.tenant_id, message.to_email, runner)) ??
+      (message.unsubscribe_url ? await withdrawnConsent(runner, message) : null);
     if (blocked) {
       await runner.query(
-        `UPDATE email_messages SET status = 'suppressed', error = $2 WHERE id = $1`,
+        `UPDATE email_messages
+            SET status = 'suppressed', error = $2, claimed_at = NULL
+          WHERE id = $1`,
         [message.id, `Address suppressed: ${blocked.reason}`],
       );
       continue;
@@ -214,7 +247,9 @@ export async function flushEmailQueue(limit = 50, runner: Queryable = db()): Pro
         headers: unsubscribeHeaders(message.unsubscribe_url),
       });
       await runner.query(
-        `UPDATE email_messages SET status = 'sent', sent_at = now(), provider_id = $2, error = NULL
+        `UPDATE email_messages
+            SET status = 'sent', sent_at = now(), provider_id = $2,
+                error = NULL, claimed_at = NULL
           WHERE id = $1`,
         [message.id, providerId],
       );
@@ -242,13 +277,27 @@ export async function flushEmailQueue(limit = 50, runner: Queryable = db()): Pro
       const giveUp = !transport && (type !== 'soft' || message.attempts >= MAX_SEND_ATTEMPTS);
 
       await runner.query(
+        // Backed off, not retried on the next tick. Five attempts fifteen
+        // seconds apart wrote a message off in about a minute and suppressed
+        // its address for thirty days — so an hour of throttling, or an
+        // afternoon on a blocklist, cost the mailing list. 1, 2, 4, 8 minutes
+        // gives the other end time to stop being broken.
         `UPDATE email_messages
             SET status = $3,
                 error = $2,
                 bounce_type = $4,
+                claimed_at = NULL,
+                next_attempt_at = now() + ($6 || ' seconds')::interval,
                 attempts = CASE WHEN $5::boolean THEN GREATEST(attempts - 1, 0) ELSE attempts END
           WHERE id = $1`,
-        [message.id, reason.slice(0, 500), giveUp ? 'failed' : 'queued', type, transport],
+        [
+          message.id,
+          reason.slice(0, 500),
+          giveUp ? 'failed' : 'queued',
+          type,
+          transport,
+          String(retryDelaySeconds(message.attempts)),
+        ],
       );
     }
   }
@@ -256,7 +305,49 @@ export async function flushEmailQueue(limit = 50, runner: Queryable = db()): Pro
   return sent;
 }
 
+/**
+ * Did this person withdraw consent after the message was queued?
+ *
+ * Keyed on the contact rather than the address, because that is what an
+ * unsubscribe writes. A message with no contact — an operator sending to a
+ * bare address — has nobody to have changed their mind.
+ */
+async function withdrawnConsent(
+  runner: Queryable,
+  message: { tenant_id: string; contact_id?: string | null },
+): Promise<{ reason: string } | null> {
+  if (!message.contact_id) return null;
+  const row = await queryOne<{ marketing_consent: boolean }>(
+    runner,
+    'SELECT marketing_consent FROM contacts WHERE tenant_id = $1 AND id = $2',
+    [message.tenant_id, message.contact_id],
+  );
+  return row && !row.marketing_consent ? { reason: 'consent_withdrawn' } : null;
+}
+
 const MAX_SEND_ATTEMPTS = 5;
+
+/**
+ * How long a claimed message may sit in `sending` before another worker takes
+ * it back.
+ *
+ * Long enough that a slow SMTP conversation is never mistaken for a dead
+ * worker — five minutes is far past any transport's own timeout — and short
+ * enough that a crash does not strand a campaign until somebody notices.
+ */
+const STALE_CLAIM = '5 minutes';
+
+/**
+ * How long to wait before trying a message again.
+ *
+ * 1, 2, 4, 8 minutes. A transport failure does not spend an attempt, so an
+ * outage still backs off without ever exhausting the budget — the wait is what
+ * stops the queue hammering a relay that is down, and the unspent attempt is
+ * what stops the outage suppressing anybody.
+ */
+function retryDelaySeconds(attempts: number): number {
+  return Math.min(2 ** Math.max(0, attempts - 1), 8) * 60;
+}
 
 /**
  * RFC 8058 one-click unsubscribe.

@@ -274,12 +274,43 @@ export function compileGroup(
     index += compiled.params.length;
   }
 
-  // An empty group matches everyone rather than nobody. A segment saved with
-  // no filters yet is "all contacts", which is what an admin means by it; the
+  // An empty *top-level* group matches everyone: a segment saved with no
+  // filters yet is "all contacts", which is what an admin means by it, and the
   // alternative silently sends to zero people and looks like a broken send.
-  if (parts.length === 0) return { sql: 'TRUE', params: [] };
+  //
+  // An empty group *nested* inside one is different. Under `match: any` it
+  // contributes a TRUE, so a single stray empty group — one click in a builder
+  // — turns a careful segment into "everybody". Nothing means that, so it is
+  // refused.
+  if (parts.length === 0) {
+    if (depth > 0) {
+      throw ApiError.badRequest(
+        'A group inside a filter needs at least one condition. An empty one would match everybody.',
+      );
+    }
+    return { sql: 'TRUE', params: [] };
+  }
 
   return { sql: parts.join(` ${match} `), params };
+}
+
+/**
+ * A boolean a caller actually meant.
+ *
+ * The strings are here because a form posts strings and a checkbox posts
+ * "on" — but only the unambiguous ones. Anything else is an error, because
+ * coercing it silently picks one half of an audience.
+ */
+function asBoolean(value: unknown, field: string): boolean {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    const text = value.trim().toLowerCase();
+    if (['true', 'yes', 'on', '1'].includes(text)) return true;
+    if (['false', 'no', 'off', '0'].includes(text)) return false;
+  }
+  if (value === 1) return true;
+  if (value === 0) return false;
+  throw ApiError.badRequest(`"${field}" takes true or false, not ${JSON.stringify(value)}`);
 }
 
 function compileFilter(
@@ -394,7 +425,12 @@ function compileFilter(
     }
 
     if (field.kind === 'boolean') {
-      const value = Boolean(filter.value);
+      // `Boolean("false")` is true, and a form posts strings. A builder that
+      // sent `"false"` built the exact inverse of the audience somebody asked
+      // for — which is not a thing they would notice until the wrong people had
+      // been mailed. Refused rather than guessed at: there is no reading of
+      // `"maybe"` that is safe to pick for them.
+      const value = asBoolean(filter.value, field.label ?? String(filter.field));
       return {
         sql: operator === 'eq' ? `${column} IS ${value ? 'TRUE' : 'NOT TRUE'}`
                                : `${column} IS ${value ? 'NOT TRUE' : 'TRUE'}`,

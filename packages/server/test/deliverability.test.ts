@@ -10,7 +10,13 @@ import {
   type TestTenant,
 } from './helpers.js';
 import { classifyFailure, isSuppressed, suppress } from '../src/services/deliverability.js';
-import { unsubscribeHeaders } from '../src/services/email.js';
+import {
+  flushEmailQueue,
+  outbox,
+  queueEmail,
+  setEmailTransport,
+  unsubscribeHeaders,
+} from '../src/services/email.js';
 
 let tenant: TestTenant;
 
@@ -75,11 +81,41 @@ describe('classifying a delivery failure', () => {
     }
   });
 
-  it('spots a complaint but is not fooled by a spam filter score', () => {
-    expect(classifyFailure('Message refused: recipient reported as spam')).toBe('complaint');
-    // SpamAssassin rejecting on score is a delivery problem, not somebody
-    // pressing "this is junk".
-    expect(classifyFailure('rejected by SpamAssassin, score 9.1')).toBe('soft');
+  it('does not read a content block as a complaint', () => {
+    // Nothing in an SMTP reply is a complaint. Reading one as such suppressed
+    // the address permanently AND withdrew that person's marketing consent —
+    // so an hour of Gmail blocking our content took the whole batch off the
+    // list. A real complaint arrives out of band through
+    // `POST /v1/email/suppressions`.
+    for (const reply of [
+      '550-5.7.1 Our system has detected that this message is likely unsolicited mail. blocked',
+      '550 5.7.1 Message rejected as spam by Content Filtering',
+      '554 5.7.1 Service unavailable; Client host blocked using zen.spamhaus.org',
+      '550 5.7.1 Message contains spam-like content',
+      'rejected by SpamAssassin, score 9.1',
+      '550 5.7.1 Rejected for policy reasons; contact abuse@example.com',
+    ]) {
+      expect(classifyFailure(reply), reply).toBe('soft');
+    }
+
+    // And the things that really are about the mailbox still are.
+    expect(classifyFailure('550 5.1.1 The email account that you tried to reach does not exist'))
+      .toBe('hard');
+    expect(classifyFailure('421 4.7.0 Try again later')).toBe('transport');
+  });
+
+  it('still records a complaint that arrives out of band', async () => {
+    // The feedback-loop path: a provider's FBL handler, or an operator.
+    await suppress(tenant.id, 'reporter@example.com', 'complaint', 'FBL report');
+    const blocked = await isSuppressed(tenant.id, 'reporter@example.com');
+    expect(blocked?.reason).toBe('complaint');
+
+    const { rows } = await db().query<{ marketing_consent: boolean }>(
+      "SELECT marketing_consent FROM contacts WHERE email_normalised = 'reporter@example.com'",
+    );
+    // No contact seeded here, so nothing to assert about consent beyond the
+    // suppression itself standing.
+    expect(rows).toHaveLength(0);
   });
 });
 
@@ -147,6 +183,73 @@ describe('suppression', () => {
   });
 });
 
+describe('consent is re-checked when the message actually goes', () => {
+  it('does not send marketing queued before somebody unsubscribed', async () => {
+    // A broadcast queues 200 recipients a pass while the queue drains 50, so a
+    // large audience spends the best part of an hour waiting. Anyone who
+    // clicked unsubscribe during it was mailed anyway.
+    setEmailTransport(null);
+    outbox().length = 0;
+
+    const created = await authed('POST', '/v1/contacts', {
+      email: 'changed-mind@example.com',
+      marketingConsent: true,
+    });
+    const contactId = JSON.parse(created.body).contact_id as string;
+
+    await queueEmail({
+      tenantId: tenant.id,
+      contactId,
+      templateKey: 'promo',
+      to: 'changed-mind@example.com',
+      subject: 'Our sale',
+      html: '<p>Sale</p>',
+      dedupeKey: 'late-unsub-1',
+      // What makes it marketing.
+      unsubscribeUrl: 'https://example.com/n/unsubscribe/tok',
+    });
+
+    await db().query(
+      'UPDATE contacts SET marketing_consent = false WHERE tenant_id = $1 AND id = $2',
+      [tenant.id, contactId],
+    );
+
+    await flushEmailQueue(50);
+
+    expect(outbox()).toHaveLength(0);
+    const { rows } = await db().query<{ status: string; error: string }>(
+      "SELECT status, error FROM email_messages WHERE dedupe_key = 'late-unsub-1'",
+    );
+    expect(rows[0]!.status).toBe('suppressed');
+    expect(rows[0]!.error).toMatch(/consent_withdrawn/);
+  });
+
+  it('still sends a receipt to somebody who unsubscribed from marketing', async () => {
+    // Transactional mail carries no unsubscribe URL, and withdrawing marketing
+    // consent does not cancel the receipt for something they just did.
+    setEmailTransport(null);
+    outbox().length = 0;
+
+    const created = await authed('POST', '/v1/contacts', {
+      email: 'receipts-only@example.com',
+      marketingConsent: false,
+    });
+
+    await queueEmail({
+      tenantId: tenant.id,
+      contactId: JSON.parse(created.body).contact_id as string,
+      templateKey: 'order_receipt',
+      to: 'receipts-only@example.com',
+      subject: 'Your order',
+      html: '<p>Thanks</p>',
+      dedupeKey: 'receipt-1',
+    });
+
+    await flushEmailQueue(50);
+    expect(outbox().map((m) => m.to)).toEqual(['receipts-only@example.com']);
+  });
+});
+
 describe('List-Unsubscribe', () => {
   it('emits both headers, since one without the other is useless', () => {
     const headers = unsubscribeHeaders('https://rewards.example.com/n/unsubscribe/abc');
@@ -188,5 +291,100 @@ describe('List-Unsubscribe', () => {
       ['bye@example.com'],
     );
     expect(rows[0]!.marketing_consent).toBe(false);
+  });
+});
+
+describe('two workers do not send the same message twice', () => {
+  it('claims a message out of the queue rather than leaving it there', async () => {
+    // The claim used `FOR UPDATE SKIP LOCKED`, bumped `attempts` and left
+    // `status = 'queued'`. Those locks last only as long as the claiming
+    // statement, so the next worker's tick matched the same rows and sent
+    // every one of them again. One worker never noticed; the shipped compose
+    // file runs an API and a separate worker container.
+    const sent: string[] = [];
+    setEmailTransport({
+      async send(message) {
+        // Slow enough that the second flush overlaps the first, which is the
+        // whole point — two ticks 15 seconds apart overlap whenever a batch
+        // takes longer than that.
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        sent.push(message.to);
+        return { providerId: `p-${sent.length}` };
+      },
+    });
+
+    for (const n of [1, 2, 3]) {
+      await queueEmail({
+        tenantId: tenant.id,
+        templateKey: 'twice',
+        to: `twice${n}@example.com`,
+        subject: 'Only once',
+        html: '<p>Only once</p>',
+        dedupeKey: `twice-${n}`,
+      });
+    }
+
+    await Promise.all([flushEmailQueue(50), flushEmailQueue(50)]);
+
+    expect(sent.sort()).toEqual([
+      'twice1@example.com',
+      'twice2@example.com',
+      'twice3@example.com',
+    ]);
+
+    const { rows } = await db().query<{ status: string; attempts: number }>(
+      'SELECT status, attempts FROM email_messages WHERE tenant_id = $1 ORDER BY to_email',
+      [tenant.id],
+    );
+    expect(rows.map((row) => row.status)).toEqual(['sent', 'sent', 'sent']);
+    // One claim each, not one per worker.
+    expect(rows.map((row) => row.attempts)).toEqual([1, 1, 1]);
+  });
+
+  it('takes back a message a dead worker left mid-send', async () => {
+    setEmailTransport(null);
+    outbox().length = 0;
+
+    await queueEmail({
+      tenantId: tenant.id,
+      templateKey: 'stranded',
+      to: 'stranded@example.com',
+      subject: 'Still goes',
+      html: '<p>Still goes</p>',
+      dedupeKey: 'stranded-1',
+    });
+
+    // What a worker killed between claiming and sending leaves behind.
+    await db().query(
+      `UPDATE email_messages
+          SET status = 'sending', attempts = 1, claimed_at = now() - interval '1 hour'
+        WHERE tenant_id = $1`,
+      [tenant.id],
+    );
+
+    expect(await flushEmailQueue(50)).toBe(1);
+    expect(outbox().map((m) => m.to)).toEqual(['stranded@example.com']);
+  });
+
+  it('leaves a message another worker is still sending alone', async () => {
+    setEmailTransport(null);
+    outbox().length = 0;
+
+    await queueEmail({
+      tenantId: tenant.id,
+      templateKey: 'inflight',
+      to: 'inflight@example.com',
+      subject: 'Being sent',
+      html: '<p>Being sent</p>',
+      dedupeKey: 'inflight-1',
+    });
+    await db().query(
+      `UPDATE email_messages SET status = 'sending', attempts = 1, claimed_at = now()
+        WHERE tenant_id = $1`,
+      [tenant.id],
+    );
+
+    expect(await flushEmailQueue(50)).toBe(0);
+    expect(outbox()).toHaveLength(0);
   });
 });

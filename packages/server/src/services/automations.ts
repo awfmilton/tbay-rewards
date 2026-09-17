@@ -174,8 +174,13 @@ export async function fire(
 
     const claim = await queryOne<{ id: string }>(
       runner,
-      `INSERT INTO automation_runs (tenant_id, automation_id, contact_id, dedupe_key, context)
-       VALUES ($1, $2, $3, $4, $5::jsonb)
+      // `status` named rather than left to the column default, which is
+      // 'completed'. A crash between claiming the run and finishing it left a
+      // row saying the automation had completed when it had never started —
+      // and its dedupe key spent, so it could never be retried.
+      `INSERT INTO automation_runs
+         (tenant_id, automation_id, contact_id, dedupe_key, context, status)
+       VALUES ($1, $2, $3, $4, $5::jsonb, 'running')
        ON CONFLICT (automation_id, dedupe_key) DO NOTHING
        RETURNING id`,
       [
@@ -339,11 +344,19 @@ async function sendEmailAction(
   //
   // Transactional mail passes straight through, for the same reason as the
   // consent check above it.
+  //
+  // On `runner`, not the pool. Passing `undefined` sent this read outside the
+  // caller's transaction, and the callers that matter fire from inside the
+  // transaction that just created the contact or granted consent —
+  // `newsletter.confirmed`, single-opt-in `subscribe`, `contact.created` from
+  // `/v1/identify`. The pool saw the pre-commit row: consent still false, or no
+  // row at all. So every welcome series built on those triggers silently sent
+  // nothing, and the run was recorded as completed.
   const wanted = await mayReceive(
     tenant.id,
     ctx.contact.id,
     template.topic_key ?? null,
-    undefined,
+    runner,
     template.transactional,
   );
   if (!wanted.allowed) return;

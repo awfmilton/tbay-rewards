@@ -380,3 +380,48 @@ describe('imported history stays in the past', () => {
     expect(outcome.awarded).toBe(true);
   });
 });
+
+describe('re-running a stale export', () => {
+  it('does not resubscribe somebody who opted out since it was taken', async () => {
+    // Re-running an export is the documented way to resume an interrupted
+    // import. It was also a way to put everybody who unsubscribed in the
+    // meantime back on the list.
+    const csv = [
+      'id,email,firstname,status',
+      '1,optout@example.com,Sam,subscribed',
+    ].join('\n');
+
+    await importMauticContacts({ tenantId: tenant.id, csv });
+
+    const contactId = (
+      await db().query<{ id: string }>(
+        "SELECT id FROM contacts WHERE email_normalised = 'optout@example.com'",
+      )
+    ).rows[0]!.id;
+
+    // They unsubscribe here, after the file was written.
+    await db().query(
+      'UPDATE contacts SET marketing_consent = false WHERE id = $1',
+      [contactId],
+    );
+    await db().query(
+      "UPDATE subscriptions SET status = 'unsubscribed' WHERE contact_id = $1",
+      [contactId],
+    );
+
+    // The same file again.
+    await importMauticContacts({ tenantId: tenant.id, csv });
+
+    const { rows } = await db().query<{ marketing_consent: boolean }>(
+      'SELECT marketing_consent FROM contacts WHERE id = $1',
+      [contactId],
+    );
+    expect(rows[0]!.marketing_consent).toBe(false);
+
+    const { rows: subs } = await db().query<{ status: string }>(
+      'SELECT status FROM subscriptions WHERE contact_id = $1',
+      [contactId],
+    );
+    expect(subs[0]!.status).toBe('unsubscribed');
+  });
+});

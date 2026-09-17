@@ -66,6 +66,23 @@ export async function importMauticContacts(
 
     try {
       await withTransaction(async (client) => {
+        // Has this person already opted out *here*?
+        //
+        // An import is a snapshot of somebody else's system, and re-running a
+        // stale export is the documented way to resume an interrupted one. It
+        // was also a way to resubscribe everybody who unsubscribed in the
+        // meantime — a file written last month overriding a decision made last
+        // week. An opt-out recorded on this platform outranks the file.
+        const optedOut = await client.query(
+          `SELECT 1 FROM subscriptions s
+             JOIN contacts c ON c.id = s.contact_id
+            WHERE c.tenant_id = $1 AND c.email_normalised = lower($2)
+              AND s.status IN ('unsubscribed', 'complained')
+            LIMIT 1`,
+          [input.tenantId, email],
+        );
+        const mayGrantConsent = (optedOut.rowCount ?? 0) === 0;
+
         const contact = await upsertContact(
           input.tenantId,
           {
@@ -74,8 +91,14 @@ export async function importMauticContacts(
             phone: pick(row, 'phone', 'mobile') || null,
             country: pick(row, 'country').slice(0, 2) || null,
             externalRef: pick(row, 'id') ? `mautic:${pick(row, 'id')}` : null,
-            marketingConsent: status === 'subscribed',
-            consentSource: 'mautic_import',
+            // Only ever granted, never withdrawn, and never overwritten once
+            // it is already true. An import is a snapshot: re-running a stale
+            // export — the documented way to resume an interrupted one —
+            // otherwise resubscribed everybody who unsubscribed since it was
+            // taken. Somebody who opts out after the file was written has
+            // opted out.
+            marketingConsent: status === 'subscribed' && mayGrantConsent ? true : undefined,
+            consentSource: status === 'subscribed' && mayGrantConsent ? 'mautic_import' : undefined,
             attributes: extraAttributes(row),
             tags: parseTags(row),
           },
@@ -100,7 +123,13 @@ export async function importMauticContacts(
              requested_at, confirmed_at, unsubscribed_at
            ) VALUES ($1, $2, $3, $4, $5, 'mautic_import', COALESCE($6, now()), $7, $8)
            ON CONFLICT (list_id, contact_id) DO UPDATE SET
-             status = EXCLUDED.status,
+             -- An unsubscribe here outranks whatever the file says: it
+             -- happened on this platform, after the export was taken.
+             status = CASE
+                        WHEN subscriptions.status IN ('unsubscribed', 'complained')
+                          THEN subscriptions.status
+                        ELSE EXCLUDED.status
+                      END,
              confirmed_at = COALESCE(subscriptions.confirmed_at, EXCLUDED.confirmed_at)`,
           [
             input.tenantId,

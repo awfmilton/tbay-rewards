@@ -3,6 +3,7 @@ import { db, queryOne, withTransaction, type Queryable } from '../db/pool.js';
 import { ApiError } from '../lib/errors.js';
 import { compileGroup, type FilterGroup } from './segment-filters.js';
 import { getContact } from './contacts.js';
+import { customFieldsFor } from './segments.js';
 import { getTenantById, type Tenant } from './tenants.js';
 import type { Automation, AutomationContext, Action } from './automations.js';
 
@@ -28,6 +29,15 @@ import type { Automation, AutomationContext, Action } from './automations.js';
 
 /** How many steps one run may execute, across all its resumptions. */
 const MAX_STEPS = 100;
+
+/**
+ * How many times a parked run may fail before it stops being retried.
+ *
+ * A run that throws every time — a template deleted after it parked, a `goto`
+ * that names nothing — is not going to start working, and retrying it forever
+ * spends the batch that healthy runs need.
+ */
+const MAX_RESUME_ATTEMPTS = 3;
 
 /** Longest a run may be parked. Two years is far past any real sequence. */
 const MAX_WAIT_SECONDS = 60 * 60 * 24 * 730;
@@ -107,7 +117,18 @@ export async function contactMatches(
     'SELECT timezone FROM tenants WHERE id = $1',
     [tenantId],
   );
-  const compiled = compileGroup(filter, tenant?.timezone?.trim() || 'UTC', 2);
+  // With the retailer's own fields, like every other compile site. Without
+  // them a `cf_*` filter — legal in a segment, and offered by the same builder
+  // — threw "Unknown segment field" when the run resumed, which failed the run
+  // rather than the form.
+  const compiled = compileGroup(
+    filter,
+    tenant?.timezone?.trim() || 'UTC',
+    2,
+    0,
+    undefined,
+    await customFieldsFor(tenantId, runner),
+  );
 
   const row = await queryOne<{ matched: boolean }>(
     runner,
@@ -354,6 +375,9 @@ export async function resumeDueRuns(
         const tenant = await getTenantById(run.tenant_id);
         if (!tenant) return null;
 
+        // Counted here for a run that gets as far as committing; a run that
+        // throws has this rolled back and is counted in the catch instead, so
+        // either way an attempt is recorded exactly once.
         await client.query(
           `UPDATE automation_runs SET status = 'running', attempts = attempts + 1, updated_at = now()
             WHERE id = $1`,
@@ -382,15 +406,23 @@ export async function resumeDueRuns(
       // Recorded on its own connection: the run's transaction is already
       // rolled back, so writing the reason inside it would be lost.
       await db().query(
+        // The increment happens here, not only inside the transaction above:
+        // that one rolled back with everything else, so `attempts` stayed 0,
+        // `attempts >= 3` never fired, and `now() + 0 minutes` made the run due
+        // again immediately. A run that always throws — a deleted template, a
+        // bad `goto` — was re-selected every thirty seconds forever, filling
+        // the batch of 50 and starving every healthy run behind it. It never
+        // showed up as failed, because it never stopped being "waiting".
         `UPDATE automation_runs
-            SET status = CASE WHEN attempts >= 3 THEN 'failed' ELSE 'waiting' END,
+            SET attempts = attempts + 1,
+                status = CASE WHEN attempts + 1 >= $3 THEN 'failed' ELSE 'waiting' END,
                 error = $2,
                 -- Back off rather than retrying in a tight loop against
                 -- whatever is broken.
-                resume_at = now() + (attempts * interval '5 minutes'),
+                resume_at = now() + ((attempts + 1) * interval '5 minutes'),
                 updated_at = now()
           WHERE id = $1`,
-        [id, message.slice(0, 500)],
+        [id, message.slice(0, 500), MAX_RESUME_ATTEMPTS],
       );
     }
   }

@@ -574,3 +574,72 @@ describe('over the API', () => {
     expect((await authed('GET', '/v1/saved-reports/theirs/run')).statusCode).toBe(404);
   });
 });
+
+describe('a schedule reads the tenant\'s clock, not the host\'s', () => {
+  it('is unaffected by the process timezone', async () => {
+    // `now() AT TIME ZONE $1` is a timestamp without a zone, and
+    // node-postgres parses one of those using the process timezone. A London
+    // tenant on a Toronto host read four hours ahead: reports fired early, and
+    // weekly and monthly ones landed on the wrong day.
+    const { runDueReports } = await import('../src/services/report-schedules.js');
+    const saved = process.env.TZ;
+
+    await db().query("UPDATE tenants SET timezone = 'Europe/London' WHERE id = $1", [tenant.id]);
+
+    const keys: string[] = [];
+    for (const zone of ['UTC', 'America/Toronto', 'Asia/Tokyo']) {
+      process.env.TZ = zone;
+      const { rows } = await db().query<{ local: string }>(
+        `SELECT to_char(now() AT TIME ZONE 'Europe/London', 'YYYY-MM-DD"T"HH24:MI:SS') AS local`,
+      );
+      keys.push(new Date(`${rows[0]!.local}Z`).toISOString().slice(0, 13));
+    }
+    process.env.TZ = saved;
+
+    // The same wall-clock hour at the tenant, whatever the host thinks.
+    expect(new Set(keys).size).toBe(1);
+    // And the worker still runs.
+    expect(typeof (await runDueReports())).toBe('number');
+  });
+
+  it('hands the period back when a send fails, so it is retried', async () => {
+    const { runDueReports } = await import('../src/services/report-schedules.js');
+
+    await authed('PUT', '/v1/saved-reports/tz_report', {
+      name: 'Timezone report',
+      definition: { source: 'orders', measures: ['orders'], dimensions: [] },
+    });
+    // A recipient the send will choke on, so `sendOne` throws.
+    await authed('PUT', '/v1/saved-reports/tz_report/schedule', {
+      cadence: 'daily',
+      hour: 0,
+      recipients: ['nobody@example.com'],
+    });
+
+    await db().query(
+      `UPDATE report_schedules SET last_period = NULL, enabled = true
+        WHERE tenant_id = $1`,
+      [tenant.id],
+    );
+    await db().query('UPDATE reports SET definition = $2 WHERE tenant_id = $1', [
+      tenant.id,
+      // A source the report builder will refuse, so the send fails.
+      JSON.stringify({ source: 'nonsense', measures: ['orders'], dimensions: [] }),
+    ]);
+
+    await runDueReports();
+
+    const { rows } = await db().query<{ last_period: string | null }>(
+      'SELECT last_period FROM report_schedules WHERE tenant_id = $1',
+      [tenant.id],
+    );
+    // Not claimed, so tomorrow's pass tries again rather than skipping the day.
+    expect(rows[0]!.last_period).toBeNull();
+
+    const { rows: runs } = await db().query<{ status: string }>(
+      'SELECT status FROM report_runs WHERE tenant_id = $1',
+      [tenant.id],
+    );
+    expect(runs.map((row) => row.status)).toContain('failed');
+  });
+});

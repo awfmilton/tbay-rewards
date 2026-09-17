@@ -267,3 +267,44 @@ describe('building and sending to a segment', () => {
     expect(saved.rowCount).toBe(0);
   });
 });
+
+describe('a filter that would build the wrong audience is refused', () => {
+  it('will not read the string "false" as true', async () => {
+    // `Boolean("false")` is true, and a form posts strings. A builder sending
+    // `"false"` built the exact inverse of the audience somebody asked for.
+    const asBool = (value: unknown) =>
+      compileGroup(
+        { match: 'all', filters: [{ field: 'marketing_consent', operator: 'eq', value }] },
+        'UTC',
+      ).sql;
+
+    expect(asBool(false)).toContain('NOT TRUE');
+    expect(asBool('false')).toContain('NOT TRUE');
+    expect(asBool('no')).toContain('NOT TRUE');
+    expect(asBool(true)).toMatch(/IS TRUE/);
+    expect(asBool('true')).toMatch(/IS TRUE/);
+
+    // And something that means neither is an error rather than a guess.
+    expect(() => asBool('maybe')).toThrow(/takes true or false/i);
+  });
+
+  it('refuses an empty group nested inside another', () => {
+    // Under `match: any` an empty group contributes TRUE, so one stray click
+    // in a builder turned a careful segment into "everybody".
+    expect(() =>
+      compileGroup(
+        {
+          match: 'any',
+          filters: [{ field: 'tags', operator: 'contains', value: ['vip'] }],
+          groups: [{ match: 'all', filters: [] }],
+        },
+        'UTC',
+      ),
+    ).toThrow(/needs at least one condition/i);
+  });
+
+  it('still treats a segment with no filters at all as everybody', () => {
+    // Which is what an admin means by an empty segment.
+    expect(compileGroup({ match: 'all', filters: [] }, 'UTC').sql).toBe('TRUE');
+  });
+});

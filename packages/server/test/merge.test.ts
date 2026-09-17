@@ -10,7 +10,7 @@ import {
   type TestTenant,
 } from './helpers.js';
 import { upsertContact } from '../src/services/contacts.js';
-import { award, getBalance, spend } from '../src/services/points.js';
+import { award, getBalance, reverse, spend } from '../src/services/points.js';
 import { recordOrder } from '../src/services/commissions.js';
 import { getTenantById } from '../src/services/tenants.js';
 import { findDuplicates, mergeContacts, previewMerge } from '../src/services/merge.js';
@@ -516,6 +516,40 @@ describe('a merge and a spend at the same moment', () => {
     } finally {
       holder.release();
     }
+  });
+
+  it('does not deadlock with a refund clawing points back', async () => {
+    // Every writer takes the contact first. `reverse` took the ledger row
+    // first and the balance second — the opposite of the merge's
+    // contact → balance → ledger — so a refund racing a merge deadlocked and
+    // Postgres aborted one of them. That surfaced as a 500 on
+    // `POST /v1/orders/:ref/refund`, which rolled the whole refund back: the
+    // points stayed with the customer and the commissions stayed payable.
+    const failures: string[] = [];
+
+    for (let round = 0; round < 8; round += 1) {
+      const keep = (await upsertContact(tenant.id, { email: `dl-keep-${round}@example.com` })).id;
+      const loser = (await upsertContact(tenant.id, { email: `dl-lose-${round}@example.com` })).id;
+      const entry = await award(tenant.id, {
+        contactId: loser,
+        points: 200,
+        reason: 'to be reversed',
+        idempotencyKey: `dl-seed-${round}`,
+      });
+
+      const results = await Promise.allSettled([
+        mergeContacts(tenant.id, keep, loser),
+        reverse(tenant.id, entry.entry!.id, 'refund', undefined, { clampToBalance: true }),
+      ]);
+
+      for (const result of results) {
+        if (result.status === 'rejected' && /deadlock/i.test(String(result.reason))) {
+          failures.push(String(result.reason).slice(0, 80));
+        }
+      }
+    }
+
+    expect(failures).toEqual([]);
   });
 
   it('leaves the survivor with a balance that equals its own ledger', async () => {

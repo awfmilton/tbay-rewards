@@ -255,3 +255,139 @@ describe('sending a broadcast', () => {
     expect(report.opened).toBe(1);
   });
 });
+
+describe('a send honours what people chose per topic', () => {
+  it('inherits the template\'s topic and skips anyone who turned it off', async () => {
+    // The column existed and nothing ever wrote it, so the preference centre
+    // worked for automations and did nothing for campaigns — the one kind of
+    // mail people actually turn off.
+    await authed('PUT', '/v1/email/topics/offers', { name: 'Offers' });
+    await authed('PUT', '/v1/email/templates/promo', {
+      subject: 'Our sale',
+      html: '<p>Sale</p>',
+      topicKey: 'offers',
+    });
+
+    await seedAudience(2);
+    const { rows } = await db().query<{ id: string; email: string }>(
+      'SELECT id, email FROM contacts WHERE tenant_id = $1 ORDER BY email',
+      [tenant.id],
+    );
+    const optedOut = rows[0]!;
+
+    await authed('PUT', '/v1/email/preferences', {
+      contactId: optedOut.id,
+      topics: { offers: false },
+    });
+
+    const saved = await authed('PUT', '/v1/broadcasts/sale', {
+      name: 'Sale',
+      segmentKey: 'promo',
+      templateKey: 'promo',
+    });
+    expect(saved.json().broadcast.topic_key).toBe('offers');
+
+    await startBroadcast(tenant.id, 'sale');
+    await sendBroadcastBatch(tenant.id, 'sale', 100);
+
+    const { rows: mailed } = await db().query<{ to_email: string }>(
+      'SELECT to_email FROM email_messages WHERE tenant_id = $1',
+      [tenant.id],
+    );
+    expect(mailed.map((row) => row.to_email)).not.toContain(optedOut.email);
+    expect(mailed).toHaveLength(1);
+
+    const { rows: skipped } = await db().query<{ reason: string }>(
+      `SELECT skip_reason AS reason FROM broadcast_recipients
+        WHERE broadcast_id = (SELECT id FROM broadcasts WHERE tenant_id = $1 AND key = 'sale')
+          AND status = 'skipped'`,
+      [tenant.id],
+    );
+    expect(skipped.map((row) => row.reason)).toEqual(['topic_off']);
+  });
+
+  it('lets a send be put in no topic on purpose', async () => {
+    await authed('PUT', '/v1/email/topics/offers', { name: 'Offers' });
+    await authed('PUT', '/v1/email/templates/promo', {
+      subject: 'Our sale', html: '<p>Sale</p>', topicKey: 'offers',
+    });
+    const saved = await authed('PUT', '/v1/broadcasts/everyone', {
+      name: 'Everyone',
+      templateKey: 'promo',
+      topicKey: null,
+    });
+    expect(saved.json().broadcast.topic_key).toBeNull();
+  });
+});
+
+describe('arming a send that would reach nobody', () => {
+  it('refuses a segment the builder has not materialised yet', async () => {
+    // The builder runs every ten minutes and saving a segment does not build
+    // it, so "create the segment, then send" inside that window walked an
+    // empty audience, marked the broadcast `sent`, and reported success. The
+    // retailer found out when the campaign produced no orders.
+    await authed('PUT', '/v1/email/templates/promo', { subject: 'Sale', html: '<p>Sale</p>' });
+    await authed('PUT', '/v1/segments/fresh', {
+      name: 'Fresh',
+      definition: { match: 'all', filters: [{ field: 'order_count', operator: 'gte', value: 0 }] },
+    });
+    await authed('PUT', '/v1/broadcasts/premature', {
+      name: 'Premature',
+      segmentKey: 'fresh',
+      templateKey: 'promo',
+    });
+
+    await expect(startBroadcast(tenant.id, 'premature')).rejects.toThrow(/has not been built/i);
+
+    // Built, and it arms.
+    await buildSegment(tenant.id, 'fresh');
+    await expect(startBroadcast(tenant.id, 'premature')).resolves.toMatchObject({
+      status: 'scheduled',
+    });
+  });
+
+  it('still arms a built segment that is empty right now', async () => {
+    // A send scheduled for Friday does not need its audience to exist today.
+    await authed('PUT', '/v1/email/templates/promo', { subject: 'Sale', html: '<p>Sale</p>' });
+    await authed('PUT', '/v1/segments/nobody', {
+      name: 'Nobody',
+      definition: {
+        match: 'all',
+        filters: [{ field: 'order_count', operator: 'gte', value: 9999 }],
+      },
+    });
+    await buildSegment(tenant.id, 'nobody');
+
+    await authed('PUT', '/v1/broadcasts/later', {
+      name: 'Later',
+      segmentKey: 'nobody',
+      templateKey: 'promo',
+    });
+    await expect(startBroadcast(tenant.id, 'later')).resolves.toMatchObject({
+      status: 'scheduled',
+    });
+  });
+
+  it('lets a failed send be armed again instead of stranding its audience', async () => {
+    await authed('PUT', '/v1/email/templates/promo', { subject: 'Sale', html: '<p>Sale</p>' });
+    await seedAudience(2);
+    await authed('PUT', '/v1/broadcasts/broken', {
+      name: 'Broken',
+      segmentKey: 'promo',
+      templateKey: 'promo',
+    });
+    await startBroadcast(tenant.id, 'broken');
+
+    // What an exception mid-walk leaves behind.
+    await db().query(
+      "UPDATE broadcasts SET status = 'failed', error = 'connection timeout' WHERE tenant_id = $1",
+      [tenant.id],
+    );
+
+    // Its key could not be reused, it could not be edited, and it could not be
+    // cancelled — the rest of the audience simply never heard from it.
+    await expect(startBroadcast(tenant.id, 'broken')).resolves.toMatchObject({
+      status: 'scheduled',
+    });
+  });
+});

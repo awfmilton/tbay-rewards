@@ -251,8 +251,22 @@ export async function upsertContact(
               SELECT COALESCE(array_agg(DISTINCT tag), '{}')
                 FROM unnest(tags || $12::text[]) AS tag
             ) END,
-            marketing_consent = COALESCE($13, marketing_consent),
-            consent_source    = COALESCE($14, consent_source),
+            -- Consent can be granted from a public form; it can never be
+            -- taken away by one. A subscribe form passes the list's own
+            -- default, which for a double-opt-in list is false -- so an
+            -- unauthenticated request naming a known customer's address was
+            -- switching their marketing consent off, dropping them out of
+            -- every campaign, and rewriting the provenance field that records
+            -- how they consented in the first place.
+            marketing_consent = CASE
+                                  WHEN $15 THEN marketing_consent OR COALESCE($13, false)
+                                  ELSE COALESCE($13, marketing_consent)
+                                END,
+            consent_source    = CASE
+                                  WHEN $15 AND NOT ($13 IS TRUE AND NOT marketing_consent)
+                                    THEN consent_source
+                                  ELSE COALESCE($14, consent_source)
+                                END,
             consent_at        = CASE WHEN $13 IS TRUE AND NOT marketing_consent
                                      THEN now() ELSE consent_at END,
             last_seen_at      = now(),

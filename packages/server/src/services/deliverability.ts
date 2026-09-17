@@ -46,7 +46,22 @@ const HARD_BOUNCE = new RegExp(
   'i',
 );
 
-const COMPLAINT = /\b(?:spam|abuse|complaint|unsolicited)\b/i;
+/**
+ * Rejections that are about the message or the sender, not the mailbox.
+ *
+ * These used to be read as complaints, which permanently suppressed the
+ * address *and* withdrew that person's marketing consent. But Gmail's standard
+ * block is `550-5.7.1 … likely unsolicited mail … blocked`, and a content
+ * filter says `rejected as spam`: both are the receiver refusing *our*
+ * message, not a recipient reporting us. An hour of that took every recipient
+ * in the batch off the list permanently — which is worse than the bounce
+ * storm the classifier was written to prevent.
+ *
+ * A real complaint is a feedback-loop report, which arrives out of band —
+ * `POST /v1/email/suppressions` with `reason: complaint` is how a provider's
+ * FBL handler or an operator records one. Nothing in an SMTP reply is one.
+ */
+const CONTENT_BLOCK = /\b(?:spam|abuse|complaint|unsolicited|blocked|blacklist|denylist|reputation|policy)\b/i;
 
 /**
  * Failures that are about *us*, not the recipient.
@@ -76,7 +91,14 @@ export function classifyFailure(message: string): FailureKind {
   // Checked first: a relay that rejects everything with "spam" in the text is
   // a transport problem, not four thousand people complaining.
   if (TRANSPORT_FAILURE.test(message)) return 'transport';
-  if (COMPLAINT.test(message) && !/spamassassin/i.test(message)) return 'complaint';
+
+  // A content or reputation block is about this message, or about our sending
+  // domain. Soft, so it is retried and lapses, and — this is the part that
+  // matters — it never withdraws anybody's consent. Checked before the
+  // hard-bounce patterns because a block often quotes "recipient rejected"
+  // alongside the real reason.
+  if (CONTENT_BLOCK.test(message)) return 'soft';
+
   return HARD_BOUNCE.test(message) ? 'hard' : 'soft';
 }
 

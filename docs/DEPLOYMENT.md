@@ -101,9 +101,9 @@ The ones that matter most:
 
 | Variable | Why it matters |
 |---|---|
-| `PUBLIC_URL` | Every generated link. Wrong value = broken opt-in and share links |
-| `IDENTITY_SALT` | Changing it un-links members across retailers. Set once |
-| `TOKEN_SECRET` | Signs attribution cookies and opt-in tokens |
+| `PUBLIC_URL` | Every generated link. Wrong value = broken opt-in and share links. **https in production** — cookies are set `Secure`, so over plain http the browser never sends them back and attribution stops |
+| `IDENTITY_SALT` | Changing it un-links members across retailers. Set once. At least 32 random characters |
+| `TOKEN_SECRET` | Signs attribution cookies and opt-in tokens. At least 32 random characters, and **not the same value** as `IDENTITY_SALT` |
 | `TBAY_CHAIN_ID` | 300 = zkSync Sepolia, 324 = Era mainnet |
 | `TBAY_CLAIM_SIGNER_KEY` | Must hold `CLAIMER_ROLE`. Signing only — no gas needed |
 | `TBAY_REWARD_SUPPLY_CAP_WEI` | **Set before mainnet.** See [TOKEN.md](TOKEN.md) |

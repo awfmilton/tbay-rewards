@@ -1019,7 +1019,15 @@ an audience is read, so a segment cannot be built that forgets them.
 | `POST` | `/v1/broadcasts/:key/send` | Arm it; a worker walks the audience |
 | `POST` | `/v1/broadcasts/:key/cancel` | Stop the walk |
 
-`PUT` takes `{ name?, segmentKey?, templateKey?, subject?, sendAt?, blocks?, preheader? }`.
+`PUT` takes `{ name?, segmentKey?, templateKey?, subject?, sendAt?, blocks?, preheader?, topicKey? }`.
+
+`topicKey` omitted is inherited from the template, so a send honours what people
+chose in the preference centre without anybody having to remember. `null` puts
+the send in no topic, reaching everyone who consents whatever they chose.
+
+Arming a send whose segment has never been built is refused: the builder runs
+every ten minutes and saving a segment does not build it, so "create the
+segment, then send" used to walk an empty audience and report success.
 
 A broadcast either names a template or carries its own body. Sending `blocks`
 clears the template it named, and naming a template clears the blocks; sending
