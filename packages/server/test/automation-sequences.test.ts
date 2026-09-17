@@ -209,6 +209,142 @@ describe('branches', () => {
   });
 });
 
+describe('a branch that gates nothing, and a send that reaches nobody', () => {
+  it('refuses an "if" whose filter decides nothing (HIGH)', async () => {
+    // `typeof step.filter !== 'object'` let three shapes through and each one
+    // gated nobody. `typeof null` is 'object', so a null filter passed and
+    // then failed at two in the morning inside a customer's run instead of in
+    // front of the admin who saved it. `{}` and an empty filter list compile
+    // to TRUE -- correct for a segment, where an empty definition means
+    // everyone and is the default a new one is created with, and exactly
+    // wrong for a branch. "If tagged vip, send the VIP offer", saved with the
+    // filter row still blank, sent the VIP offer to the whole list.
+    for (const filter of [null, {}, { match: 'all', filters: [] }, { match: 'any', filters: [] },
+                          { match: 'all', filters: [], groups: [] }, []] as const) {
+      const response = await authed('PUT', '/v1/automations/blank_gate', {
+        name: 'Blank gate',
+        triggerType: 'contact.created',
+        actions: [{ type: 'if', filter, else: 'stop' }, { type: 'send_email', template: 'step_two' }],
+      });
+      expect(response.statusCode, JSON.stringify(filter)).toBe(400);
+    }
+
+    // A nested group with a real condition in it is still accepted, so the
+    // check is "decides something", not "has a top-level filter".
+    const nested = await authed('PUT', '/v1/automations/nested_gate', {
+      name: 'Nested gate',
+      triggerType: 'contact.created',
+      actions: [
+        {
+          type: 'if',
+          filter: {
+            match: 'all',
+            filters: [],
+            groups: [{ match: 'any', filters: [{ field: 'order_count', operator: 'eq', value: 0 }] }],
+          },
+          else: 'stop',
+        },
+        { type: 'send_email', template: 'step_two' },
+      ],
+    });
+    expect(nested.statusCode).toBe(200);
+  });
+
+  it('sends a dedupe-keyed step to every contact, not to the first one (HIGH)', async () => {
+    // `email_messages` is UNIQUE (tenant_id, dedupe_key) with ON CONFLICT DO
+    // NOTHING, and a caller-supplied `dedupe` went in unscoped. So the obvious
+    // thing to write for "only send this once" delivered to whichever contact
+    // the scheduler reached first and silently dropped it for everybody else
+    // -- while every run still reported `completed`, so nothing anywhere said
+    // the campaign had reached one person.
+    await authed('PUT', '/v1/automations/one_off', {
+      name: 'One off',
+      triggerType: 'contact.created',
+      actions: [{ type: 'send_email', template: 'step_two', dedupe: 'spring_offer' }],
+    });
+
+    for (const email of ['a@example.com', 'b@example.com', 'c@example.com']) {
+      const contactId = await makeContact({ email });
+      await fire(tenant.id, 'contact.created', {
+        contact: { id: contactId } as never,
+        data: {},
+        dedupeKey: `c:${contactId}`,
+      });
+    }
+    await flushEmailQueue();
+
+    expect(outbox().map((m) => m.to).sort()).toEqual([
+      'a@example.com',
+      'b@example.com',
+      'c@example.com',
+    ]);
+
+    // And it is still a dedupe: the same contact triggering again gets nothing
+    // more, which is what the field is for.
+    const again = await makeContact({ email: 'a@example.com' });
+    await fire(tenant.id, 'contact.created', {
+      contact: { id: again } as never,
+      data: {},
+      dedupeKey: `c:${again}:second`,
+    });
+    await flushEmailQueue();
+    expect(outbox().filter((m) => m.to === 'a@example.com')).toHaveLength(1);
+  });
+
+  it('honours the retailer\'s frequency cap in automation mail too (HIGH)', async () => {
+    // The cap was private to the broadcast sender. A cap one of four senders
+    // obeys is not a cap -- and automations are where mail actually stacks up:
+    // a welcome series, an abandoned-cart sequence and a points email can all
+    // fire for the same person on the same afternoon.
+    await authed('PUT', '/v1/email/templates/promo_one', {
+      subject: 'Promo one', html: '<p>One</p>', transactional: false,
+    });
+    await authed('PUT', '/v1/email/templates/promo_two', {
+      subject: 'Promo two', html: '<p>Two</p>', transactional: false,
+    });
+    await db().query(
+      `UPDATE tenants SET settings = COALESCE(settings, '{}'::jsonb) || '{"maxMarketingPerDay": 1}'::jsonb
+        WHERE id = $1`,
+      [tenant.id],
+    );
+
+    const contactId = await makeContact({ email: 'capped@example.com', marketingConsent: true });
+    for (const [key, template, trigger] of [
+      ['cap_first', 'promo_one', 'cap_one'],
+      ['cap_second', 'promo_two', 'cap_two'],
+    ] as const) {
+      await authed('PUT', `/v1/automations/${key}`, {
+        name: key,
+        triggerType: trigger,
+        actions: [{ type: 'send_email', template }],
+      });
+    }
+
+    // The cap counts mail already *sent*, not queued -- a backlog must not be
+    // able to suppress a campaign -- so the first message has to land before
+    // the second is queued, which is exactly the sequence a welcome series
+    // and an abandoned-cart sequence produce hours apart.
+    await fire(tenant.id, 'cap_one', {
+      contact: { id: contactId } as never,
+      data: {},
+      dedupeKey: `c:${contactId}:first`,
+    });
+    await flushEmailQueue();
+    expect(outbox().filter((m) => m.to === 'capped@example.com')).toHaveLength(1);
+
+    await fire(tenant.id, 'cap_two', {
+      contact: { id: contactId } as never,
+      data: {},
+      dedupeKey: `c:${contactId}:second`,
+    });
+    await flushEmailQueue();
+
+    // Still one. Before this, the second automation sent regardless: the cap
+    // was private to the broadcast sender and no automation ever asked it.
+    expect(outbox().filter((m) => m.to === 'capped@example.com')).toHaveLength(1);
+  });
+});
+
 describe('safety', () => {
   it('rejects a goto that points outside the sequence', async () => {
     const response = await authed('PUT', '/v1/automations/bad', {

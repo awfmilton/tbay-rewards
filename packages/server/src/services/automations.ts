@@ -5,6 +5,7 @@ import { personalise, pointsBalanceFor } from './email-blocks.js';
 import { config } from '../config.js';
 import { ApiError } from '../lib/errors.js';
 import { getTemplate, queueEmail, renderTemplate, senderFor } from './email.js';
+import { frequencyRuleFor, overFrequencyCap } from './frequency.js';
 import { shouldTrack } from './email-tracking.js';
 import {
   actionsHash,
@@ -361,6 +362,23 @@ async function sendEmailAction(
   );
   if (!wanted.allowed) return;
 
+  // And the retailer's frequency cap, which until now only broadcasts
+  // honoured. A cap one of four senders obeys is not a cap: a welcome series,
+  // an abandoned-cart sequence and a points-awarded email can all fire for the
+  // same person on the same afternoon, each certain it is the only message
+  // being sent, while the tenant's setting says one a day. Transactional mail
+  // is exempt, because it carries no unsubscribe link and the cap counts only
+  // messages that do.
+  if (!template.transactional) {
+    const over = await overFrequencyCap(
+      runner,
+      tenant.id,
+      ctx.contact.id,
+      frequencyRuleFor(tenant),
+    );
+    if (over) return;
+  }
+
   // Built once and used twice: in the body and in the List-Unsubscribe header,
   // so the mail client's own button and the link in the message agree.
   const unsubscribeUrl = unsubscribeRequestUrl(tenant.id, ctx.contact.email);
@@ -404,7 +422,19 @@ async function sendEmailAction(
       subject: rendered.subject,
       html: rendered.html,
       text: rendered.text,
-      dedupeKey: action.dedupe ?? `automation:${automation.key}:${stepIndex}:${ctx.dedupeKey}`,
+      // A caller-supplied dedupe is scoped to the contact, and has to be.
+      //
+      // `email_messages` is UNIQUE (tenant_id, dedupe_key) and the insert is
+      // ON CONFLICT DO NOTHING, so a fixed string here -- which is the obvious
+      // thing to write for "only send this once" -- delivered the message to
+      // whichever contact the scheduler reached first and silently dropped it
+      // for everybody else, while every run still reported `completed`. The
+      // only sane reading of a per-contact action's dedupe is "once per
+      // contact"; "once per tenant" is what the automation's own enrolment
+      // key already provides.
+      dedupeKey: action.dedupe
+        ? `automation:${automation.key}:${action.dedupe}:${ctx.contact.id}`
+        : `automation:${automation.key}:${stepIndex}:${ctx.dedupeKey}`,
       // Marketing mail is tracked; a transactional receipt is not. The same
       // flag that decides whether consent is required decides this, because
       // the two questions have the same answer: is this a campaign or a
@@ -597,6 +627,29 @@ const CONTROL_TYPES = ['wait', 'if', 'goto', 'stop'];
  * while an admin is looking at the form, not silently parked forever when a
  * customer triggers it at two in the morning.
  */
+/**
+ * Does this filter actually decide anything?
+ *
+ * `typeof step.filter !== 'object'` accepted three shapes that gate nobody.
+ * `typeof null` is `'object'`, so a null filter passed and then failed at two
+ * in the morning inside a customer's run rather than in front of the admin who
+ * saved it. `{}` and `{ match: 'all', filters: [] }` are worse: they compile
+ * to `TRUE`, which is the right answer for a *segment* -- an empty definition
+ * means everyone, and that is the default a new segment is created with -- and
+ * exactly the wrong one for a branch. An admin who builds "if tagged vip, send
+ * the VIP offer", saves it with the filter row still blank, and sees no error,
+ * has sent the VIP offer to the whole list.
+ *
+ * So the branch asks a stricter question than the compiler does, at save time,
+ * where the answer is useful.
+ */
+function gatesAnything(filter: unknown): boolean {
+  if (typeof filter !== 'object' || filter === null || Array.isArray(filter)) return false;
+  const group = filter as { filters?: unknown; groups?: unknown };
+  if (Array.isArray(group.filters) && group.filters.length > 0) return true;
+  return Array.isArray(group.groups) && group.groups.some((nested) => gatesAnything(nested));
+}
+
 export function validateSteps(steps: Array<Record<string, unknown>>): void {
   steps.forEach((step, index) => {
     const type = String(step.type ?? '');
@@ -606,8 +659,10 @@ export function validateSteps(steps: Array<Record<string, unknown>>): void {
         // Throws on a zero or absurd duration.
         waitSeconds(step as never);
       }
-      if (type === 'if' && typeof step.filter !== 'object') {
-        throw ApiError.badRequest(`Step ${index}: an "if" needs a filter`);
+      if (type === 'if' && !gatesAnything(step.filter)) {
+        throw ApiError.badRequest(
+          `Step ${index}: an "if" needs a filter with at least one condition`,
+        );
       }
       if (type === 'goto') {
         const target = Number(step.step);
