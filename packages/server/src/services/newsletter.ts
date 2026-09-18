@@ -308,6 +308,23 @@ export async function confirmSubscription(
       [row.contact_id],
     );
 
+    // Somebody who left and came back is back.
+    //
+    // A confirmed click is the strongest signal of intent this system has, and
+    // it is what lifts the `manual` suppression their own unsubscribe wrote.
+    // Only `manual`: a hard bounce is a fact about the mailbox and a complaint
+    // is a statement of intent, and neither is undone by a form submission.
+    // Without this the address stayed suppressed after confirming, so the
+    // welcome mail and everything after it went to `suppressed` while the list
+    // row said `subscribed` -- a person who is on the list and can never be
+    // mailed, which is the worst of both readings.
+    await client.query(
+      `DELETE FROM email_suppressions
+        WHERE tenant_id = $1 AND reason = 'manual'
+          AND email = (SELECT email_normalised FROM contacts WHERE id = $2)`,
+      [row.tenant_id, row.contact_id],
+    );
+
     const tenant = await queryOne<Tenant>(client, 'SELECT * FROM tenants WHERE id = $1', [
       row.tenant_id,
     ]);

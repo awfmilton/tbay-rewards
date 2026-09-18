@@ -155,6 +155,65 @@ describe('badges', () => {
   });
 });
 
+describe('editing one field of a badge or rank keeps the rest (HIGH)', () => {
+  it('keeps a badge\'s name, description and image on a partial update', async () => {
+    // The third site of the same family, and the one that proves the fix is
+    // not "move the defaults into the SQL": EXCLUDED is the row proposed by
+    // the INSERT, so it carries those defaults and a COALESCE against it falls
+    // back from nothing. The DO UPDATE has to read the parameters.
+    await upsertBadge(tenant.id, {
+      key: 'collector',
+      name: 'The Collector',
+      description: 'Bought from five different categories',
+      imageUrl: 'https://shop.example/badges/collector.png',
+      criteria: { type: 'lifetime_points' },
+      tiers: [
+        { level: 1, threshold: 100 },
+        { level: 2, threshold: 500 },
+        { level: 3, threshold: 2_000 },
+      ],
+    });
+
+    const toggled = await upsertBadge(tenant.id, { key: 'collector', enabled: false });
+
+    expect(toggled.enabled).toBe(false);
+    expect(toggled.name).toBe('The Collector');
+    expect(toggled.description).toBe('Bought from five different categories');
+    expect(toggled.image_url).toBe('https://shop.example/badges/collector.png');
+    expect(toggled.tiers).toHaveLength(3);
+
+    // And an image can still be removed on purpose, which is why "absent" and
+    // "explicitly null" have to be different things.
+    const cleared = await upsertBadge(tenant.id, { key: 'collector', imageUrl: null });
+    expect(cleared.image_url).toBeNull();
+    expect(cleared.name).toBe('The Collector');
+  });
+
+  it('keeps a rank\'s ceiling on a partial update', async () => {
+    // max_points is genuinely nullable -- the top rank has no ceiling -- so a
+    // partial update that did not restate it uncapped the middle of a
+    // retailer's ladder, silently, and every member above the gap re-ranked.
+    await upsertRank(tenant.id, {
+      key: 'silver',
+      name: 'Silver',
+      description: 'Halfway there',
+      minPoints: 500,
+      maxPoints: 1_500,
+    });
+
+    const renamed = await upsertRank(tenant.id, { key: 'silver', name: 'Silver Tier' });
+    expect(renamed.name).toBe('Silver Tier');
+    expect(renamed.description).toBe('Halfway there');
+    expect(Number(renamed.min_points)).toBe(500);
+    expect(Number(renamed.max_points)).toBe(1_500);
+
+    // And the top of a ladder can still be opened deliberately.
+    const top = await upsertRank(tenant.id, { key: 'silver', maxPoints: null });
+    expect(top.max_points).toBeNull();
+    expect(top.name).toBe('Silver Tier');
+  });
+});
+
 describe('ranks', () => {
   it('promotes on lifetime points earned', async () => {
     const contact = await member('climber@example.com', 600);

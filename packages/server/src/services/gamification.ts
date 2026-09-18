@@ -470,7 +470,7 @@ export async function upsertBadge(
        tenant_id, key, name, description, image_url, criteria, tiers,
        points_per_tier, manual_only, display_order, enabled, point_type
      ) VALUES (
-       $1, $2, $3, $4, $5,
+       $1, $2, COALESCE($3, $2), COALESCE($4, ''), $5,
        -- COALESCE here, not only in the UPDATE below: on a fresh insert there
        -- is no existing row to fall back to, and these columns are NOT NULL.
        COALESCE($6::jsonb, '{}'::jsonb),
@@ -479,9 +479,16 @@ export async function upsertBadge(
        COALESCE($12, $13)
      )
      ON CONFLICT (tenant_id, key) DO UPDATE SET
-       name = COALESCE(EXCLUDED.name, badges.name),
-       description = COALESCE(EXCLUDED.description, badges.description),
-       image_url = EXCLUDED.image_url,
+       -- The parameters, not EXCLUDED. EXCLUDED is the row proposed above, so
+       -- it carries the defaults this statement just applied and there is
+       -- nothing left for a COALESCE against it to fall back from. Editing one
+       -- field of a badge renamed it to its own key and blanked its
+       -- description, which is what the WordPress badge form sends on a Save.
+       name = COALESCE($3, badges.name),
+       description = COALESCE($4, badges.description),
+       -- An image can legitimately be removed, so "not supplied" and
+       -- "supplied as null" have to be different things: $14 says which.
+       image_url = CASE WHEN $14 THEN $5 ELSE badges.image_url END,
        criteria = COALESCE($6::jsonb, badges.criteria),
        tiers = COALESCE($7::jsonb, badges.tiers),
        points_per_tier = COALESCE($8, badges.points_per_tier),
@@ -494,8 +501,8 @@ export async function upsertBadge(
     [
       tenantId,
       key,
-      input.name ?? key,
-      input.description ?? '',
+      input.name ?? null,
+      input.description ?? null,
       input.imageUrl ?? null,
       input.criteria ? JSON.stringify(input.criteria) : null,
       input.tiers ? JSON.stringify(input.tiers) : null,
@@ -505,6 +512,7 @@ export async function upsertBadge(
       input.enabled ?? null,
       type?.key ?? null,
       fallbackType.key,
+      Object.hasOwn(input, 'imageUrl'),
     ],
   );
   return row!;
@@ -609,17 +617,23 @@ export async function upsertRank(
        tenant_id, key, name, description, image_url, min_points, max_points,
        perks, manual_only, display_order, enabled, point_type
      ) VALUES (
-       $1, $2, $3, $4, $5, COALESCE($6, 0), $7,
+       $1, $2, COALESCE($3, $2), COALESCE($4, ''), $5, COALESCE($6, 0), $7,
        COALESCE($8::jsonb, '{}'::jsonb),
        COALESCE($9, false), COALESCE($10, 0), COALESCE($11, true),
        COALESCE($12, $13)
      )
      ON CONFLICT (tenant_id, key) DO UPDATE SET
-       name = COALESCE(EXCLUDED.name, ranks.name),
-       description = COALESCE(EXCLUDED.description, ranks.description),
-       image_url = EXCLUDED.image_url,
+       -- See upsertBadge: the parameters rather than EXCLUDED, for the same
+       -- reason and with the same consequence if they are not.
+       name = COALESCE($3, ranks.name),
+       description = COALESCE($4, ranks.description),
+       image_url = CASE WHEN $14 THEN $5 ELSE ranks.image_url END,
        min_points = COALESCE($6, ranks.min_points),
-       max_points = EXCLUDED.max_points,
+       -- NULL is a real value here: the top rank has no ceiling. So a partial
+       -- update must not be able to mean "remove it" by accident -- which is
+       -- what this did, uncapping the top of a retailer's ladder on any edit
+       -- that did not restate it.
+       max_points = CASE WHEN $15 THEN $7 ELSE ranks.max_points END,
        perks = COALESCE($8::jsonb, ranks.perks),
        manual_only = COALESCE($9, ranks.manual_only),
        display_order = COALESCE($10, ranks.display_order),
@@ -629,8 +643,8 @@ export async function upsertRank(
     [
       tenantId,
       key,
-      input.name ?? key,
-      input.description ?? '',
+      input.name ?? null,
+      input.description ?? null,
       input.imageUrl ?? null,
       input.minPoints ?? null,
       input.maxPoints ?? null,
@@ -640,6 +654,8 @@ export async function upsertRank(
       input.enabled ?? null,
       type?.key ?? null,
       fallbackType.key,
+      Object.hasOwn(input, 'imageUrl'),
+      Object.hasOwn(input, 'maxPoints'),
     ],
   );
   return row!;
