@@ -333,8 +333,28 @@ export async function flushEmailQueue(limit = 50, runner: Queryable = db()): Pro
     // unsubscribe during it was mailed anyway, by a message written before
     // they asked us to stop. Only marketing is re-checked: a message with no
     // unsubscribe URL is a receipt, which withdrawing consent does not cancel.
+    // A confirmation email is the one message a `manual` suppression must not
+    // stop.
+    //
+    // Unsubscribing from a link writes a permanent `manual` suppression, which
+    // is right -- the decision has to survive a re-import or a second
+    // subscription row. But it also blocked the double opt-in confirmation,
+    // and that is the only message that can put somebody back on the list. So
+    // anyone who ever left could never return: the public form accepted them,
+    // the confirmation was suppressed at send time, and nothing told either
+    // side. Only a retailer with admin access to `unsuppress` could undo it.
+    //
+    // Narrow on purpose. `hard_bounce` is a fact about a mailbox and
+    // `complaint` is a statement of intent; neither is overridden here, and no
+    // other template is either. Confirming is what clears the suppression --
+    // see confirmSubscription -- so an unconfirmed address stays suppressed
+    // and receives nothing further.
+    const suppression = await isSuppressed(message.tenant_id, message.to_email, runner);
+    const reconsidering =
+      suppression?.reason === 'manual' && message.template_key === 'newsletter_confirm';
+
     const blocked =
-      (await isSuppressed(message.tenant_id, message.to_email, runner)) ??
+      (reconsidering ? null : suppression) ??
       (message.unsubscribe_url ? await withdrawnConsent(runner, message) : null);
     if (blocked) {
       await runner.query(

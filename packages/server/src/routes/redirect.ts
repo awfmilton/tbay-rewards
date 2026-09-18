@@ -151,15 +151,37 @@ export async function redirectRoutes(app: FastifyInstance): Promise<void> {
     method: ['GET', 'POST'],
     url: '/n/unsubscribe/:token',
     handler: async (request, reply) => {
+      // POST acts; GET asks first.
+      //
+      // RFC 8058 one-click is a POST that a mail client sends because the
+      // person pressed its unsubscribe button, so it must act immediately --
+      // that is the whole point of advertising List-Unsubscribe-Post. A GET is
+      // not a person. `sendConfirmationEmail` puts this exact URL in the
+      // double opt-in email, and every corporate mail gateway that matters --
+      // Outlook Safe Links, Proofpoint, Mimecast, Barracuda -- fetches every
+      // link in an inbound message to check it. So the scanner unsubscribed
+      // the person before they had opened the mail, and the Confirm button
+      // they then pressed subscribed them to a list they were already off.
+      //
+      // An interstitial is also just correct: GET is not supposed to change
+      // anything, and the sibling route at /n/u/:token already did this.
+      if (request.method === 'GET') {
+        // An empty action posts back to this same URL, which keeps the page
+        // byte-identical for a real token and a made-up one. Putting the token
+        // in the action would have echoed it into the body, and "the two
+        // responses are indistinguishable" is a property this route is tested
+        // for: the token must not become an oracle for which addresses are on
+        // file. The token is already in the browser's address bar, so posting
+        // to the current URL costs nothing.
+        return reply
+          .type('text/html')
+          .send(confirmPage('Unsubscribe?', 'This will stop all marketing email from us.', ''));
+      }
+
       await unsubscribeByToken(request.params.token);
 
-      if (request.method === 'POST') {
-        return reply.code(200).send();
-      }
       // Always the same answer: the token must not become an address oracle.
-      return reply
-        .type('text/html')
-        .send(page('Unsubscribed', 'You will not receive any further marketing email from us.'));
+      return reply.code(200).send();
     },
   });
 

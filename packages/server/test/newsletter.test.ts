@@ -21,6 +21,7 @@ import {
   unsubscribeByToken,
 } from '../src/services/newsletter.js';
 import { flushEmailQueue, outbox, setEmailTransport } from '../src/services/email.js';
+import { isSuppressed, suppress } from '../src/services/deliverability.js';
 import { getBalance } from '../src/services/points.js';
 import { getTenantById } from '../src/services/tenants.js';
 import { hashToken, randomToken } from '../src/lib/crypto.js';
@@ -188,6 +189,108 @@ describe('newsletter double opt-in', () => {
 
     const stats = await listStats(tenant.id);
     expect(stats[0]).toMatchObject({ slug: 'newsletter', subscribed: 1, pending: 1 });
+  });
+});
+
+describe('leaving and coming back (HIGH)', () => {
+  it('does not unsubscribe somebody because a link scanner opened their mail', async () => {
+    // sendConfirmationEmail puts /n/unsubscribe/<token> in the double opt-in
+    // email, and that route acted on a bare GET. Every corporate mail gateway
+    // that matters -- Outlook Safe Links, Proofpoint, Mimecast, Barracuda --
+    // fetches every link in an inbound message to check it, so the scanner
+    // unsubscribed the person before they had opened the mail, and the
+    // Confirm button they then pressed put them on a list they were already
+    // off.
+    const result = await subscribe(await tenantObject(), { email: 'scanned@example.com' });
+    const { rows } = await db().query<{ unsub_token_hash: string }>(
+      'SELECT unsub_token_hash FROM subscriptions WHERE tenant_id = $1',
+      [tenant.id],
+    );
+    expect(rows[0]!.unsub_token_hash).toBeTruthy();
+
+    await flushEmailQueue();
+    const confirmationEmail = outbox().find((m) => m.to === 'scanned@example.com');
+    expect(confirmationEmail).toBeDefined();
+    const unsubUrl = /\/n\/unsubscribe\/([A-Za-z0-9._-]+)/.exec(confirmationEmail!.html)?.[1];
+    expect(unsubUrl).toBeTruthy();
+
+    const app = await testApp();
+
+    // The scanner: a plain GET, which must ask rather than act.
+    const scanned = await app.inject({ method: 'GET', url: `/n/unsubscribe/${unsubUrl}` });
+    expect(scanned.statusCode).toBe(200);
+    expect(scanned.body).toContain('<form method="post"');
+
+    const afterScan = await db().query<{ status: string }>(
+      'SELECT status FROM subscriptions WHERE tenant_id = $1',
+      [tenant.id],
+    );
+    expect(afterScan.rows[0]!.status).toBe('pending');
+
+    // Confirming still works, because nothing was done behind their back.
+    await confirmSubscription(result.confirmToken!);
+    const afterConfirm = await db().query<{ status: string }>(
+      'SELECT status FROM subscriptions WHERE tenant_id = $1',
+      [tenant.id],
+    );
+    expect(afterConfirm.rows[0]!.status).toBe('subscribed');
+
+    // And a real one-click unsubscribe -- the POST a mail client sends
+    // because somebody pressed its button -- still acts immediately. That is
+    // what List-Unsubscribe-Post advertises and the law requires.
+    const clicked = await app.inject({ method: 'POST', url: `/n/unsubscribe/${unsubUrl}` });
+    expect(clicked.statusCode).toBe(200);
+    const afterClick = await db().query<{ status: string }>(
+      'SELECT status FROM subscriptions WHERE tenant_id = $1',
+      [tenant.id],
+    );
+    expect(afterClick.rows[0]!.status).toBe('unsubscribed');
+  });
+
+  it('lets somebody who unsubscribed join again', async () => {
+    // Unsubscribing from an email link writes a permanent `manual`
+    // suppression, which is right -- the decision must survive a re-import or
+    // a second subscription row. But it also blocked the double opt-in
+    // confirmation, the one message that can put somebody back on, so anyone
+    // who ever left could never return: the form accepted them, the
+    // confirmation was suppressed at send time, and neither side was told.
+    // Only a retailer with admin access could undo it.
+    await suppress(tenant.id, 'returning@example.com', 'manual', 'Unsubscribed from an email link');
+    expect(await isSuppressed(tenant.id, 'returning@example.com')).not.toBeNull();
+
+    const again = await subscribe(await tenantObject(), { email: 'returning@example.com' });
+    await flushEmailQueue();
+    const confirmation = outbox().find((m) => m.to === 'returning@example.com');
+    expect(confirmation).toBeDefined();
+
+    // Confirming is what lifts it -- an unconfirmed address stays suppressed.
+    expect(await isSuppressed(tenant.id, 'returning@example.com')).not.toBeNull();
+    await confirmSubscription(again.confirmToken!);
+    expect(await isSuppressed(tenant.id, 'returning@example.com')).toBeNull();
+
+    // And the welcome mail that follows actually reaches them, rather than
+    // landing in `suppressed` while the list row says subscribed.
+    await flushEmailQueue();
+    const { rows } = await db().query<{ status: string }>(
+      `SELECT status FROM email_messages
+        WHERE tenant_id = $1 AND to_email = 'returning@example.com'
+        ORDER BY created_at`,
+      [tenant.id],
+    );
+    expect(rows.every((r) => r.status !== 'suppressed')).toBe(true);
+  });
+
+  it('never lets a form submission undo a hard bounce or a complaint', async () => {
+    // The narrowness is the point. A hard bounce is a fact about a mailbox
+    // and a complaint is a statement of intent; neither is a decision a
+    // signup form may reverse.
+    for (const reason of ['hard_bounce', 'complaint'] as const) {
+      const email = `${reason}@example.com`;
+      await suppress(tenant.id, email, reason, 'from the relay');
+      const joined = await subscribe(await tenantObject(), { email });
+      await confirmSubscription(joined.confirmToken!);
+      expect(await isSuppressed(tenant.id, email), reason).not.toBeNull();
+    }
   });
 });
 
