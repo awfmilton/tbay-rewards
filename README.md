@@ -5,7 +5,7 @@ platform. It replaces Mautic and myCred with one system, and settles its rewards
 in TBAY — an ERC-20 that spends at any retailer on the network and bridges to
 Ethereum.
 
-Built for [tbay.tk LLC](https://tbay.tk).
+Built by [Alexander Milton](https://github.com/awfmilton).
 
 ---
 
@@ -184,4 +184,4 @@ the suite drops and recreates its schema on every run.
 
 ## Licence
 
-Proprietary — tbay.tk LLC. All rights reserved.
+Mozilla Public License 2.0 (MPL-2.0). Copyright (c) Alexander Milton. See [LICENSE](LICENSE).

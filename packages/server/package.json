@@ -2,6 +2,8 @@
   "name": "@tbay/rewards-server",
   "version": "0.1.0",
   "private": true,
+  "author": "Alexander Milton <awfmilton@gmail.com>",
+  "license": "MPL-2.0",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {

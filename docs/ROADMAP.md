@@ -97,23 +97,38 @@ is still HTML, and every existing one is.
 
 ---
 
-## Still open
+## Planned Roadmap (Next 20+ Hours)
 
-### buyCRED
+### 1. buyCRED — Direct Point Purchasing (~8 hours)
 
-Points can be spent at checkout, but they cannot be **bought** for money.
-myCred's buyCRED sells points through a payment gateway. Nothing in the rewards
-programme needs it — points are earned, and TBAY is the thing with a price —
-so it is open rather than planned.
+Points can currently be spent at checkout, but cannot be purchased directly for fiat currency. Planned implementation:
+- Payment gateway webhook handlers (Stripe / WooCommerce checkout integration) for purchasing point bundles.
+- Configurable conversion tiers, per-currency purchase minimums/maximums, and fraud-prevention velocity limits.
+- Ledger entry reconciliation with automatic clawback on chargeback or refund events.
 
-### Deliberately omitted, and staying omitted
+### 2. Exit-Intent Capture & List-Growth Widgets (~6 hours)
 
-Forms, landing pages, A/B tests, SMS, web push, stages, dynamic web content,
+- Lightweight, zero-dependency modal/banner trigger in `tbay.js` detecting viewport exit intent on desktop and scroll-up velocity on mobile.
+- Double opt-in newsletter capture with instant coupon or bonus-point incentives credited upon confirmation.
+- Frequency-cap and suppression cookies so returning subscribers are never prompted twice.
+
+### 3. SMS Cart Recovery Channel (~6 hours)
+
+- Pluggable SMS transport adapter alongside the existing SMTP email worker.
+- Per-contact SMS consent tracking, quiet-hours enforcement in the retailer's timezone, and STOP/UNSUBSCRIBE webhook handling.
+- Multi-step cart recovery sequences combining email first-touch with SMS follow-up for high-value carts.
+
+### 4. Monthly Event Partitioning & Retention Automation (~4 hours)
+
+- Migrate `events` to declarative monthly range partitions (`(id, occurred_at)` composite key) with automated partition creation and 90-day drop workers.
+
+---
+
+## Deliberately omitted
+
+Forms, landing pages, A/B tests, web push, stages, dynamic web content,
 assets, the integrations framework, and users/roles/SSO. A WooCommerce store
 has forms and pages from WordPress; signed webhooks cover Zapier-shaped needs.
-
-Two are worth revisiting when there is demand: **exit-intent capture**, a
-mainstream list-growth tool, and **SMS cart recovery**, which converts well.
 
 ---
 

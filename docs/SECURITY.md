@@ -274,4 +274,4 @@ customer's checkout.
 
 ## Reporting a vulnerability
 
-Email security@tbay.tk. Please do not open a public issue.
+Email awfmilton@gmail.com. Please do not open a public issue.

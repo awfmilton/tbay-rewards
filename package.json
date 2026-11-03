@@ -3,7 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "description": "TBAY Rewards — unified marketing automation, analytics and token-backed loyalty platform",
-  "license": "UNLICENSED",
+  "author": "Alexander Milton <awfmilton@gmail.com>",
+  "license": "MPL-2.0",
   "workspaces": [
     "packages/server"
   ],

@@ -6,10 +6,10 @@
  * Version:           1.0.0
  * Requires at least: 6.0
  * Requires PHP:      8.1
- * Author:            tbay.tk LLC
- * Author URI:        https://tbay.tk
- * License:           GPL-2.0-or-later
- * License URI:       https://www.gnu.org/licenses/gpl-2.0.html
+ * Author:            Alexander Milton
+ * Author URI:        https://github.com/awfmilton
+ * License:           MPL-2.0
+ * License URI:       https://mozilla.org/MPL/2.0/
  * Text Domain:       tbay-rewards
  * Domain Path:       /languages
  *
