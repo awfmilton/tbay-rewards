@@ -97,45 +97,52 @@ is still HTML, and every existing one is.
 
 ---
 
-## Planned Roadmap (Next 55+ Hours)
+## Planned Roadmap (Next 65+ Hours)
 
-### 1. buyCRED — Direct Point Purchasing & Supporter Donations (~10 hours)
+### 1. Migrate Legacy `myCRED` Naming to First-Party `TBAY` Naming (~8 hours)
+
+Across the server, WordPress plugin, and documentation, classes, files, settings keys, and feature names still carry legacy `myCRED` / `buyCRED` naming (e.g., `packages/wordpress-plugin/tbay-rewards/includes/class-tbay-mycred.php`, `TBAY_Rewards_MyCred`, `mycred_point_type`, `mycred_sync`, `packages/server/src/importers/mycred.ts`, `importMyCredBalances`, `importMyCredHistory`, and `buyCRED` feature labels). Planned migration:
+- Rename the direct point-purchasing module from `buyCRED` to `TBAY Point Purchase` (`tbay-buy-points`) across docs, routes, and UI labels.
+- Refactor `class-tbay-mycred.php` (`TBAY_Rewards_MyCred`) and option keys (`mycred_point_type`, `mycred_sync` in `class-tbay-settings.php` and `tbay-rewards.php`) to first-party `TBAY_Rewards_Legacy_Bridge` / `tbay_bridge_*` identifiers with automatic `wp_options` migration on plugin upgrade so existing installs do not lose settings.
+- Rename server importer modules and TypeScript symbols (`packages/server/src/importers/mycred.ts` → `legacy-points.ts`, `importMyCredBalances` → `importLegacyBalances`, `importMyCredHistory` → `importLegacyHistory`) while keeping backward-compatible CLI aliases and idempotency key prefixes.
+
+### 2. Direct Point Purchasing (`tbay-buy-points`) & Supporter Donations (~10 hours)
 
 Points can currently be spent at checkout, but cannot be purchased directly for fiat currency, nor is there a built-in charity/supporter donation module:
 - Payment gateway webhook handlers (Stripe / WooCommerce checkout integration) for purchasing point bundles and accepting one-time or recurring supporter donations (or donating earned points to partner charities).
 - Configurable conversion tiers, per-currency purchase minimums/maximums, and fraud-prevention velocity limits.
 - Ledger entry reconciliation with automatic clawback on chargeback or refund events.
 
-### 2. Exit-Intent Capture & List-Growth Widgets (~6 hours)
+### 3. Exit-Intent Capture & List-Growth Widgets (~6 hours)
 
 - Lightweight, zero-dependency modal/banner trigger in `tbay.js` detecting viewport exit intent on desktop and scroll-up velocity on mobile.
 - Double opt-in newsletter capture with instant coupon or bonus-point incentives credited upon confirmation.
 - Frequency-cap and suppression cookies so returning subscribers are never prompted twice.
 
-### 3. SMS Cart Recovery Channel (~6 hours)
+### 4. SMS Cart Recovery Channel (~6 hours)
 
 - Pluggable SMS transport adapter alongside the existing SMTP email worker.
 - Per-contact SMS consent tracking, quiet-hours enforcement in the retailer's timezone, and STOP/UNSUBSCRIBE webhook handling.
 - Multi-step cart recovery sequences combining email first-touch with SMS follow-up for high-value carts.
 
-### 4. Monthly Event Partitioning & Retention Automation (~5 hours)
+### 5. Monthly Event Partitioning & Retention Automation (~5 hours)
 
 - Migrate `events` (`packages/server/migrations/0001_baseline.sql`) to declarative monthly range partitions (`(id, occurred_at)` composite primary key) with automated partition creation and 90-day drop workers.
 
-### 5. Multilingual Support & Localization (`packages/server` & `packages/wordpress-plugin`) (~8 hours)
+### 6. Multilingual Support & Localization (`packages/server` & `packages/wordpress-plugin`) (~8 hours)
 
 - Complete `.pot` / `.po` internationalization across all 10 WordPress admin screens and shortcodes (`packages/wordpress-plugin/tbay-rewards/`) with shipped translations for French (`fr_CA`), Spanish (`es`), and German (`de`).
 - Add per-contact `locale` preference on `contacts` so transactional receipts, preference-centre pages, and email builder blocks render in the customer's preferred language.
 
-### 6. Security Review (~8 hours)
+### 7. Security Review (~8 hours)
 
 - Audit EIP-712 claim voucher replay protection, tenant API key scoping, SSRF guards on outbound webhook delivery (`packages/server/src/services/`), and WordPress REST proxy nonce/capability verification (`packages/wordpress-plugin/tbay-rewards/includes/class-tbay-api.php`).
 
-### 7. Infrastructure Review (~6 hours)
+### 8. Infrastructure Review (~6 hours)
 
 - Review PostgreSQL connection pool sizing, PgBouncer transaction-mode compatibility, worker lock-ordering guarantees, and Docker Compose zero-downtime migration execution (`docker-compose.yml`, `Dockerfile`).
 
-### 8. GitHub Actions & Automated Testing Review (~8 hours)
+### 9. GitHub Actions & Automated Testing Review (~8 hours)
 
 - Add GitHub Actions CI workflows (`.github/workflows/ci.yml`) with `concurrency: cancel-in-progress: true`, ephemerally provisioned PostgreSQL service containers running the full Vitest integration suite (`npm test`), `npm run typecheck`, and PHPUnit / PHPCS checks for the WordPress plugin.
 
