@@ -97,12 +97,12 @@ is still HTML, and every existing one is.
 
 ---
 
-## Planned Roadmap (Next 20+ Hours)
+## Planned Roadmap (Next 55+ Hours)
 
-### 1. buyCRED — Direct Point Purchasing (~8 hours)
+### 1. buyCRED — Direct Point Purchasing & Supporter Donations (~10 hours)
 
-Points can currently be spent at checkout, but cannot be purchased directly for fiat currency. Planned implementation:
-- Payment gateway webhook handlers (Stripe / WooCommerce checkout integration) for purchasing point bundles.
+Points can currently be spent at checkout, but cannot be purchased directly for fiat currency, nor is there a built-in charity/supporter donation module:
+- Payment gateway webhook handlers (Stripe / WooCommerce checkout integration) for purchasing point bundles and accepting one-time or recurring supporter donations (or donating earned points to partner charities).
 - Configurable conversion tiers, per-currency purchase minimums/maximums, and fraud-prevention velocity limits.
 - Ledger entry reconciliation with automatic clawback on chargeback or refund events.
 
@@ -118,9 +118,26 @@ Points can currently be spent at checkout, but cannot be purchased directly for 
 - Per-contact SMS consent tracking, quiet-hours enforcement in the retailer's timezone, and STOP/UNSUBSCRIBE webhook handling.
 - Multi-step cart recovery sequences combining email first-touch with SMS follow-up for high-value carts.
 
-### 4. Monthly Event Partitioning & Retention Automation (~4 hours)
+### 4. Monthly Event Partitioning & Retention Automation (~5 hours)
 
-- Migrate `events` to declarative monthly range partitions (`(id, occurred_at)` composite key) with automated partition creation and 90-day drop workers.
+- Migrate `events` (`packages/server/migrations/0001_baseline.sql`) to declarative monthly range partitions (`(id, occurred_at)` composite primary key) with automated partition creation and 90-day drop workers.
+
+### 5. Multilingual Support & Localization (`packages/server` & `packages/wordpress-plugin`) (~8 hours)
+
+- Complete `.pot` / `.po` internationalization across all 10 WordPress admin screens and shortcodes (`packages/wordpress-plugin/tbay-rewards/`) with shipped translations for French (`fr_CA`), Spanish (`es`), and German (`de`).
+- Add per-contact `locale` preference on `contacts` so transactional receipts, preference-centre pages, and email builder blocks render in the customer's preferred language.
+
+### 6. Security Review (~8 hours)
+
+- Audit EIP-712 claim voucher replay protection, tenant API key scoping, SSRF guards on outbound webhook delivery (`packages/server/src/services/`), and WordPress REST proxy nonce/capability verification (`packages/wordpress-plugin/tbay-rewards/includes/class-tbay-api.php`).
+
+### 7. Infrastructure Review (~6 hours)
+
+- Review PostgreSQL connection pool sizing, PgBouncer transaction-mode compatibility, worker lock-ordering guarantees, and Docker Compose zero-downtime migration execution (`docker-compose.yml`, `Dockerfile`).
+
+### 8. GitHub Actions & Automated Testing Review (~8 hours)
+
+- Add GitHub Actions CI workflows (`.github/workflows/ci.yml`) with `concurrency: cancel-in-progress: true`, ephemerally provisioned PostgreSQL service containers running the full Vitest integration suite (`npm test`), `npm run typecheck`, and PHPUnit / PHPCS checks for the WordPress plugin.
 
 ---
 
